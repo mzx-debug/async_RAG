@@ -1,0 +1,68 @@
+[
+  {
+    "name": "plain_b16",
+    "mode": "plain_fixed_batch",
+    "wall_time_ms": 20117.577719967812,
+    "wall_qps": 4.970777366538738,
+    "avg_emb_ms": 4.321384034119546,
+    "avg_ret_ms": 19.31067897938192,
+    "avg_gen_ms": 196.63350372109562,
+    "dispatch_ms": 0.0,
+    "feedback_ms": 0.23777945898473263
+  },
+  {
+    "name": "plain_b64",
+    "mode": "plain_fixed_batch",
+    "wall_time_ms": 10126.17210787721,
+    "wall_qps": 9.875399996629467,
+    "avg_emb_ms": 4.285048209130764,
+    "avg_ret_ms": 14.48122730012983,
+    "avg_gen_ms": 89.24272635718808,
+    "dispatch_ms": 0.0,
+    "feedback_ms": 0.09296601638197899
+  },
+  {
+    "name": "bucket_fixed_batch_fixed_action",
+    "mode": "online_dispatch_ema_v1",
+    "wall_time_ms": 19981.541260844097,
+    "wall_qps": 5.004618947786594,
+    "avg_emb_ms": 10.587706451769918,
+    "avg_ret_ms": 19.381353887729347,
+    "avg_gen_ms": 195.40691122878343,
+    "dispatch_ms": 0.6145727820694447,
+    "feedback_ms": 0.23366138339042664
+  },
+  {
+    "name": "bucket_online_batch_fixed_action",
+    "mode": "online_dispatch_ema_v1",
+    "wall_time_ms": 20183.47745691426,
+    "wall_qps": 4.954547610215848,
+    "avg_emb_ms": 10.32165069365874,
+    "avg_ret_ms": 21.753220446407795,
+    "avg_gen_ms": 197.56646582856774,
+    "dispatch_ms": 0.7770201191306114,
+    "feedback_ms": 0.28183404356241226
+  },
+  {
+    "name": "bucket_online_batch_online_action",
+    "mode": "online_dispatch_ema_v1",
+    "wall_time_ms": 20203.347439179197,
+    "wall_qps": 4.949674815079194,
+    "avg_emb_ms": 9.388199211098254,
+    "avg_ret_ms": 22.79597015120089,
+    "avg_gen_ms": 197.38378684502095,
+    "dispatch_ms": 0.9016236290335655,
+    "feedback_ms": 0.2707622479647398
+  },
+  {
+    "name": "bucket_online_batch_online_action_no_chunk",
+    "mode": "online_dispatch_ema_v1",
+    "wall_time_ms": 19993.032990954816,
+    "wall_qps": 5.0017423592129155,
+    "avg_emb_ms": 3.9263089699670672,
+    "avg_ret_ms": 18.34699558094144,
+    "avg_gen_ms": 196.09115003142506,
+    "dispatch_ms": 0.8891122415661812,
+    "feedback_ms": 0.3226501867175102
+  }
+]

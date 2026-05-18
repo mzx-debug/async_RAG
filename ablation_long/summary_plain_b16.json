@@ -1,0 +1,393 @@
+{
+  "config": {
+    "b": 16,
+    "xE": 1,
+    "xR": 0,
+    "xG": 1,
+    "nprobe": 128,
+    "topk": 1,
+    "embedding_model": "intfloat/e5-large-v2",
+    "generator_model": "/data/home/mazhenxiang/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3.1-8B-Instruct"
+  },
+  "scheduler": {
+    "mode": "plain_fixed_batch",
+    "bucket_thresholds": {
+      "short": 48,
+      "long": 128
+    },
+    "bucket_batch_sizes": {
+      "short": 64,
+      "mid": 32,
+      "long": 16
+    },
+    "bucket_counts": {
+      "short": 0,
+      "mid": 0,
+      "long": 7
+    },
+    "action_counts": {
+      "xE1_xR0": 7
+    },
+    "max_q_er": 7,
+    "max_q_rg": 6,
+    "fixed_nprobe": 128,
+    "execution": "async_threaded_pipeline_plain"
+  },
+  "timing_breakdown": {
+    "token_length_prep_ms": 14.65634093619883,
+    "scheduler_dispatch_ms_total": 0.0,
+    "scheduler_dispatch_ms_avg": 0.0,
+    "scheduler_feedback_ms_total": 0.23777945898473263,
+    "scheduler_feedback_ms_avg": 0.03396849414067609
+  },
+  "num_queries": 100,
+  "avg_embedding_ms": 4.321384034119546,
+  "avg_retrieval_ms": 19.31067897938192,
+  "avg_generation_ms": 196.63350372109562,
+  "total_ms": 22026.55667345971,
+  "throughput_qps": 4.5399742448392875,
+  "wall_time_ms": 20117.577719967812,
+  "wall_throughput_qps": 4.970777366538738,
+  "total_generated_tokens": 12800,
+  "generation_ms_per_token": 1.5361992478210595,
+  "samples": [
+    {
+      "query": "Provide a comprehensive analysis of Who or what is Normal Sounds and Noises a Refrigerator Makes? Begin by defining the core concept and its historical development from early origins to present day. Then explain the underlying mechanisms, key components, and how they interact with each other. Discuss the practical applications across different domains and industries, including specific use cases and real-world examples. Analyze the advantages and limitations, comparing it with alternative approaches or competing theories. Address common misconceptions and clarify what distinguishes it from closely related concepts. Finally, evaluate current research trends, unresolved challenges, and promising directions for future development.",
+      "top_doc_snippet": "Describe the sound of wind?\ndescribe the sound of wind? im writing a paper and he has wind whooshing past his ears.. i dont know how to describe it though . help? Source(s): describe sound wind: https://trimurl.im/b12/describe-the-sound-of-wind.",
+      "answer": " The sound of wind is a complex and subjective phenomenon that can be described in various ways, depending on the context and the individual's experience. Here are some possible ways to describe the sound of wind:\n\n*   **Whooshing or rushing sound**: A gentle breeze might produce a soft whooshing or rushing sound, like the gentle lapping of waves against the shore.\n*   **Whispering or murmuring sound**: A light wind might create a soft whispering or murmuring sound, similar to the quiet hum of a distant engine.\n*   **Howling or moaning sound**: A strong wind can produce a loud,",
+      "bucket": "long",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    },
+    {
+      "query": "Provide a comprehensive analysis of Where does Commissioners come from? Begin by defining the core concept and its historical development from early origins to present day. Then explain the underlying mechanisms, key components, and how they interact with each other. Discuss the practical applications across different domains and industries, including specific use cases and real-world examples. Analyze the advantages and limitations, comparing it with alternative approaches or competing theories. Address common misconceptions and clarify what distinguishes it from closely related concepts. Finally, evaluate current research trends, unresolved challenges, and promising directions for future development.",
+      "top_doc_snippet": "-\nThe Commission; Activities & Objectives; Meeting Agenda; Commission Reports; Commissioner's Login; Employee Access; Enforcement Division; Complaint procedures; Enforcement Actions; Ask a Question; Corporate Finance; Check Filing Status; IC Notice Permit Letters; Ask a Question; Firms /Professional",
+      "answer": " \nThe concept of a Commissioner originates from ancient times, where it referred to a high-ranking official responsible for overseeing various aspects of governance, such as law enforcement, taxation, and public works. Over time, the role of a Commissioner has evolved to encompass a wide range of responsibilities, from local government to international organizations.\n\n**Historical Development:**\n\n1.  **Ancient Civilizations:** In ancient Greece and Rome, Commissioners were appointed to oversee public works, such as road construction and water supply systems.\n2.  **Medieval Period:** During the Middle Ages, Commissioners were responsible for collecting taxes, maintaining law and order, and administering",
+      "bucket": "long",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    },
+    {
+      "query": "Explore What is the origin of Candice Bergen? in depth from foundational principles to cutting-edge developments. Establish the conceptual groundwork by defining key terms, assumptions, and boundary conditions. Review the historical trajectory, highlighting pivotal moments, influential figures, and paradigm shifts. Explain the underlying science, mathematics, or logic that provides the theoretical foundation. Describe practical implementations, including tools, techniques, and best practices used by experts. Analyze empirical evidence from controlled studies, field observations, and meta-analyses. Discuss interdisciplinary connections and how insights from other fields have enriched understanding. Identify knowledge gaps, methodological limitations, and areas requiring further investigation. Synthesize the analysis to provide actionable guidance for researchers, practitioners, and decision-makers.",
+      "top_doc_snippet": "-\nThe background research will need to include key definitions and explanations of concepts, history of similar experiments, mathematical formulas with explanations you will need to describe the results of your experiment, and answers to any research questions.",
+      "answer": " \nThe origin of Candice Bergen is a topic that requires a comprehensive exploration of its history, theoretical foundations, practical implementations, and empirical evidence. Candice Bergen is a renowned American actress, comedian, and activist, best known for her iconic role as Murphy Brown in the popular television series.\n\n**Foundational Principles and Key Terms:**\n\n*   Candice Bergen is a name that has become synonymous with wit, intelligence, and strong-willed characters.\n*   The term \"Candice Bergen\" refers to the actress, but also to the concept of a strong, independent woman who embodies the qualities of intelligence, wit, and determination.\n",
+      "bucket": "long",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    }
+  ],
+  "per_batch": [
+    {
+      "batch_index": 1,
+      "batch_size": 16,
+      "bucket": "long",
+      "embedding_sec": 0.07097542192786932,
+      "retrieval_sec": 0.3761385171674192,
+      "generation_sec": 2.927610681159422,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 2,
+      "batch_size": 16,
+      "bucket": "long",
+      "embedding_sec": 0.06812013918533921,
+      "retrieval_sec": 0.30284736189059913,
+      "generation_sec": 2.8889104870613664,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 3,
+      "batch_size": 16,
+      "bucket": "long",
+      "embedding_sec": 0.06123619503341615,
+      "retrieval_sec": 0.3189733847975731,
+      "generation_sec": 2.826535691972822,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 4,
+      "batch_size": 16,
+      "bucket": "long",
+      "embedding_sec": 0.06930843717418611,
+      "retrieval_sec": 0.27065207599662244,
+      "generation_sec": 2.9501990671269596,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 5,
+      "batch_size": 16,
+      "bucket": "long",
+      "embedding_sec": 0.06779929203912616,
+      "retrieval_sec": 0.2732788738794625,
+      "generation_sec": 2.8272095508873463,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 6,
+      "batch_size": 16,
+      "bucket": "long",
+      "embedding_sec": 0.07288432284258306,
+      "retrieval_sec": 0.2748071560636163,
+      "generation_sec": 2.8613675499800593,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 7,
+      "batch_size": 4,
+      "bucket": "long",
+      "embedding_sec": 0.02181459520943463,
+      "retrieval_sec": 0.11437052814289927,
+      "generation_sec": 2.381517343921587,
+      "generated_tokens": 512,
+      "xE": 1,
+      "xR": 0
+    }
+  ],
+  "dispatch_trace": [],
+  "feedback_trace": [
+    {
+      "batch_index": 1,
+      "bucket": "long",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 115,
+      "token_length_max": 220,
+      "token_length_avg": 154.3125,
+      "embedding_ms_per_query": 4.4359638704918325,
+      "retrieval_ms_per_query": 23.5086573229637,
+      "generation_ms_per_query": 182.97566757246386,
+      "transfer_ms_per_query_est": 0.6653945805737749,
+      "batch_size_residual_ms_per_query": 176.8002887659194,
+      "ema_after_update": {
+        "embedding": 4.4359638704918325,
+        "retrieval": 23.5086573229637,
+        "generation": 182.97566757246386,
+        "transfer": 0.6653945805737749,
+        "batch_size_residual": 176.8002887659194,
+        "bucket_batch_size_ema": 17.0
+      }
+    },
+    {
+      "batch_index": 2,
+      "bucket": "long",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 115,
+      "token_length_max": 222,
+      "token_length_avg": 163.25,
+      "embedding_ms_per_query": 4.257508699083701,
+      "retrieval_ms_per_query": 18.927960118162446,
+      "generation_ms_per_query": 180.5569054413354,
+      "transfer_ms_per_query_est": 0.6587025116459699,
+      "batch_size_residual_ms_per_query": 130.63938930246164,
+      "ema_after_update": {
+        "embedding": 4.3913500776398,
+        "retrieval": 22.363483021763386,
+        "generation": 182.37097703968175,
+        "transfer": 0.6587025116459699,
+        "batch_size_residual": 130.63938930246164,
+        "bucket_batch_size_ema": 17.75
+      }
+    },
+    {
+      "batch_index": 3,
+      "bucket": "long",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 119,
+      "token_length_max": 167,
+      "token_length_avg": 147.125,
+      "embedding_ms_per_query": 3.8272621895885095,
+      "retrieval_ms_per_query": 19.935836549848318,
+      "generation_ms_per_query": 176.65848074830137,
+      "transfer_ms_per_query_est": 0.6375492158440466,
+      "batch_size_residual_ms_per_query": 95.63880868609806,
+      "ema_after_update": {
+        "embedding": 4.250328105626977,
+        "retrieval": 21.75657140378462,
+        "generation": 180.94285296683665,
+        "transfer": 0.6375492158440466,
+        "batch_size_residual": 95.63880868609806,
+        "bucket_batch_size_ema": 18.3125
+      }
+    },
+    {
+      "batch_index": 4,
+      "bucket": "long",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 119,
+      "token_length_max": 222,
+      "token_length_avg": 170.625,
+      "embedding_ms_per_query": 4.331777323386632,
+      "retrieval_ms_per_query": 16.915754749788903,
+      "generation_ms_per_query": 184.38744169543497,
+      "transfer_ms_per_query_est": 0.6406035615100336,
+      "batch_size_residual_ms_per_query": 71.2410245337031,
+      "ema_after_update": {
+        "embedding": 4.270690410066891,
+        "retrieval": 20.54636724028569,
+        "generation": 181.80400014898623,
+        "transfer": 0.6406035615100336,
+        "batch_size_residual": 71.2410245337031,
+        "bucket_batch_size_ema": 18.734375
+      }
+    },
+    {
+      "batch_index": 5,
+      "bucket": "long",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 112,
+      "token_length_max": 207,
+      "token_length_avg": 141.25,
+      "embedding_ms_per_query": 4.237455752445385,
+      "retrieval_ms_per_query": 17.079929617466405,
+      "generation_ms_per_query": 176.70059693045914,
+      "transfer_ms_per_query_est": 0.6393572618492271,
+      "batch_size_residual_ms_per_query": 51.119848635157844,
+      "ema_after_update": {
+        "embedding": 4.262381745661514,
+        "retrieval": 19.67975783458087,
+        "generation": 180.52814934435446,
+        "transfer": 0.6393572618492271,
+        "batch_size_residual": 51.119848635157844,
+        "bucket_batch_size_ema": 19.05078125
+      }
+    },
+    {
+      "batch_index": 6,
+      "bucket": "long",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 115,
+      "token_length_max": 226,
+      "token_length_avg": 156.0,
+      "embedding_ms_per_query": 4.555270177661441,
+      "retrieval_ms_per_query": 17.175447253976017,
+      "generation_ms_per_query": 178.8354718737537,
+      "transfer_ms_per_query_est": 0.6503405780492244,
+      "batch_size_residual_ms_per_query": 37.20402225610466,
+      "ema_after_update": {
+        "embedding": 4.335603853661496,
+        "retrieval": 19.053680189429656,
+        "generation": 180.10497997670427,
+        "transfer": 0.6503405780492244,
+        "batch_size_residual": 37.20402225610466,
+        "bucket_batch_size_ema": 19.2880859375
+      }
+    },
+    {
+      "batch_index": 7,
+      "bucket": "long",
+      "batch_size": 4,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 144,
+      "token_length_max": 216,
+      "token_length_avg": 169.0,
+      "embedding_ms_per_query": 5.453648802358657,
+      "retrieval_ms_per_query": 28.59263203572482,
+      "generation_ms_per_query": 595.3793359803967,
+      "transfer_ms_per_query_est": 0.692267263625368,
+      "batch_size_residual_ms_per_query": 425.28101222063555,
+      "ema_after_update": {
+        "embedding": 4.615115090835786,
+        "retrieval": 21.438418151003447,
+        "generation": 283.9235689776274,
+        "transfer": 0.692267263625368,
+        "batch_size_residual": 425.28101222063555,
+        "bucket_batch_size_ema": 16.466064453125
+      }
+    }
+  ],
+  "chunk_trace": [
+    {
+      "batch_index": 1,
+      "bucket": "long",
+      "num_queries": 16,
+      "num_chunked_queries": 0,
+      "total_chunks": 16,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 2,
+      "bucket": "long",
+      "num_queries": 16,
+      "num_chunked_queries": 0,
+      "total_chunks": 16,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 3,
+      "bucket": "long",
+      "num_queries": 16,
+      "num_chunked_queries": 0,
+      "total_chunks": 16,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 4,
+      "bucket": "long",
+      "num_queries": 16,
+      "num_chunked_queries": 0,
+      "total_chunks": 16,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 5,
+      "bucket": "long",
+      "num_queries": 16,
+      "num_chunked_queries": 0,
+      "total_chunks": 16,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 6,
+      "bucket": "long",
+      "num_queries": 16,
+      "num_chunked_queries": 0,
+      "total_chunks": 16,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 7,
+      "bucket": "long",
+      "num_queries": 4,
+      "num_chunked_queries": 0,
+      "total_chunks": 4,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    }
+  ]
+}

@@ -1,0 +1,442 @@
+{
+  "config": {
+    "b": 16,
+    "xE": 1,
+    "xR": 0,
+    "xG": 1,
+    "nprobe": 128,
+    "topk": 1,
+    "embedding_model": "intfloat/e5-large-v2",
+    "generator_model": "/data/home/mazhenxiang/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3.1-8B-Instruct"
+  },
+  "scheduler": {
+    "mode": "plain_fixed_batch",
+    "bucket_thresholds": {
+      "short": 48,
+      "long": 128
+    },
+    "bucket_batch_sizes": {
+      "short": 64,
+      "mid": 32,
+      "long": 16
+    },
+    "bucket_counts": {
+      "short": 0,
+      "mid": 32,
+      "long": 0
+    },
+    "action_counts": {
+      "xE1_xR0": 32
+    },
+    "max_q_er": 0,
+    "max_q_rg": 0,
+    "fixed_nprobe": 128,
+    "execution": "serial_pipeline"
+  },
+  "timing_breakdown": {
+    "token_length_prep_ms": 15.001492109149694,
+    "scheduler_dispatch_ms_total": 0.0,
+    "scheduler_dispatch_ms_avg": 0.0,
+    "scheduler_feedback_ms_total": 0.0,
+    "scheduler_feedback_ms_avg": 0.0
+  },
+  "num_queries": 512,
+  "avg_embedding_ms": 2.0333559709797555,
+  "avg_retrieval_ms": 18.191970571479033,
+  "avg_generation_ms": 162.22243868742225,
+  "total_ms": 93413.2557976991,
+  "throughput_qps": 5.48102082116499,
+  "wall_time_ms": 93437.06839997321,
+  "wall_throughput_qps": 5.479623973306795,
+  "total_generated_tokens": 65536,
+  "generation_ms_per_token": 1.2673628022454864,
+  "samples": [
+    {
+      "query": "What causes ThermaCELL Mosquito Repellent: Product Review?",
+      "top_doc_snippet": "ThermaCELL Mosquito Repellent: Product Review\nThermaCELL Mosquito Repellent: Product Review. If youâre a mosquito magnet like me, youâre always looking for ways to keep the pesky critters at bay. Choices mostly involve covering yourself in smelly sprays or lighting smoky and smelly coils or cand",
+      "answer": " Heat\nThe ThermaCELL Mosquito Repellent uses heat to repel mosquitoes. The device uses a butane cartridge to heat a mat that releases a repellent gas, which is then released into the air to repel mosquitoes. This heat-based technology is a unique and effective way to keep mosquitoes at bay, making it a great option for outdoor enthusiasts and anyone looking for a more pleasant and effective mosquito repellent solution. The ThermaCELL Mosquito Repellent is a great product that is easy to use, portable, and effective, making it a great choice for anyone looking to enjoy the outdoors without the nuisance of mosquitoes.",
+      "bucket": "mid",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    },
+    {
+      "query": "What are the most important things to understand about Steve Wheeler, and what common mistakes do people make when dealing with it?",
+      "top_doc_snippet": "Steve Wheeler\nWith over 20 years of experience in the financial services industry, Steve has extensive expertise in consumer finance risk management and compliance, operational risk management, and securitization and funding strategy.",
+      "answer": " To understand Steve Wheeler, it's essential to recognize his background and expertise in the financial services industry, particularly in consumer finance risk management and compliance. Common mistakes people make when dealing with Steve include:\n1. Underestimating his experience: With over 20 years in the industry, Steve has a deep understanding of the complexities involved in consumer finance risk management and compliance.\n2. Failing to appreciate his breadth of expertise: Steve's experience spans multiple areas, including operational risk management and securitization and funding strategy, making him a valuable resource for comprehensive advice.\n3. Not recognizing the importance of his compliance expertise: Steve's background in",
+      "bucket": "mid",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    },
+    {
+      "query": "Describe the history and development of ThermaCELL Mosquito Repellent: Product Review, highlighting the major milestones and how understanding has evolved over time.",
+      "top_doc_snippet": "ThermaCELL Mosquito Repellent: Product Review\nThermaCELL Mosquito Repellent: Product Review. If youâre a mosquito magnet like me, youâre always looking for ways to keep the pesky critters at bay. Choices mostly involve covering yourself in smelly sprays or lighting smoky and smelly coils or cand",
+      "answer": " ThermaCELL Mosquito Repellent: Product Review\nThe ThermaCELL Mosquito Repellent has a rich history that spans over two decades. The product was first introduced in the early 2000s by the Thermacell Outdoor Products company, which was founded by a group of outdoor enthusiasts who were frustrated with the existing mosquito repellent options. The founders, who were avid hunters and campers, recognized the need for a more effective and convenient way to repel mosquitoes and other insects.\nThe first ThermaCELL Mosquito Repellent was a small, portable device that used a butane cartridge to heat a mat that",
+      "bucket": "mid",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    }
+  ],
+  "per_batch": [
+    {
+      "batch_index": 1,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.029099575942382216,
+      "retrieval_sec": 0.3307378280442208,
+      "generation_sec": 2.6986137030180544,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 2,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.030703779077157378,
+      "retrieval_sec": 0.2729282120708376,
+      "generation_sec": 2.6006793440319598,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 3,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03291673306375742,
+      "retrieval_sec": 0.2538762728217989,
+      "generation_sec": 2.5730238740798086,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 4,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.02877113502472639,
+      "retrieval_sec": 0.27464930596761405,
+      "generation_sec": 2.5756285560783,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 5,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.031317088985815644,
+      "retrieval_sec": 0.26039058715105057,
+      "generation_sec": 2.5979504850693047,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 6,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03075072797946632,
+      "retrieval_sec": 0.2566968740429729,
+      "generation_sec": 2.60044390684925,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 7,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03124555293470621,
+      "retrieval_sec": 0.2697263779118657,
+      "generation_sec": 2.600014680996537,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 8,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.02841512206941843,
+      "retrieval_sec": 0.31697303196415305,
+      "generation_sec": 2.613004146143794,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 9,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.028879479970782995,
+      "retrieval_sec": 0.2544793300330639,
+      "generation_sec": 2.5992363239638507,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 10,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.02684891107492149,
+      "retrieval_sec": 0.26292931591160595,
+      "generation_sec": 2.5667780849616975,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 11,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03423130791634321,
+      "retrieval_sec": 0.2868980111088604,
+      "generation_sec": 2.590513987932354,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 12,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03221166902221739,
+      "retrieval_sec": 0.32257037283852696,
+      "generation_sec": 2.5742428018711507,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 13,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.030490966979414225,
+      "retrieval_sec": 0.2547805190552026,
+      "generation_sec": 2.5590003919787705,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 14,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.032679293071851134,
+      "retrieval_sec": 0.2856782141607255,
+      "generation_sec": 2.5989282969385386,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 15,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.02898674295283854,
+      "retrieval_sec": 0.32327972282655537,
+      "generation_sec": 2.6036512330174446,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 16,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.029548072954639792,
+      "retrieval_sec": 0.26415098388679326,
+      "generation_sec": 2.5758726510684937,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 17,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03289357805624604,
+      "retrieval_sec": 0.25067038694396615,
+      "generation_sec": 2.6174257989041507,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 18,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03202110901474953,
+      "retrieval_sec": 0.24744097096845508,
+      "generation_sec": 2.563154421048239,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 19,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.031932762125507,
+      "retrieval_sec": 0.2473683429416269,
+      "generation_sec": 2.612402165075764,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 20,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.02935219299979508,
+      "retrieval_sec": 0.2486524109262973,
+      "generation_sec": 2.5720910008531064,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 21,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.08392986701801419,
+      "retrieval_sec": 0.2544034640304744,
+      "generation_sec": 2.6210024398751557,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 22,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.031495614908635616,
+      "retrieval_sec": 0.2347937289159745,
+      "generation_sec": 2.599897204898298,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 23,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.0328196978662163,
+      "retrieval_sec": 0.3157878848724067,
+      "generation_sec": 2.593585919821635,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 24,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03141794796101749,
+      "retrieval_sec": 0.31095873611047864,
+      "generation_sec": 2.601370324846357,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 25,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.029450909001752734,
+      "retrieval_sec": 0.3681234810501337,
+      "generation_sec": 2.5541726709343493,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 26,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.028496926184743643,
+      "retrieval_sec": 0.26653776387684047,
+      "generation_sec": 2.5889961649663746,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 27,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.029991772025823593,
+      "retrieval_sec": 0.34885249589569867,
+      "generation_sec": 2.598264393862337,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 28,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03230885206721723,
+      "retrieval_sec": 0.4270534520037472,
+      "generation_sec": 2.58202304597944,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 29,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03230844088830054,
+      "retrieval_sec": 0.40110993292182684,
+      "generation_sec": 2.63747221394442,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 30,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03181627090089023,
+      "retrieval_sec": 0.3114228821359575,
+      "generation_sec": 2.611224137013778,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 31,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03187096398323774,
+      "retrieval_sec": 0.2778271450661123,
+      "generation_sec": 2.5929128259886056,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 32,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.03187519311904907,
+      "retrieval_sec": 0.3125408941414207,
+      "generation_sec": 2.5843114119488746,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    }
+  ],
+  "dispatch_trace": [],
+  "feedback_trace": [],
+  "chunk_trace": []
+}

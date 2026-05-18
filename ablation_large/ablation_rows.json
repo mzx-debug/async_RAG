@@ -1,0 +1,68 @@
+[
+  {
+    "name": "plain_b16",
+    "mode": "plain_fixed_batch",
+    "wall_time_ms": 85339.08609999344,
+    "wall_qps": 5.999595535861256,
+    "avg_emb_ms": 13.45717994036022,
+    "avg_ret_ms": 18.682456748592813,
+    "avg_gen_ms": 165.2449752123175,
+    "dispatch_ms": 0.0,
+    "feedback_ms": 1.479306723922491
+  },
+  {
+    "name": "plain_b64",
+    "mode": "plain_fixed_batch",
+    "wall_time_ms": 33945.15077304095,
+    "wall_qps": 15.083155865863102,
+    "avg_emb_ms": 2.0292781618991285,
+    "avg_ret_ms": 14.280264418175648,
+    "avg_gen_ms": 64.35515385737745,
+    "dispatch_ms": 0.0,
+    "feedback_ms": 0.5505078006535769
+  },
+  {
+    "name": "bucket_fixed_batch_fixed_action",
+    "mode": "online_dispatch_ema_v1",
+    "wall_time_ms": 37968.75077113509,
+    "wall_qps": 13.484773388679322,
+    "avg_emb_ms": 1.5102150287020777,
+    "avg_ret_ms": 14.70044562847761,
+    "avg_gen_ms": 72.22236589632303,
+    "dispatch_ms": 1.137572806328535,
+    "feedback_ms": 0.4773570690304041
+  },
+  {
+    "name": "bucket_online_batch_fixed_action",
+    "mode": "online_dispatch_ema_v1",
+    "wall_time_ms": 37982.34952497296,
+    "wall_qps": 13.479945458965508,
+    "avg_emb_ms": 1.5310199905798072,
+    "avg_ret_ms": 14.452301157689362,
+    "avg_gen_ms": 72.25651914677655,
+    "dispatch_ms": 2.6960098184645176,
+    "feedback_ms": 0.6513660773634911
+  },
+  {
+    "name": "bucket_online_batch_online_action",
+    "mode": "online_dispatch_ema_v1",
+    "wall_time_ms": 37997.45835317299,
+    "wall_qps": 13.474585464141848,
+    "avg_emb_ms": 1.5301362009267905,
+    "avg_ret_ms": 14.81360307570867,
+    "avg_gen_ms": 72.16069424293892,
+    "dispatch_ms": 15.024699503555894,
+    "feedback_ms": 0.41810283437371254
+  },
+  {
+    "name": "bucket_online_batch_online_action_no_chunk",
+    "mode": "online_dispatch_ema_v1",
+    "wall_time_ms": 38765.25025907904,
+    "wall_qps": 13.207705266396074,
+    "avg_emb_ms": 1.0764121839201835,
+    "avg_ret_ms": 15.43477532459292,
+    "avg_gen_ms": 73.756106413839,
+    "dispatch_ms": 1.7597971018403769,
+    "feedback_ms": 0.9288089349865913
+  }
+]

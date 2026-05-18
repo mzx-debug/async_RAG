@@ -1,0 +1,35 @@
+[
+  {
+    "mode": "serial",
+    "execution": "serial_pipeline",
+    "num_queries": 512,
+    "wall_time_ms": 93437.06839997321,
+    "wall_qps": 5.479623973306795,
+    "total_ms": 93413.2557976991,
+    "avg_emb_ms": 2.0333559709797555,
+    "avg_ret_ms": 18.191970571479033,
+    "avg_gen_ms": 162.22243868742225
+  },
+  {
+    "mode": "async_plain",
+    "execution": "async_threaded_pipeline_plain",
+    "num_queries": 512,
+    "wall_time_ms": 84188.21280193515,
+    "wall_qps": 6.081611462694349,
+    "total_ms": 99443.15945939161,
+    "avg_emb_ms": 13.198335960623808,
+    "avg_ret_ms": 17.417487493730732,
+    "avg_gen_ms": 163.6090973647697
+  },
+  {
+    "mode": "async_bucket",
+    "execution": "async_threaded_pipeline_bucket",
+    "num_queries": 512,
+    "wall_time_ms": 37927.09689587355,
+    "wall_qps": 13.499583197882604,
+    "total_ms": 44966.21561096981,
+    "avg_emb_ms": 1.3315049359334807,
+    "avg_ret_ms": 14.503472643355053,
+    "avg_gen_ms": 71.98966228588688
+  }
+]

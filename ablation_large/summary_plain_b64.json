@@ -1,0 +1,436 @@
+{
+  "config": {
+    "b": 64,
+    "xE": 1,
+    "xR": 0,
+    "xG": 1,
+    "nprobe": 128,
+    "topk": 1,
+    "embedding_model": "intfloat/e5-large-v2",
+    "generator_model": "/data/home/mazhenxiang/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3.1-8B-Instruct"
+  },
+  "scheduler": {
+    "mode": "plain_fixed_batch",
+    "bucket_thresholds": {
+      "short": 48,
+      "long": 128
+    },
+    "bucket_batch_sizes": {
+      "short": 64,
+      "mid": 32,
+      "long": 16
+    },
+    "bucket_counts": {
+      "short": 0,
+      "mid": 8,
+      "long": 0
+    },
+    "action_counts": {
+      "xE1_xR0": 8
+    },
+    "max_q_er": 8,
+    "max_q_rg": 6,
+    "fixed_nprobe": 128,
+    "execution": "async_threaded_pipeline_plain"
+  },
+  "timing_breakdown": {
+    "token_length_prep_ms": 16.9911440461874,
+    "scheduler_dispatch_ms_total": 0.0,
+    "scheduler_dispatch_ms_avg": 0.0,
+    "scheduler_feedback_ms_total": 0.5505078006535769,
+    "scheduler_feedback_ms_avg": 0.0688134750816971
+  },
+  "num_queries": 512,
+  "avg_embedding_ms": 2.0292781618991285,
+  "avg_retrieval_ms": 14.280264418175648,
+  "avg_generation_ms": 64.35515385737745,
+  "total_ms": 41300.32457597554,
+  "throughput_qps": 12.39699700321075,
+  "wall_time_ms": 33945.15077304095,
+  "wall_throughput_qps": 15.083155865863102,
+  "total_generated_tokens": 65536,
+  "generation_ms_per_token": 0.5027746395107613,
+  "samples": [
+    {
+      "query": "What causes ThermaCELL Mosquito Repellent: Product Review?",
+      "top_doc_snippet": "ThermaCELL Mosquito Repellent: Product Review\nThermaCELL Mosquito Repellent: Product Review. If youâre a mosquito magnet like me, youâre always looking for ways to keep the pesky critters at bay. Choices mostly involve covering yourself in smelly sprays or lighting smoky and smelly coils or cand",
+      "answer": " Heat\nThe ThermaCELL Mosquito Repellent uses heat to repel mosquitoes. The device uses a butane cartridge to heat a mat that releases a repellent gas, which is then released into the air to repel mosquitoes. This heat-based technology is a unique and effective way to keep mosquitoes at bay, making it a great option for outdoor enthusiasts and anyone looking for a more pleasant and effective mosquito repellent solution. The ThermaCELL Mosquito Repellent is a great product that is easy to use, portable, and effective, making it a great choice for anyone looking to enjoy the outdoors without the nuisance of mosquitoes.",
+      "bucket": "mid",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    },
+    {
+      "query": "What are the most important things to understand about Steve Wheeler, and what common mistakes do people make when dealing with it?",
+      "top_doc_snippet": "Steve Wheeler\nWith over 20 years of experience in the financial services industry, Steve has extensive expertise in consumer finance risk management and compliance, operational risk management, and securitization and funding strategy.",
+      "answer": " To understand Steve Wheeler, it's essential to recognize his background and expertise in the financial services industry, particularly in consumer finance risk management and compliance. Common mistakes people make when dealing with Steve include:\n1. Underestimating his experience: With over 20 years in the industry, Steve has a deep understanding of the complexities involved in consumer finance risk management and compliance.\n2. Failing to appreciate his breadth of expertise: Steve's experience spans multiple areas, including operational risk management and securitization and funding strategy, making him a valuable resource for comprehensive advice.\n3. Not recognizing the importance of his compliance expertise: Steve's background in",
+      "bucket": "mid",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    },
+    {
+      "query": "Describe the history and development of ThermaCELL Mosquito Repellent: Product Review, highlighting the major milestones and how understanding has evolved over time.",
+      "top_doc_snippet": "ThermaCELL Mosquito Repellent: Product Review\nThermaCELL Mosquito Repellent: Product Review. If youâre a mosquito magnet like me, youâre always looking for ways to keep the pesky critters at bay. Choices mostly involve covering yourself in smelly sprays or lighting smoky and smelly coils or cand",
+      "answer": " ThermaCELL Mosquito Repellent: Product Review\nThe ThermaCELL Mosquito Repellent has a rich history that spans over two decades. The product was first introduced in the early 2000s by the Thermacell Outdoor Products company, which was founded by a group of outdoor enthusiasts who were frustrated with the existing mosquito repellent options. The founders were determined to create a more effective, convenient, and environmentally friendly solution for outdoor enthusiasts.\nThe first ThermaCELL Mosquito Repellent was a handheld device that used a butane cartridge to heat a mat that released a vaporized repellent, allethrin,",
+      "bucket": "mid",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    }
+  ],
+  "per_batch": [
+    {
+      "batch_index": 1,
+      "batch_size": 64,
+      "bucket": "mid",
+      "embedding_sec": 0.15043200203217566,
+      "retrieval_sec": 0.8301501839887351,
+      "generation_sec": 5.135729993926361,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 2,
+      "batch_size": 64,
+      "bucket": "mid",
+      "embedding_sec": 0.11131782690063119,
+      "retrieval_sec": 0.8703347779810429,
+      "generation_sec": 4.229543531080708,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 3,
+      "batch_size": 64,
+      "bucket": "mid",
+      "embedding_sec": 0.10825668601319194,
+      "retrieval_sec": 0.9484718479216099,
+      "generation_sec": 3.902464837068692,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 4,
+      "batch_size": 64,
+      "bucket": "mid",
+      "embedding_sec": 0.12062043603509665,
+      "retrieval_sec": 0.9526333049871027,
+      "generation_sec": 3.9527960000559688,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 5,
+      "batch_size": 64,
+      "bucket": "mid",
+      "embedding_sec": 0.12587505299597979,
+      "retrieval_sec": 0.9140814610291272,
+      "generation_sec": 3.934165060054511,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 6,
+      "batch_size": 64,
+      "bucket": "mid",
+      "embedding_sec": 0.2050489669200033,
+      "retrieval_sec": 0.9208584190346301,
+      "generation_sec": 3.9013067549094558,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 7,
+      "batch_size": 64,
+      "bucket": "mid",
+      "embedding_sec": 0.1067211008630693,
+      "retrieval_sec": 0.9146788090001792,
+      "generation_sec": 4.026222680928186,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 8,
+      "batch_size": 64,
+      "bucket": "mid",
+      "embedding_sec": 0.11071834713220596,
+      "retrieval_sec": 0.9602865781635046,
+      "generation_sec": 3.86760991695337,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    }
+  ],
+  "dispatch_trace": [],
+  "feedback_trace": [
+    {
+      "batch_index": 1,
+      "bucket": "mid",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 4,
+      "token_length_max": 90,
+      "token_length_avg": 23.59375,
+      "embedding_ms_per_query": 2.3505000317527447,
+      "retrieval_ms_per_query": 12.971096624823986,
+      "generation_ms_per_query": 80.2457811550994,
+      "transfer_ms_per_query_est": 0.3525750047629117,
+      "batch_size_residual_ms_per_query": 76.30737781167613,
+      "ema_after_update": {
+        "embedding": 2.3505000317527447,
+        "retrieval": 12.971096624823986,
+        "generation": 80.2457811550994,
+        "transfer": 0.3525750047629117,
+        "batch_size_residual": 76.30737781167613,
+        "bucket_batch_size_ema": 39.0
+      }
+    },
+    {
+      "batch_index": 2,
+      "bucket": "mid",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 4,
+      "token_length_max": 88,
+      "token_length_avg": 27.921875,
+      "embedding_ms_per_query": 1.7393410453223623,
+      "retrieval_ms_per_query": 13.598980905953795,
+      "generation_ms_per_query": 66.08661767313606,
+      "transfer_ms_per_query_est": 0.32965654277177237,
+      "batch_size_residual_ms_per_query": 53.606780060750395,
+      "ema_after_update": {
+        "embedding": 2.197710285145149,
+        "retrieval": 13.128067695106438,
+        "generation": 76.70599028460856,
+        "transfer": 0.32965654277177237,
+        "batch_size_residual": 53.606780060750395,
+        "bucket_batch_size_ema": 44.25
+      }
+    },
+    {
+      "batch_index": 3,
+      "bucket": "mid",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 3,
+      "token_length_max": 90,
+      "token_length_avg": 24.65625,
+      "embedding_ms_per_query": 1.691510718956124,
+      "retrieval_ms_per_query": 14.819872623775154,
+      "generation_ms_per_query": 60.97601307919831,
+      "transfer_ms_per_query_est": 0.3106740590396839,
+      "batch_size_residual_ms_per_query": 36.486577949137214,
+      "ema_after_update": {
+        "embedding": 2.071160393597893,
+        "retrieval": 13.551018927273617,
+        "generation": 72.773495983256,
+        "transfer": 0.3106740590396839,
+        "batch_size_residual": 36.486577949137214,
+        "bucket_batch_size_ema": 48.1875
+      }
+    },
+    {
+      "batch_index": 4,
+      "bucket": "mid",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 5,
+      "token_length_max": 85,
+      "token_length_avg": 24.96875,
+      "embedding_ms_per_query": 1.884694313048385,
+      "retrieval_ms_per_query": 14.88489539042348,
+      "generation_ms_per_query": 61.76243750087451,
+      "transfer_ms_per_query_est": 0.3036815810190774,
+      "batch_size_residual_ms_per_query": 24.821352922147707,
+      "ema_after_update": {
+        "embedding": 2.024543873460516,
+        "retrieval": 13.884488043061083,
+        "generation": 70.02073136266063,
+        "transfer": 0.3036815810190774,
+        "batch_size_residual": 24.821352922147707,
+        "bucket_batch_size_ema": 51.140625
+      }
+    },
+    {
+      "batch_index": 5,
+      "bucket": "mid",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 3,
+      "token_length_max": 88,
+      "token_length_avg": 29.609375,
+      "embedding_ms_per_query": 1.9667977030621842,
+      "retrieval_ms_per_query": 14.282522828580113,
+      "generation_ms_per_query": 61.47132906335173,
+      "transfer_ms_per_query_est": 0.30151609962913994,
+      "batch_size_residual_ms_per_query": 16.48781587530896,
+      "ema_after_update": {
+        "embedding": 2.010107330860933,
+        "retrieval": 13.98399673944084,
+        "generation": 67.8833807878334,
+        "transfer": 0.30151609962913994,
+        "batch_size_residual": 16.48781587530896,
+        "bucket_batch_size_ema": 53.35546875
+      }
+    },
+    {
+      "batch_index": 6,
+      "bucket": "mid",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 5,
+      "token_length_max": 100,
+      "token_length_avg": 29.0,
+      "embedding_ms_per_query": 3.2038901081250515,
+      "retrieval_ms_per_query": 14.388412797416095,
+      "generation_ms_per_query": 60.95791804546025,
+      "transfer_ms_per_query_est": 0.3462829537765444,
+      "batch_size_residual_ms_per_query": 10.95866690479099,
+      "ema_after_update": {
+        "embedding": 2.3085530251769626,
+        "retrieval": 14.085100753934654,
+        "generation": 66.15201510224011,
+        "transfer": 0.3462829537765444,
+        "batch_size_residual": 10.95866690479099,
+        "bucket_batch_size_ema": 55.0166015625
+      }
+    },
+    {
+      "batch_index": 7,
+      "bucket": "mid",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 3,
+      "token_length_max": 84,
+      "token_length_avg": 23.078125,
+      "embedding_ms_per_query": 1.6675172009854577,
+      "retrieval_ms_per_query": 14.2918563906278,
+      "generation_ms_per_query": 62.9097293895029,
+      "transfer_ms_per_query_est": 0.32224411036936296,
+      "batch_size_residual_ms_per_query": 7.2132879650902115,
+      "ema_after_update": {
+        "embedding": 2.1482940691290864,
+        "retrieval": 14.13678966310794,
+        "generation": 65.34144367405581,
+        "transfer": 0.32224411036936296,
+        "batch_size_residual": 7.2132879650902115,
+        "bucket_batch_size_ema": 56.262451171875
+      }
+    },
+    {
+      "batch_index": 8,
+      "bucket": "mid",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 4,
+      "token_length_max": 86,
+      "token_length_avg": 27.515625,
+      "embedding_ms_per_query": 1.7299741739407182,
+      "retrieval_ms_per_query": 15.00447778380476,
+      "generation_ms_per_query": 60.431404952396406,
+      "transfer_ms_per_query_est": 0.30655711429979915,
+      "batch_size_residual_ms_per_query": 4.214237322187582,
+      "ema_after_update": {
+        "embedding": 2.0437140953319943,
+        "retrieval": 14.353711693282145,
+        "generation": 64.11393399364096,
+        "transfer": 0.30655711429979915,
+        "batch_size_residual": 4.214237322187582,
+        "bucket_batch_size_ema": 57.19683837890625
+      }
+    }
+  ],
+  "chunk_trace": [
+    {
+      "batch_index": 1,
+      "bucket": "mid",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 2,
+      "bucket": "mid",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 3,
+      "bucket": "mid",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 4,
+      "bucket": "mid",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 5,
+      "bucket": "mid",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 6,
+      "bucket": "mid",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 7,
+      "bucket": "mid",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 8,
+      "bucket": "mid",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    }
+  ]
+}

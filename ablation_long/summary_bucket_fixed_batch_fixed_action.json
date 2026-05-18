@@ -1,0 +1,639 @@
+{
+  "config": {
+    "b": 16,
+    "xE": 1,
+    "xR": 0,
+    "xG": 1,
+    "nprobe": 128,
+    "topk": 1,
+    "embedding_model": "intfloat/e5-large-v2",
+    "generator_model": "/data/home/mazhenxiang/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3.1-8B-Instruct"
+  },
+  "scheduler": {
+    "mode": "online_dispatch_ema_v1",
+    "bucket_thresholds": {
+      "short": 48,
+      "long": 128
+    },
+    "bucket_batch_sizes": {
+      "short": 64,
+      "mid": 32,
+      "long": 16
+    },
+    "bucket_counts": {
+      "short": 0,
+      "mid": 1,
+      "long": 6
+    },
+    "action_counts": {
+      "xE1_xR0": 7
+    },
+    "max_q_er": 7,
+    "max_q_rg": 3,
+    "fixed_nprobe": 128,
+    "execution": "async_threaded_pipeline_bucket"
+  },
+  "timing_breakdown": {
+    "token_length_prep_ms": 18.41322402469814,
+    "scheduler_dispatch_ms_total": 0.6145727820694447,
+    "scheduler_dispatch_ms_avg": 0.08779611172420639,
+    "scheduler_feedback_ms_total": 0.23366138339042664,
+    "scheduler_feedback_ms_avg": 0.0333801976272038
+  },
+  "num_queries": 100,
+  "avg_embedding_ms": 10.587706451769918,
+  "avg_retrieval_ms": 19.381353887729347,
+  "avg_generation_ms": 195.40691122878343,
+  "total_ms": 22537.59715682827,
+  "throughput_qps": 4.43703023459636,
+  "wall_time_ms": 19981.541260844097,
+  "wall_throughput_qps": 5.004618947786594,
+  "total_generated_tokens": 12800,
+  "generation_ms_per_token": 1.5266164939748705,
+  "samples": [
+    {
+      "query": "Provide a comprehensive analysis of Where does Aluminum, Vinyl, Wood Windows and More come from? Begin by defining the core concept and its historical development from early origins to present day. Then explain the underlying mechanisms, key components, and how they interact with each other. Discuss the practical applications across different domains and industries, including specific use cases and real-world examples. Analyze the advantages and limitations, comparing it with alternative approaches or competing theories. Address common misconceptions and clarify what distinguishes it from closely related concepts. Finally, evaluate current research trends, unresolved challenges, and promising directions for future development.",
+      "top_doc_snippet": "-\nlook at the physical limitations the industry faces, brief treatment of machine life and. obsolescence, an extensive treatment of evolving automation technologies, and speculation on. what trends we may see in the future.",
+      "answer": " \nThe core concept of Aluminum, Vinyl, Wood Windows and More refers to the various materials and technologies used in the manufacturing of windows and doors for buildings. The historical development of these materials dates back to ancient civilizations, where wood was the primary material used for window construction. However, with the advent of industrialization and technological advancements, new materials such as aluminum, vinyl, and fiberglass emerged, offering improved durability, energy efficiency, and aesthetic appeal.\n\n**Early Origins and Historical Development:**\nThe use of wood for window construction dates back to ancient Egypt and Greece, where wooden frames were used to create openings for light and ventilation. In the Middle",
+      "bucket": "mid",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    },
+    {
+      "query": "Provide a comprehensive analysis of What is IT systems management: The production acceptance process used for? Begin by defining the core concept and its historical development from early origins to present day. Then explain the underlying mechanisms, key components, and how they interact with each other. Discuss the practical applications across different domains and industries, including specific use cases and real-world examples. Analyze the advantages and limitations, comparing it with alternative approaches or competing theories. Address common misconceptions and clarify what distinguishes it from closely related concepts. Finally, evaluate current research trends, unresolved challenges, and promising directions for future development.",
+      "top_doc_snippet": "-\nlook at the physical limitations the industry faces, brief treatment of machine life and. obsolescence, an extensive treatment of evolving automation technologies, and speculation on. what trends we may see in the future.",
+      "answer": " IT systems management, also known as IT service management (ITSM), is a set of processes and practices used to manage and maintain IT systems, infrastructure, and services. The production acceptance process is a critical component of ITSM, ensuring that new or modified IT systems meet the required standards and are ready for production deployment.\n\n**Definition and Historical Development:**\nIT systems management has its roots in the early days of computing, when IT systems were simple and manual processes were used to manage them. Over time, as IT systems became more complex and widespread, the need for formalized processes and tools grew. The IT Infrastructure Library (ITIL)",
+      "bucket": "mid",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    },
+    {
+      "query": "Provide a comprehensive analysis of Who or what is Normal Sounds and Noises a Refrigerator Makes? Begin by defining the core concept and its historical development from early origins to present day. Then explain the underlying mechanisms, key components, and how they interact with each other. Discuss the practical applications across different domains and industries, including specific use cases and real-world examples. Analyze the advantages and limitations, comparing it with alternative approaches or competing theories. Address common misconceptions and clarify what distinguishes it from closely related concepts. Finally, evaluate current research trends, unresolved challenges, and promising directions for future development.",
+      "top_doc_snippet": "-\n* Look for a pattern. * Examine related problems, and determine if the same technique can be applied. * Examine a simpler or special case of the problem to gain insight into the solution of the original problem. * Make a table.",
+      "answer": " Normal Sounds and Noises a Refrigerator Makes is a comprehensive analysis of the various sounds and noises that a refrigerator can produce during its operation. The core concept revolves around understanding the underlying mechanisms and key components that contribute to these sounds, which can range from normal operating noises to potential indicators of malfunction or wear and tear.\n\n**Definition and Historical Development:**\nThe concept of normal sounds and noises a refrigerator makes has its roots in the early days of refrigeration technology. As refrigerators evolved from simple iceboxes to complex appliances, manufacturers and users began to notice and document the various sounds and noises they produced. Over time, these observations led to a",
+      "bucket": "mid",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    }
+  ],
+  "per_batch": [
+    {
+      "batch_index": 1,
+      "batch_size": 16,
+      "bucket": "mid",
+      "embedding_sec": 0.09733475791290402,
+      "retrieval_sec": 0.33594091492705047,
+      "generation_sec": 3.0395575759466738,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 2,
+      "batch_size": 16,
+      "bucket": "long",
+      "embedding_sec": 0.18567197979427874,
+      "retrieval_sec": 0.2778609360102564,
+      "generation_sec": 2.9427225368563086,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 3,
+      "batch_size": 16,
+      "bucket": "long",
+      "embedding_sec": 0.12014074786566198,
+      "retrieval_sec": 0.2906473458278924,
+      "generation_sec": 2.825353820808232,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 4,
+      "batch_size": 16,
+      "bucket": "long",
+      "embedding_sec": 0.13635625480674207,
+      "retrieval_sec": 0.29843510314822197,
+      "generation_sec": 2.7969941461924464,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 5,
+      "batch_size": 16,
+      "bucket": "long",
+      "embedding_sec": 0.18473089905455709,
+      "retrieval_sec": 0.27362804883159697,
+      "generation_sec": 2.7876918830443174,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 6,
+      "batch_size": 16,
+      "bucket": "long",
+      "embedding_sec": 0.1868909338954836,
+      "retrieval_sec": 0.3079075471032411,
+      "generation_sec": 2.792197602102533,
+      "generated_tokens": 2048,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 7,
+      "batch_size": 4,
+      "bucket": "long",
+      "embedding_sec": 0.1476450718473643,
+      "retrieval_sec": 0.15371549292467535,
+      "generation_sec": 2.356173557927832,
+      "generated_tokens": 512,
+      "xE": 1,
+      "xR": 0
+    }
+  ],
+  "dispatch_trace": [
+    {
+      "dispatch_index": 1,
+      "bucket": "mid",
+      "chosen_batch_size": 16,
+      "candidate_batch_sizes": [
+        16
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 135.98160000000001,
+          "predicted_dispatch_cost_ms_per_query": 148.5166
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 9.7086,
+          "predicted_dispatch_cost_ms_per_query": 22.2436
+        }
+      ],
+      "q_er_len": 0,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 9.7086,
+      "predicted_dispatch_cost_ms_per_query": 22.2436,
+      "pending_queries_by_bucket": {
+        "short": 0,
+        "mid": 0,
+        "long": 84
+      }
+    },
+    {
+      "dispatch_index": 2,
+      "bucket": "long",
+      "chosen_batch_size": 16,
+      "candidate_batch_sizes": [
+        16
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 421.48240000000004,
+          "predicted_dispatch_cost_ms_per_query": 440.63740000000007
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 15.9694,
+          "predicted_dispatch_cost_ms_per_query": 35.1244
+        }
+      ],
+      "q_er_len": 1,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 15.9694,
+      "predicted_dispatch_cost_ms_per_query": 35.1244,
+      "pending_queries_by_bucket": {
+        "short": 0,
+        "mid": 0,
+        "long": 68
+      }
+    },
+    {
+      "dispatch_index": 3,
+      "bucket": "long",
+      "chosen_batch_size": 16,
+      "candidate_batch_sizes": [
+        16
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 245.1814,
+          "predicted_dispatch_cost_ms_per_query": 262.6264
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 12.13615,
+          "predicted_dispatch_cost_ms_per_query": 29.58115
+        }
+      ],
+      "q_er_len": 2,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 12.13615,
+      "predicted_dispatch_cost_ms_per_query": 29.58115,
+      "pending_queries_by_bucket": {
+        "short": 0,
+        "mid": 0,
+        "long": 52
+      }
+    },
+    {
+      "dispatch_index": 4,
+      "bucket": "long",
+      "chosen_batch_size": 16,
+      "candidate_batch_sizes": [
+        16
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 224.2854,
+          "predicted_dispatch_cost_ms_per_query": 241.49040000000002
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 11.67615,
+          "predicted_dispatch_cost_ms_per_query": 28.881149999999998
+        }
+      ],
+      "q_er_len": 3,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 11.67615,
+      "predicted_dispatch_cost_ms_per_query": 28.881149999999998,
+      "pending_queries_by_bucket": {
+        "short": 0,
+        "mid": 0,
+        "long": 36
+      }
+    },
+    {
+      "dispatch_index": 5,
+      "bucket": "long",
+      "chosen_batch_size": 16,
+      "candidate_batch_sizes": [
+        16
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 192.3496,
+          "predicted_dispatch_cost_ms_per_query": 209.1646
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 10.9696,
+          "predicted_dispatch_cost_ms_per_query": 27.784599999999998
+        }
+      ],
+      "q_er_len": 4,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 10.9696,
+      "predicted_dispatch_cost_ms_per_query": 27.784599999999998,
+      "pending_queries_by_bucket": {
+        "short": 0,
+        "mid": 0,
+        "long": 20
+      }
+    },
+    {
+      "dispatch_index": 6,
+      "bucket": "long",
+      "chosen_batch_size": 16,
+      "candidate_batch_sizes": [
+        16
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 185.335,
+          "predicted_dispatch_cost_ms_per_query": 202.06
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 10.813749999999999,
+          "predicted_dispatch_cost_ms_per_query": 27.53875
+        }
+      ],
+      "q_er_len": 5,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 10.813749999999999,
+      "predicted_dispatch_cost_ms_per_query": 27.53875,
+      "pending_queries_by_bucket": {
+        "short": 0,
+        "mid": 0,
+        "long": 4
+      }
+    },
+    {
+      "dispatch_index": 7,
+      "bucket": "long",
+      "chosen_batch_size": 4,
+      "candidate_batch_sizes": [
+        4
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 162.2544,
+          "predicted_dispatch_cost_ms_per_query": 179.7744
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 11.7654,
+          "predicted_dispatch_cost_ms_per_query": 29.2854
+        }
+      ],
+      "q_er_len": 6,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 11.7654,
+      "predicted_dispatch_cost_ms_per_query": 29.2854,
+      "pending_queries_by_bucket": {
+        "short": 0,
+        "mid": 0,
+        "long": 0
+      }
+    }
+  ],
+  "feedback_trace": [
+    {
+      "batch_index": 1,
+      "bucket": "mid",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 112,
+      "token_length_max": 122,
+      "token_length_avg": 117.875,
+      "embedding_ms_per_query": 6.0834223695565015,
+      "retrieval_ms_per_query": 20.996307182940654,
+      "generation_ms_per_query": 189.9723484966671,
+      "transfer_ms_per_query_est": 0.9125133554334752,
+      "batch_size_residual_ms_per_query": 195.18347804916425,
+      "ema_after_update": {
+        "embedding": 6.0834223695565015,
+        "retrieval": 20.996307182940654,
+        "generation": 189.9723484966671,
+        "transfer": 0.9125133554334752,
+        "batch_size_residual": 195.18347804916425,
+        "bucket_batch_size_ema": 29.0
+      }
+    },
+    {
+      "batch_index": 2,
+      "bucket": "long",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 207,
+      "token_length_max": 226,
+      "token_length_avg": 217.4375,
+      "embedding_ms_per_query": 11.604498737142421,
+      "retrieval_ms_per_query": 17.366308500641026,
+      "generation_ms_per_query": 183.9201585535193,
+      "transfer_ms_per_query_est": 1.7406748105713632,
+      "batch_size_residual_ms_per_query": 178.14156579130272,
+      "ema_after_update": {
+        "embedding": 11.604498737142421,
+        "retrieval": 17.366308500641026,
+        "generation": 183.9201585535193,
+        "transfer": 1.7406748105713632,
+        "batch_size_residual": 178.14156579130272,
+        "bucket_batch_size_ema": 17.0
+      }
+    },
+    {
+      "batch_index": 3,
+      "bucket": "long",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 161,
+      "token_length_max": 169,
+      "token_length_avg": 164.5,
+      "embedding_ms_per_query": 7.508796741603874,
+      "retrieval_ms_per_query": 18.165459114243276,
+      "generation_ms_per_query": 176.5846138005145,
+      "transfer_ms_per_query_est": 1.5870859857386677,
+      "batch_size_residual_ms_per_query": 130.51298160709894,
+      "ema_after_update": {
+        "embedding": 10.580573238257784,
+        "retrieval": 17.56609615404159,
+        "generation": 182.0862723652681,
+        "transfer": 1.5870859857386677,
+        "batch_size_residual": 130.51298160709894,
+        "bucket_batch_size_ema": 17.75
+      }
+    },
+    {
+      "batch_index": 4,
+      "bucket": "long",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 148,
+      "token_length_max": 161,
+      "token_length_avg": 153.8125,
+      "embedding_ms_per_query": 8.52226592542138,
+      "retrieval_ms_per_query": 18.652193946763873,
+      "generation_ms_per_query": 174.8121341370279,
+      "transfer_ms_per_query_est": 1.5098994615073025,
+      "batch_size_residual_ms_per_query": 95.42637777180096,
+      "ema_after_update": {
+        "embedding": 10.065996410048683,
+        "retrieval": 17.83762060222216,
+        "generation": 180.26773780820804,
+        "transfer": 1.5098994615073025,
+        "batch_size_residual": 95.42637777180096,
+        "bucket_batch_size_ema": 18.3125
+      }
+    },
+    {
+      "batch_index": 5,
+      "bucket": "long",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 145,
+      "token_length_max": 148,
+      "token_length_avg": 146.3125,
+      "embedding_ms_per_query": 11.545681190909818,
+      "retrieval_ms_per_query": 17.10175305197481,
+      "generation_ms_per_query": 174.23074269026984,
+      "transfer_ms_per_query_est": 1.565387640789595,
+      "batch_size_residual_ms_per_query": 69.86901399164279,
+      "ema_after_update": {
+        "embedding": 10.435917605263967,
+        "retrieval": 17.653653714660322,
+        "generation": 178.7584890287235,
+        "transfer": 1.565387640789595,
+        "batch_size_residual": 69.86901399164279,
+        "bucket_batch_size_ema": 18.734375
+      }
+    },
+    {
+      "batch_index": 6,
+      "bucket": "long",
+      "batch_size": 16,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 136,
+      "token_length_max": 145,
+      "token_length_avg": 141.5625,
+      "embedding_ms_per_query": 11.680683368467726,
+      "retrieval_ms_per_query": 19.244221693952568,
+      "generation_ms_per_query": 174.5123501314083,
+      "transfer_ms_per_query_est": 1.612066356909736,
+      "batch_size_residual_ms_per_query": 51.6577122948299,
+      "ema_after_update": {
+        "embedding": 10.747109046064907,
+        "retrieval": 18.051295709483384,
+        "generation": 177.6969543043947,
+        "transfer": 1.612066356909736,
+        "batch_size_residual": 51.6577122948299,
+        "bucket_batch_size_ema": 19.05078125
+      }
+    },
+    {
+      "batch_index": 7,
+      "bucket": "long",
+      "batch_size": 4,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 133,
+      "token_length_max": 134,
+      "token_length_avg": 133.25,
+      "embedding_ms_per_query": 36.91126796184108,
+      "retrieval_ms_per_query": 38.428873231168836,
+      "generation_ms_per_query": 589.043389481958,
+      "transfer_ms_per_query_est": 2.5932223162513424,
+      "batch_size_residual_ms_per_query": 456.2761052581152,
+      "ema_after_update": {
+        "embedding": 17.28814877500895,
+        "retrieval": 23.145690089904747,
+        "generation": 280.5335630987855,
+        "transfer": 2.5932223162513424,
+        "batch_size_residual": 456.2761052581152,
+        "bucket_batch_size_ema": 16.2880859375
+      }
+    }
+  ],
+  "chunk_trace": [
+    {
+      "batch_index": 1,
+      "bucket": "mid",
+      "num_queries": 16,
+      "num_chunked_queries": 16,
+      "total_chunks": 48,
+      "avg_chunks_per_query": 3.0,
+      "max_chunks_for_one_query": 3
+    },
+    {
+      "batch_index": 2,
+      "bucket": "long",
+      "num_queries": 16,
+      "num_chunked_queries": 16,
+      "total_chunks": 80,
+      "avg_chunks_per_query": 5.0,
+      "max_chunks_for_one_query": 5
+    },
+    {
+      "batch_index": 3,
+      "bucket": "long",
+      "num_queries": 16,
+      "num_chunked_queries": 16,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 4.0,
+      "max_chunks_for_one_query": 4
+    },
+    {
+      "batch_index": 4,
+      "bucket": "long",
+      "num_queries": 16,
+      "num_chunked_queries": 16,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 4.0,
+      "max_chunks_for_one_query": 4
+    },
+    {
+      "batch_index": 5,
+      "bucket": "long",
+      "num_queries": 16,
+      "num_chunked_queries": 16,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 4.0,
+      "max_chunks_for_one_query": 4
+    },
+    {
+      "batch_index": 6,
+      "bucket": "long",
+      "num_queries": 16,
+      "num_chunked_queries": 16,
+      "total_chunks": 50,
+      "avg_chunks_per_query": 3.125,
+      "max_chunks_for_one_query": 4
+    },
+    {
+      "batch_index": 7,
+      "bucket": "long",
+      "num_queries": 4,
+      "num_chunked_queries": 4,
+      "total_chunks": 12,
+      "avg_chunks_per_query": 3.0,
+      "max_chunks_for_one_query": 3
+    }
+  ]
+}

@@ -1,0 +1,883 @@
+{
+  "config": {
+    "b": 16,
+    "xE": 1,
+    "xR": 0,
+    "xG": 1,
+    "nprobe": 128,
+    "topk": 1,
+    "embedding_model": "intfloat/e5-large-v2",
+    "generator_model": "/data/home/mazhenxiang/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3.1-8B-Instruct"
+  },
+  "scheduler": {
+    "mode": "online_dispatch_ema_v1",
+    "bucket_thresholds": {
+      "short": 48,
+      "long": 128
+    },
+    "bucket_batch_sizes": {
+      "short": 64,
+      "mid": 32,
+      "long": 16
+    },
+    "bucket_counts": {
+      "short": 7,
+      "mid": 3,
+      "long": 0
+    },
+    "action_counts": {
+      "xE1_xR0": 10
+    },
+    "max_q_er": 8,
+    "max_q_rg": 8,
+    "fixed_nprobe": 128,
+    "execution": "async_threaded_pipeline_bucket"
+  },
+  "timing_breakdown": {
+    "token_length_prep_ms": 17.703633988276124,
+    "scheduler_dispatch_ms_total": 2.6960098184645176,
+    "scheduler_dispatch_ms_avg": 0.26960098184645176,
+    "scheduler_feedback_ms_total": 0.6513660773634911,
+    "scheduler_feedback_ms_avg": 0.0651366077363491
+  },
+  "num_queries": 512,
+  "avg_embedding_ms": 1.5310199905798072,
+  "avg_retrieval_ms": 14.452301157689362,
+  "avg_generation_ms": 72.25651914677655,
+  "total_ms": 45178.79823106341,
+  "throughput_qps": 11.332749432187555,
+  "wall_time_ms": 37982.34952497296,
+  "wall_throughput_qps": 13.479945458965508,
+  "total_generated_tokens": 65536,
+  "generation_ms_per_token": 0.5645040558341918,
+  "samples": [
+    {
+      "query": "How is Mushrooms: What's Edible, Medicinal, and Psychedelic measured or evaluated in practice, what metrics are used, and what are the known limitations of those approaches?",
+      "top_doc_snippet": "Mushrooms For Good Health?\nIâm a big fan of mushrooms, but if you're just starting to learn about their medicinal properties, I can't fault you for being confused about which ones are, or aren't, good for you.",
+      "answer": " Evaluating the edibility, medicinal value, and psychedelic properties of mushrooms involves a combination of traditional knowledge, scientific research, and expert evaluation. Here are some metrics and limitations:\n1. Traditional knowledge: Experienced foragers and mushroom enthusiasts have developed a deep understanding of which species are safe to eat, which have medicinal properties, and which are psychoactive. This knowledge is often passed down through generations and is based on empirical observations.\n2. Chemical analysis: Modern science has developed techniques to analyze the chemical composition of mushrooms, including the presence of bioactive compounds, toxins, and psychoactive substances. This information helps to identify potential medicinal and psychoactive",
+      "bucket": "short",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    },
+    {
+      "query": "What are the most important things to understand about Armonk, NY Profile: Facts, Map & Data, and what common mistakes do people make when dealing with it?",
+      "top_doc_snippet": "-\nNew York. Description; Famous Natives; Flags; Fast Facts; Links; Maps; Symbols; Time; Geo. Statistics; Geography; Lat / Long; Timeline; Travel Info. Weather",
+      "answer": " Armonk, NY Profile: Facts, Map & Data\nArmonk is a village located in the town of North Castle in Westchester County, New York, United States. It is situated approximately 35 miles north of New York City. Here are some key facts and data about Armonk:\n1. **Location**: Armonk is located at 41.1442° N, 73.6931° W in Westchester County, New York.\n2. **Population**: As of the 2020 census, the population of Armonk is approximately 18,209 people.\n3. **Area**:",
+      "bucket": "short",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    },
+    {
+      "query": "What are the main advantages and disadvantages of Sorrento, LA Profile: Facts, Map & Data, and under what conditions does each outweigh the other?",
+      "top_doc_snippet": "Advantages of silk?\nWhat are the advantages and disadvantages? on the plus side, you have the reasons for, the benefits. then again, on the other hand, you have the drawbacks, and the negatives. hard to say. Edit",
+      "answer": " The advantages of Sorrento, LA Profile: Facts, Map & Data are:\n1. **Comprehensive Information**: It provides a wealth of information about Sorrento, including demographics, housing, education, employment, and more.\n2. **Easy Access**: The profile is easily accessible online, making it convenient for users to find the information they need.\n3. **Up-to-date Data**: The profile is regularly updated, ensuring that the information is current and accurate.\n4. **Comparative Analysis**: Users can compare Sorrento's data with other cities or states, providing valuable insights for decision-making.\n5. **Research and",
+      "bucket": "short",
+      "action": {
+        "xE": 1,
+        "xR": 0
+      }
+    }
+  ],
+  "per_batch": [
+    {
+      "batch_index": 1,
+      "batch_size": 64,
+      "bucket": "short",
+      "embedding_sec": 0.06239472492597997,
+      "retrieval_sec": 0.9051580468658358,
+      "generation_sec": 5.112651420990005,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 2,
+      "batch_size": 64,
+      "bucket": "short",
+      "embedding_sec": 0.13514210702851415,
+      "retrieval_sec": 0.9713649097830057,
+      "generation_sec": 4.023290850920603,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 3,
+      "batch_size": 64,
+      "bucket": "short",
+      "embedding_sec": 0.06945803691633046,
+      "retrieval_sec": 0.911904017906636,
+      "generation_sec": 3.7943065529689193,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 4,
+      "batch_size": 64,
+      "bucket": "short",
+      "embedding_sec": 0.05579285114072263,
+      "retrieval_sec": 0.8226268021389842,
+      "generation_sec": 3.7632224331609905,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 5,
+      "batch_size": 64,
+      "bucket": "short",
+      "embedding_sec": 0.04659834410995245,
+      "retrieval_sec": 0.8277594929095358,
+      "generation_sec": 3.805117225041613,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 6,
+      "batch_size": 64,
+      "bucket": "short",
+      "embedding_sec": 0.0441497138235718,
+      "retrieval_sec": 0.820197083055973,
+      "generation_sec": 3.7279815208166838,
+      "generated_tokens": 8192,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 7,
+      "batch_size": 51,
+      "bucket": "short",
+      "embedding_sec": 0.03355512907728553,
+      "retrieval_sec": 0.6710096329916269,
+      "generation_sec": 3.6605171309784055,
+      "generated_tokens": 6528,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 8,
+      "batch_size": 32,
+      "bucket": "mid",
+      "embedding_sec": 0.15292425896041095,
+      "retrieval_sec": 0.5729459638241678,
+      "generation_sec": 3.2650905961636454,
+      "generated_tokens": 4096,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 9,
+      "batch_size": 32,
+      "bucket": "mid",
+      "embedding_sec": 0.12646264815703034,
+      "retrieval_sec": 0.5595218150410801,
+      "generation_sec": 3.227597603108734,
+      "generated_tokens": 4096,
+      "xE": 1,
+      "xR": 0
+    },
+    {
+      "batch_index": 10,
+      "batch_size": 13,
+      "bucket": "mid",
+      "embedding_sec": 0.057404421037063,
+      "retrieval_sec": 0.33709042822010815,
+      "generation_sec": 2.615562468999997,
+      "generated_tokens": 1664,
+      "xE": 1,
+      "xR": 0
+    }
+  ],
+  "dispatch_trace": [
+    {
+      "dispatch_index": 1,
+      "bucket": "short",
+      "chosen_batch_size": 64,
+      "candidate_batch_sizes": [
+        32,
+        64
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 19.740000000000002,
+          "predicted_dispatch_cost_ms_per_query": 26.883750000000003
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 6.58875,
+          "predicted_dispatch_cost_ms_per_query": 13.7325
+        }
+      ],
+      "q_er_len": 0,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 6.58875,
+      "predicted_dispatch_cost_ms_per_query": 13.7325,
+      "pending_queries_by_bucket": {
+        "short": 371,
+        "mid": 77,
+        "long": 0
+      }
+    },
+    {
+      "dispatch_index": 2,
+      "bucket": "short",
+      "chosen_batch_size": 64,
+      "candidate_batch_sizes": [
+        32,
+        64
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 15.286600000000002,
+          "predicted_dispatch_cost_ms_per_query": 22.220350000000003
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 6.4666,
+          "predicted_dispatch_cost_ms_per_query": 13.40035
+        }
+      ],
+      "q_er_len": 1,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 6.4666,
+      "predicted_dispatch_cost_ms_per_query": 13.40035,
+      "pending_queries_by_bucket": {
+        "short": 307,
+        "mid": 77,
+        "long": 0
+      }
+    },
+    {
+      "dispatch_index": 3,
+      "bucket": "short",
+      "chosen_batch_size": 64,
+      "candidate_batch_sizes": [
+        32,
+        64
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 13.6,
+          "predicted_dispatch_cost_ms_per_query": 20.44375
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 6.41875,
+          "predicted_dispatch_cost_ms_per_query": 13.2625
+        }
+      ],
+      "q_er_len": 2,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 6.41875,
+      "predicted_dispatch_cost_ms_per_query": 13.2625,
+      "pending_queries_by_bucket": {
+        "short": 243,
+        "mid": 77,
+        "long": 0
+      }
+    },
+    {
+      "dispatch_index": 4,
+      "bucket": "short",
+      "chosen_batch_size": 64,
+      "candidate_batch_sizes": [
+        32,
+        64
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 8.5554,
+          "predicted_dispatch_cost_ms_per_query": 15.06915
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 6.2664,
+          "predicted_dispatch_cost_ms_per_query": 12.780149999999999
+        }
+      ],
+      "q_er_len": 3,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 6.2664,
+      "predicted_dispatch_cost_ms_per_query": 12.780149999999999,
+      "pending_queries_by_bucket": {
+        "short": 179,
+        "mid": 77,
+        "long": 0
+      }
+    },
+    {
+      "dispatch_index": 5,
+      "bucket": "short",
+      "chosen_batch_size": 64,
+      "candidate_batch_sizes": [
+        32,
+        64
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 7.490399999999999,
+          "predicted_dispatch_cost_ms_per_query": 13.91415
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 6.2311499999999995,
+          "predicted_dispatch_cost_ms_per_query": 12.6549
+        }
+      ],
+      "q_er_len": 4,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 6.2311499999999995,
+      "predicted_dispatch_cost_ms_per_query": 12.6549,
+      "pending_queries_by_bucket": {
+        "short": 115,
+        "mid": 77,
+        "long": 0
+      }
+    },
+    {
+      "dispatch_index": 6,
+      "bucket": "short",
+      "chosen_batch_size": 64,
+      "candidate_batch_sizes": [
+        32,
+        64
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 6.8544,
+          "predicted_dispatch_cost_ms_per_query": 13.21815
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 6.20915,
+          "predicted_dispatch_cost_ms_per_query": 12.5729
+        }
+      ],
+      "q_er_len": 5,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 6.20915,
+      "predicted_dispatch_cost_ms_per_query": 12.5729,
+      "pending_queries_by_bucket": {
+        "short": 51,
+        "mid": 77,
+        "long": 0
+      }
+    },
+    {
+      "dispatch_index": 7,
+      "bucket": "short",
+      "chosen_batch_size": 51,
+      "candidate_batch_sizes": [
+        32,
+        51
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 6.309462745098039,
+          "predicted_dispatch_cost_ms_per_query": 12.637109803921568
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 6.220212745098039,
+          "predicted_dispatch_cost_ms_per_query": 12.547859803921568
+        }
+      ],
+      "q_er_len": 6,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 6.220212745098039,
+      "predicted_dispatch_cost_ms_per_query": 12.547859803921568,
+      "pending_queries_by_bucket": {
+        "short": 0,
+        "mid": 77,
+        "long": 0
+      }
+    },
+    {
+      "dispatch_index": 8,
+      "bucket": "mid",
+      "chosen_batch_size": 32,
+      "candidate_batch_sizes": [
+        16,
+        32
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 95.85,
+          "predicted_dispatch_cost_ms_per_query": 107.5375
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 8.55,
+          "predicted_dispatch_cost_ms_per_query": 20.2375
+        }
+      ],
+      "q_er_len": 7,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 8.55,
+      "predicted_dispatch_cost_ms_per_query": 20.2375,
+      "pending_queries_by_bucket": {
+        "short": 0,
+        "mid": 45,
+        "long": 0
+      }
+    },
+    {
+      "dispatch_index": 9,
+      "bucket": "mid",
+      "chosen_batch_size": 32,
+      "candidate_batch_sizes": [
+        16,
+        32
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 68.5476,
+          "predicted_dispatch_cost_ms_per_query": 79.6951
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 7.9146,
+          "predicted_dispatch_cost_ms_per_query": 19.0621
+        }
+      ],
+      "q_er_len": 8,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 7.9146,
+      "predicted_dispatch_cost_ms_per_query": 19.0621,
+      "pending_queries_by_bucket": {
+        "short": 0,
+        "mid": 13,
+        "long": 0
+      }
+    },
+    {
+      "dispatch_index": 10,
+      "bucket": "mid",
+      "chosen_batch_size": 13,
+      "candidate_batch_sizes": [
+        13,
+        13
+      ],
+      "chosen_action": {
+        "xE": 1,
+        "xR": 0
+      },
+      "candidate_actions": [
+        {
+          "xE": 0,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 60.87778461538462,
+          "predicted_dispatch_cost_ms_per_query": 72.11932307692308
+        },
+        {
+          "xE": 1,
+          "xR": 0,
+          "predicted_action_cost_ms_per_query": 8.089784615384616,
+          "predicted_dispatch_cost_ms_per_query": 19.331323076923077
+        }
+      ],
+      "q_er_len": 8,
+      "q_rg_len": 0,
+      "predicted_action_cost_ms_per_query": 8.089784615384616,
+      "predicted_dispatch_cost_ms_per_query": 19.331323076923077,
+      "pending_queries_by_bucket": {
+        "short": 0,
+        "mid": 0,
+        "long": 0
+      }
+    }
+  ],
+  "feedback_trace": [
+    {
+      "batch_index": 1,
+      "bucket": "short",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 28,
+      "token_length_max": 35,
+      "token_length_avg": 29.90625,
+      "embedding_ms_per_query": 0.9749175769684371,
+      "retrieval_ms_per_query": 14.143094482278684,
+      "generation_ms_per_query": 79.88517845296883,
+      "transfer_ms_per_query_est": 0.14623763654526556,
+      "batch_size_residual_ms_per_query": 81.36444051221595,
+      "ema_after_update": {
+        "embedding": 0.9749175769684371,
+        "retrieval": 14.143094482278684,
+        "generation": 79.88517845296883,
+        "transfer": 0.14623763654526556,
+        "batch_size_residual": 81.36444051221595,
+        "bucket_batch_size_ema": 65.0
+      }
+    },
+    {
+      "batch_index": 2,
+      "bucket": "short",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 25,
+      "token_length_max": 28,
+      "token_length_avg": 26.6875,
+      "embedding_ms_per_query": 2.1115954223205335,
+      "retrieval_ms_per_query": 15.177576715359464,
+      "generation_ms_per_query": 62.86391954563442,
+      "transfer_ms_per_query_est": 0.18886305574596918,
+      "batch_size_residual_ms_per_query": 57.274246267800265,
+      "ema_after_update": {
+        "embedding": 1.2590870383064612,
+        "retrieval": 14.40171504054888,
+        "generation": 75.62986372613523,
+        "transfer": 0.18886305574596918,
+        "batch_size_residual": 57.274246267800265,
+        "bucket_batch_size_ema": 65.75
+      }
+    },
+    {
+      "batch_index": 3,
+      "bucket": "short",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 14,
+      "token_length_max": 25,
+      "token_length_avg": 22.375,
+      "embedding_ms_per_query": 1.0852818268176634,
+      "retrieval_ms_per_query": 14.248500279791187,
+      "generation_ms_per_query": 59.286039890139364,
+      "transfer_ms_per_query_est": 0.18234536031513926,
+      "batch_size_residual_ms_per_query": 38.74075798485312,
+      "ema_after_update": {
+        "embedding": 1.2156357354342617,
+        "retrieval": 14.363411350359456,
+        "generation": 71.54390776713626,
+        "transfer": 0.18234536031513926,
+        "batch_size_residual": 38.74075798485312,
+        "bucket_batch_size_ema": 66.3125
+      }
+    },
+    {
+      "batch_index": 4,
+      "bucket": "short",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 11,
+      "token_length_max": 14,
+      "token_length_avg": 12.1875,
+      "embedding_ms_per_query": 0.8717632990737911,
+      "retrieval_ms_per_query": 12.853543783421628,
+      "generation_ms_per_query": 58.800350518140476,
+      "transfer_ms_per_query_est": 0.1694501439516216,
+      "batch_size_residual_ms_per_query": 25.360657835487533,
+      "ema_after_update": {
+        "embedding": 1.129667626344144,
+        "retrieval": 13.985944458625,
+        "generation": 68.35801845488731,
+        "transfer": 0.1694501439516216,
+        "batch_size_residual": 25.360657835487533,
+        "bucket_batch_size_ema": 66.734375
+      }
+    },
+    {
+      "batch_index": 5,
+      "bucket": "short",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 9,
+      "token_length_max": 11,
+      "token_length_avg": 9.71875,
+      "embedding_ms_per_query": 0.728099126718007,
+      "retrieval_ms_per_query": 12.933742076711496,
+      "generation_ms_per_query": 59.4549566412752,
+      "transfer_ms_per_query_est": 0.15439132521564147,
+      "batch_size_residual_ms_per_query": 16.388922666839807,
+      "ema_after_update": {
+        "embedding": 1.0292755014376098,
+        "retrieval": 13.722893863146624,
+        "generation": 66.13225300148429,
+        "transfer": 0.15439132521564147,
+        "batch_size_residual": 16.388922666839807,
+        "bucket_batch_size_ema": 67.05078125
+      }
+    },
+    {
+      "batch_index": 6,
+      "bucket": "short",
+      "batch_size": 64,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 7,
+      "token_length_max": 9,
+      "token_length_avg": 7.796875,
+      "embedding_ms_per_query": 0.6898392784933094,
+      "retrieval_ms_per_query": 12.815579422749579,
+      "generation_ms_per_query": 58.249711262760684,
+      "transfer_ms_per_query_est": 0.1416624668552302,
+      "batch_size_residual_ms_per_query": 9.970771068309709,
+      "ema_after_update": {
+        "embedding": 0.9444164457015347,
+        "retrieval": 13.496065253047362,
+        "generation": 64.16161756680339,
+        "transfer": 0.1416624668552302,
+        "batch_size_residual": 9.970771068309709,
+        "bucket_batch_size_ema": 67.2880859375
+      }
+    },
+    {
+      "batch_index": 7,
+      "bucket": "short",
+      "batch_size": 51,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 3,
+      "token_length_max": 7,
+      "token_length_avg": 5.490196078431373,
+      "embedding_ms_per_query": 0.6579437073977554,
+      "retrieval_ms_per_query": 13.157051627286801,
+      "generation_ms_per_query": 71.77484570545893,
+      "transfer_ms_per_query_est": 0.13091973916883848,
+      "batch_size_residual_ms_per_query": 6.846079307735977,
+      "ema_after_update": {
+        "embedding": 0.8727982611255899,
+        "retrieval": 13.411311846607223,
+        "generation": 66.06492460146727,
+        "transfer": 0.13091973916883848,
+        "batch_size_residual": 6.846079307735977,
+        "bucket_batch_size_ema": 64.216064453125
+      }
+    },
+    {
+      "batch_index": 8,
+      "bucket": "mid",
+      "batch_size": 32,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 82,
+      "token_length_max": 100,
+      "token_length_avg": 85.84375,
+      "embedding_ms_per_query": 4.778883092512842,
+      "retrieval_ms_per_query": 17.904561369505245,
+      "generation_ms_per_query": 102.03408113011392,
+      "transfer_ms_per_query_est": 0.7168324638769263,
+      "batch_size_residual_ms_per_query": 104.66752559213201,
+      "ema_after_update": {
+        "embedding": 4.778883092512842,
+        "retrieval": 17.904561369505245,
+        "generation": 102.03408113011392,
+        "transfer": 0.7168324638769263,
+        "batch_size_residual": 104.66752559213201,
+        "bucket_batch_size_ema": 33.0
+      }
+    },
+    {
+      "batch_index": 9,
+      "bucket": "mid",
+      "batch_size": 32,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 76,
+      "token_length_max": 82,
+      "token_length_avg": 78.90625,
+      "embedding_ms_per_query": 3.9519577549071983,
+      "retrieval_ms_per_query": 17.485056720033754,
+      "generation_ms_per_query": 100.86242509714793,
+      "transfer_ms_per_query_est": 0.6858227637167147,
+      "batch_size_residual_ms_per_query": 77.716914573119,
+      "ema_after_update": {
+        "embedding": 4.572151758111431,
+        "retrieval": 17.799685207137372,
+        "generation": 101.74116712187242,
+        "transfer": 0.6858227637167147,
+        "batch_size_residual": 77.716914573119,
+        "bucket_batch_size_ema": 33.75
+      }
+    },
+    {
+      "batch_index": 10,
+      "bucket": "mid",
+      "batch_size": 13,
+      "xE": 1,
+      "xR": 0,
+      "token_length_min": 72,
+      "token_length_max": 76,
+      "token_length_avg": 73.46153846153847,
+      "embedding_ms_per_query": 4.415724695158692,
+      "retrieval_ms_per_query": 25.93003294000832,
+      "generation_ms_per_query": 201.19711299999975,
+      "transfer_ms_per_query_est": 0.679956748855987,
+      "batch_size_residual_ms_per_query": 106.74404378432882,
+      "ema_after_update": {
+        "embedding": 4.533044992373247,
+        "retrieval": 19.83227214035511,
+        "generation": 126.60515359140425,
+        "transfer": 0.679956748855987,
+        "batch_size_residual": 106.74404378432882,
+        "bucket_batch_size_ema": 29.5625
+      }
+    }
+  ],
+  "chunk_trace": [
+    {
+      "batch_index": 1,
+      "bucket": "short",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 2,
+      "bucket": "short",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 3,
+      "bucket": "short",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 4,
+      "bucket": "short",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 5,
+      "bucket": "short",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 6,
+      "bucket": "short",
+      "num_queries": 64,
+      "num_chunked_queries": 0,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 7,
+      "bucket": "short",
+      "num_queries": 51,
+      "num_chunked_queries": 0,
+      "total_chunks": 51,
+      "avg_chunks_per_query": 1.0,
+      "max_chunks_for_one_query": 1
+    },
+    {
+      "batch_index": 8,
+      "bucket": "mid",
+      "num_queries": 32,
+      "num_chunked_queries": 32,
+      "total_chunks": 65,
+      "avg_chunks_per_query": 2.03125,
+      "max_chunks_for_one_query": 3
+    },
+    {
+      "batch_index": 9,
+      "bucket": "mid",
+      "num_queries": 32,
+      "num_chunked_queries": 32,
+      "total_chunks": 64,
+      "avg_chunks_per_query": 2.0,
+      "max_chunks_for_one_query": 2
+    },
+    {
+      "batch_index": 10,
+      "bucket": "mid",
+      "num_queries": 13,
+      "num_chunked_queries": 13,
+      "total_chunks": 26,
+      "avg_chunks_per_query": 2.0,
+      "max_chunks_for_one_query": 2
+    }
+  ]
+}
