@@ -1,47 +1,95 @@
-# Repository Guidelines
+# Repository Guidelines — Async RAG Pipeline V1 (Resource-Constrained)
 
-## Project Structure & Module Organization
-This repository is a script-first Python experiment for comparing RAG execution modes. Keep core pipeline logic in `async_rag_pipeline.py`, index construction in `build_index.py`, and experiment orchestration in `run_comparison.py`. Input data lives in `data/`. Generated reports and summaries currently live in `comparison/` and `comparison_large/`. Working notes and run instructions belong in `docs/`.
+## Project Scope
 
-When adding new code, prefer small helper functions over new top-level scripts unless the workflow is truly standalone.
+V1 is a **minimal fork of V0** for resource-constrained hardware. The scheduling and pipeline logic in `async_rag_pipeline.py` must remain **identical to V0** — only data, model defaults, and CLI defaults change.
+
+## What must stay identical to V0
+
+- `async_rag_pipeline.py` — copy verbatim from V0, no modifications
+- Scheduling logic (bucket dispatch, EMA feedback, action selection)
+- Output JSON schema
+- Argument names and semantics for scheduler-related flags
+
+## What may differ from V0
+
+- Default values for `--generator-model`, `--model-path`, `--b`, `--nprobe`, etc.
+- Corpus source and size
+- FAISS index type
+- Query set generation scripts
+- Documentation and guides
+
+## Key differences from V0
+
+| | V0 | V1 |
+|-|----|----|
+| Generation | Llama-3.1-8B-Instruct | Qwen2.5-3B-Instruct |
+| Embedding | intfloat/e5-large-v2 (1024-dim) | all-MiniLM-L6-v2 (384-dim) |
+| Corpus | 8.8M passages | 10,000 passages |
+| Index | IVF4096,Flat (~34 GB) | Flat (~15 MB) |
+| Target hardware | Server GPU (24–80 GB) | Edge GPU (4–16 GB) |
+
+## Adding new code
+
+Follow V0 conventions:
+- 4-space indentation, type hints, docstrings
+- `snake_case` for functions, `PascalCase` for classes
+- Keep scripts importable
+- New scripts belong in the root (not `docs/` or `data/`)
 
 ## Build, Test, and Development Commands
-Set up the environment:
 
 ```bash
+# Setup
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# Build corpus (one-time)
+python corpus_builder.py --num-passages 10000 --output ./data/corpus_small.jsonl
+
+# Build index
+python build_index.py \
+  --corpus-path ./data/corpus_small.jsonl \
+  --output-dir ./indexes/flat \
+  --model-path sentence-transformers/all-MiniLM-L6-v2 \
+  --batch-size 256 --max-length 384 \
+  --pooling-method mean --use-fp16 --faiss-type Flat --device cuda
+
+# Generate queries
+python generate_queries.py
+
+# Run comparison
+python run_comparison.py --workdir . \
+  --index-path ./indexes/flat/faiss.index \
+  --corpus-path ./data/corpus_small.jsonl \
+  --generator-model Qwen/Qwen2.5-3B-Instruct \
+  --b 32 --nprobe 1 --topk 1 \
+  --gpu-memory-utilization 0.6 \
+  --output-dir ./output/comparison
 ```
 
-Key workflows:
+## Testing
+
+Run the smallest possible path first:
 
 ```bash
-python ./build_index.py --corpus-path ./data/corpus.jsonl --output-dir ./indexes/flat --device cuda
-python ./async_rag_pipeline.py --pipeline-mode async_bucket --index-path ./indexes/flat/faiss.index --corpus-path ./data/corpus.jsonl --generator-model meta-llama/Llama-3.1-8B-Instruct --queries-file ./data/queries_generated.jsonl
-python ./run_comparison.py --workdir . --index-path ./indexes/flat/faiss.index --corpus-path ./data/corpus.jsonl --generator-model meta-llama/Llama-3.1-8B-Instruct --queries-file ./data/queries_generated.jsonl --output-dir ./comparison
+# Just build the corpus (no GPU needed)
+python corpus_builder.py --num-passages 1000 --output ./data/corpus_test.jsonl
+
+# Build a tiny index
+python build_index.py --corpus-path ./data/corpus_test.jsonl \
+  --output-dir ./indexes/test --model-path sentence-transformers/all-MiniLM-L6-v2 \
+  --max-length 384 --faiss-type Flat --device cpu
+
+# One serial run with 16 queries
+python async_rag_pipeline.py \
+  --pipeline-mode serial \
+  --index-path ./indexes/test/faiss.index \
+  --corpus-path ./data/corpus_test.jsonl \
+  --generator-model Qwen/Qwen2.5-3B-Instruct \
+  --sample-queries 16 --b 8 --nprobe 1 --topk 1 \
+  --output-json ./output/test_serial.json
 ```
 
-Use `docs/pipeline_execution_guide.md` for fuller parameter examples.
-
-## Coding Style & Naming Conventions
-Use 4-space indentation, type hints, and clear docstrings for public helpers. Follow existing Python naming: `snake_case` for functions and variables, `PascalCase` for classes, and descriptive CLI flags such as `--queries-file` and `--pipeline-mode`.
-
-Keep scripts importable and avoid burying logic inside `main()`. Prefer standard library utilities and keep new dependencies justified in `requirements.txt`.
-
-## Testing Guidelines
-There is no dedicated `tests/` directory yet. Validate changes by running the smallest relevant script path first, then a full comparison if behavior affects scheduling or metrics. Check generated JSON summaries and Markdown tables for schema stability and sensible metric deltas.
-
-If you add reusable logic, introduce `pytest` tests under `tests/` with names like `test_scheduler.py`.
-
-## Commit & Pull Request Guidelines
-Git history is not available in this workspace snapshot, so use short imperative commit subjects, for example: `pipeline: tighten async bucket scheduling`. Keep one logical change per commit.
-
-Pull requests should include:
-- A short summary of the experiment or code change
-- Exact commands used for validation
-- Notes on data, model, or GPU assumptions
-- Output snippets or tables when metrics change
-
-## Configuration & Data Tips
-Do not commit large generated indexes, model weights, or raw experiment dumps unless they are required artifacts. Keep dataset paths configurable by CLI flags and document non-default hardware assumptions in `docs/`.
+Check the output JSON for schema stability and sensible values before running full experiments.

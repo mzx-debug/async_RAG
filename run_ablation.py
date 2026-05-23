@@ -55,20 +55,31 @@ def make_table(rows: List[Dict[str, Any]]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run ablation variants for async_rag_pipeline.py")
+    parser = argparse.ArgumentParser(description="Run ablation variants for async_rag_pipeline.py (V1: resource-constrained defaults).")
     parser.add_argument("--workdir", type=str, default=".", help="Directory containing async_rag_pipeline.py")
-    parser.add_argument("--index-path", type=str, required=True)
-    parser.add_argument("--corpus-path", type=str, required=True)
-    parser.add_argument("--generator-model", type=str, required=True)
+    parser.add_argument("--index-path", type=str,
+                        default="./indexes/flat/faiss.index")
+    parser.add_argument("--corpus-path", type=str,
+                        default="./data/corpus_small.jsonl")
+    parser.add_argument("--generator-model", type=str,
+                        default="Qwen/Qwen2.5-3B-Instruct")
+    parser.add_argument("--embedding-model", type=str,
+                        default="sentence-transformers/all-MiniLM-L6-v2",
+                        help="Embedding model path or HuggingFace id. Must match the index.")
+    parser.add_argument("--embedding-max-length", type=int, default=384)
+    parser.add_argument("--pooling-method", type=str, default="mean",
+                        choices=["mean", "cls", "pooler"])
+    parser.add_argument("--embedding-use-fp16", action="store_true", default=True)
     parser.add_argument("--queries-file", type=str, default=None)
     parser.add_argument("--sample-queries", type=int, default=256)
-    parser.add_argument("--b", type=int, default=16)
+    parser.add_argument("--b", type=int, default=32)
     parser.add_argument("--xE", type=int, default=1)
     parser.add_argument("--xR", type=int, default=0)
-    parser.add_argument("--nprobe", type=int, default=128)
+    parser.add_argument("--nprobe", type=int, default=1)
     parser.add_argument("--topk", type=int, default=1)
     parser.add_argument("--gpu-id", type=str, default="0")
-    parser.add_argument("--output-dir", type=str, default="./ablation_output")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
+    parser.add_argument("--output-dir", type=str, default="./output/ablation")
     parser.add_argument("--scheduler-ema-alpha", type=float, default=0.25)
     args = parser.parse_args()
 
@@ -81,35 +92,29 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     common_args: List[str] = [
-        "--index-path",
-        str(args.index_path),
-        "--corpus-path",
-        str(args.corpus_path),
-        "--generator-model",
-        str(args.generator_model),
-        "--b",
-        str(args.b),
-        "--xE",
-        str(args.xE),
-        "--xR",
-        str(args.xR),
-        "--nprobe",
-        str(args.nprobe),
-        "--topk",
-        str(args.topk),
-        "--sample-queries",
-        str(args.sample_queries),
-        "--gpu-id",
-        str(args.gpu_id),
-        "--scheduler-ema-alpha",
-        str(args.scheduler_ema_alpha),
+        "--index-path",             str(args.index_path),
+        "--corpus-path",            str(args.corpus_path),
+        "--generator-model",        str(args.generator_model),
+        "--b",                      str(args.b),
+        "--xE",                     str(args.xE),
+        "--xR",                     str(args.xR),
+        "--nprobe",                 str(args.nprobe),
+        "--topk",                   str(args.topk),
+        "--sample-queries",         str(args.sample_queries),
+        "--gpu-id",                 str(args.gpu_id),
+        "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+        "--scheduler-ema-alpha",    str(args.scheduler_ema_alpha),
+        "--embedding-model",         str(args.embedding_model),
+        "--embedding-max-length",  str(args.embedding_max_length),
+        "--pooling-method",         str(args.pooling_method),
+        "--embedding-use-fp16",
     ]
     if args.queries_file:
         common_args += ["--queries-file", str(args.queries_file)]
 
     variants: List[Dict[str, Any]] = [
-        {"name": "plain_b16", "args": ["--pipeline-mode", "async_plain", "--b", "16"]},
-        {"name": "plain_b64", "args": ["--pipeline-mode", "async_plain", "--b", "64"]},
+        {"name": "plain_b16",  "args": ["--pipeline-mode", "async_plain", "--b", "16"]},
+        {"name": "plain_b32",  "args": ["--pipeline-mode", "async_plain", "--b", "32"]},
         {"name": "bucket_fixed_batch_fixed_action", "args": ["--pipeline-mode", "async_bucket", "--ablate-online-batch", "--ablate-online-action"]},
         {"name": "bucket_online_batch_fixed_action", "args": ["--pipeline-mode", "async_bucket", "--ablate-online-action"]},
         {"name": "bucket_online_batch_online_action", "args": ["--pipeline-mode", "async_bucket"]},
