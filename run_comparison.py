@@ -63,6 +63,9 @@ def main() -> None:
                         default="./data/corpus_small.jsonl")
     parser.add_argument("--generator-model", type=str,
                         default="Qwen/Qwen2.5-3B-Instruct")
+    parser.add_argument("--embedding-model", type=str,
+                        default="sentence-transformers/all-MiniLM-L6-v2",
+                        help="Embedding model path or HuggingFace id. Must match the index.")
     parser.add_argument("--queries-file", type=str, default=None,
                         help="Query file (queries.jsonl from generate_queries.py). "
                              "Example: ./data/beir_nfcorpus/queries.jsonl")
@@ -97,6 +100,7 @@ def main() -> None:
         "--sample-queries",     str(args.sample_queries),
         "--gpu-id",             str(args.gpu_id),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+        "--embedding-model",       str(args.embedding_model),
     ]
     if args.queries_file:
         base_args += ["--queries-file", str(args.queries_file)]
