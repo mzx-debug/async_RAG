@@ -2135,7 +2135,7 @@ class StandaloneRAGPipeline:
         embed_batch_counter = [0]
 
         def embed_worker() -> None:
-            nonlocal q_er_size, q_er_max_seen, q_rg_size, q_rg_max_seen
+            nonlocal q_er_size, q_er_max_seen, q_rg_size, q_rg_max_seen, scheduler_dispatch_sec_total, scheduler_feedback_sec_total
             try:
                 stage_cache: Dict[str, QueryEmbeddingStage] = {self.embedding_backend: self.embedding_stage}
                 while True:
