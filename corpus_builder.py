@@ -55,10 +55,14 @@ def download_dataset(dataset_name: str, output_dir: Path) -> dict[str, list]:
     Returns {"corpus": [...], "queries": [...]} in pipeline format.
     """
     t0 = time.perf_counter()
-    print(f"Loading BEIR dataset: {dataset_name}")
+    # dataset_name may be "beir/nfcorpus" or just "nfcorpus"
+    # HuggingFace dataset id is always "beir/{name}" with lowercase 'b'
+    beir_name = dataset_name.replace("BeIR/", "").replace("beir/", "")
+    hf_id = f"beir/{beir_name}"
+    print(f"Loading BEIR dataset: {dataset_name}  (HuggingFace: {hf_id})")
 
-    corpus_ds = load_dataset(f"BeIR/{dataset_name}", name="corpus", split="corpus", trust_remote_code=True)
-    queries_ds = load_dataset(f"BeIR/{dataset_name}", name="queries", split="queries", trust_remote_code=True)
+    corpus_ds = load_dataset(hf_id, name="corpus", split="corpus")
+    queries_ds = load_dataset(hf_id, name="queries", split="queries")
 
     corpus = [beir_to_pipeline(dict(d)) for d in corpus_ds]
     queries = [beir_query_to_pipeline(dict(d)) for d in queries_ds]
@@ -84,7 +88,7 @@ def download_dataset(dataset_name: str, output_dir: Path) -> dict[str, list]:
 
     # Also try to load qrels if available (for reference / evaluation)
     try:
-        qrels_ds = load_dataset(f"BeIR/{dataset_name}", name="qrels", split="train", trust_remote_code=True)
+        qrels_ds = load_dataset(hf_id, name="qrels", split="train")
         qrels_path = output_dir / "qrels.jsonl"
         with qrels_path.open("w", encoding="utf-8") as f:
             for row in qrels_ds:
