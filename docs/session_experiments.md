@@ -273,28 +273,7 @@ b = 16 / 32 / 64
   - 显存使用随时间的变化
 ```
 
-#### 实验 7.3：Lookahead dispatch 效果验证
-
-**目标**：验证 lookahead dispatch 在显存受限时是否提升 pipeline 利用率
-
-```
-命令：
-  --pipeline-mode async_bucket
-  --b 16
-  --gpu-memory-utilization 0.3
-
-对比：
-  --enable-lookahead-dispatch  # 新版（提前 push 多 batch）
-  vs
-  （无 --enable-lookahead-dispatch）  # 旧版（等 feedback 后再 dispatch）
-
-关注指标：
-  - max_q_er（pipeline 积压深度）
-  - wall_time_ms
-  - q_rg/q_out 队列积压情况
-```
-
-#### 实验 7.4：显存受限场景完整对比
+#### 实验 7.3：显存受限场景完整对比
 
 **目标**：在资源受限时比较 `plain_b64` vs `async_bucket`（显存感知）
 
@@ -308,8 +287,7 @@ b = 16 / 32 / 64
 对比组：
   1. plain_b64（async_plain, b=64）：显存充裕时的最强基线
   2. plain_b16（async_plain, b=16）：显存受限下的实际可行 batch size
-  3. async_bucket（显存感知 + 禁用 lookahead）
-  4. async_bucket（显存感知 + 启用 lookahead）
+  3. async_bucket（显存感知调度）
 
 关注指标：
   - wall_throughput_qps（核心）
@@ -347,7 +325,6 @@ gpu_memory_utilization = 0.3 / 0.4 / 0.5 / 0.6 / 0.8
 2. async_bucket_no_mem             # --disable-memory-aware-scheduling
 3. async_bucket_mem_act           # 显存感知 action + 旧版桶优先级
 4. async_bucket_mem_bucket        # 显存感知 action + 显存感知桶优先级
-5. async_bucket_mem_lookahead     # 显存感知 action + 显存感知桶优先级 + lookahead
 ```
 
 ### 关键对比
@@ -357,7 +334,6 @@ gpu_memory_utilization = 0.3 / 0.4 / 0.5 / 0.6 / 0.8
 | 2 vs 1 | async_bucket 基础效应 | 调度算法本身的收益 |
 | 3 vs 2 | 显存感知 action | action 空间细粒度控制的收益 |
 | 4 vs 3 | 显存感知桶优先级 | 动态 bucket 调度的收益 |
-| 5 vs 4 | lookahead dispatch | pipeline overlap 的收益 |
 
 ---
 

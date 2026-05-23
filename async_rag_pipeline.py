@@ -2194,7 +2194,6 @@ class StandaloneRAGPipeline:
                     # ── Event-driven dispatch ─────────────────────────────────────
                     # Embedding 结束的那一刻，立刻根据当前实时状态决定下一个 batch。
                     # 只要 embed 始终有下一个可跑，retrieval 和 generation 自然饱和。
-                    # 不再需要主线程 lookahead。
                     if self.scheduler.has_pending():
                         dispatch_start = time.perf_counter()
                         with stats_lock:

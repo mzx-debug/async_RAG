@@ -26,7 +26,6 @@
 
 1. 先跑一次 `--disable-memory-aware-scheduling` 的 baseline
 2. 再跑一次默认（显存感知启用）对比
-3. 验证 `lookahead dispatch` 的效果
 
 ---
 

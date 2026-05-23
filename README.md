@@ -28,10 +28,10 @@ The current implementation is intentionally narrow:
 
 ## Setup
 
-```powershell
-cd E:\R1\async_rag_pipeline_v0
+```bash
+cd /path/to/async_rag_pipeline_v0
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/bin/activate
 pip install -U pip
 pip install -r requirements.txt
 ```
@@ -50,51 +50,51 @@ Query files accept `.txt`, `.jsonl`, or `.json`. The loader prefers the `questio
 
 ## Example: build index
 
-```powershell
-python .\build_index.py `
-  --corpus-path .\data\corpus.jsonl `
-  --output-dir .\indexes\ivf4096_flat `
-  --model-path intfloat/e5-large-v2 `
-  --batch-size 256 `
-  --max-length 512 `
-  --pooling-method mean `
-  --use-fp16 `
-  --faiss-type IVF4096,Flat `
+```bash
+python ./build_index.py \
+  --corpus-path ./data/corpus.jsonl \
+  --output-dir ./indexes/ivf4096_flat \
+  --model-path intfloat/e5-large-v2 \
+  --batch-size 256 \
+  --max-length 512 \
+  --pooling-method mean \
+  --use-fp16 \
+  --faiss-type IVF4096,Flat \
   --device cuda
 ```
 
 Output:
 
-- `indexes\ivf4096_flat\faiss.index`
+- `indexes/ivf4096_flat/faiss.index`
 
 ## Example: run one mode
 
-```powershell
-python .\async_rag_pipeline.py `
-  --pipeline-mode async_bucket `
-  --index-path .\indexes\ivf4096_flat\faiss.index `
-  --corpus-path .\data\corpus.jsonl `
-  --generator-model meta-llama/Llama-3.1-8B-Instruct `
-  --queries-file .\data\queries.jsonl `
-  --sample-queries 256 `
-  --b 64 --xE 1 --xR 0 `
-  --nprobe 128 --topk 1 `
-  --output-json .\output\summary_async_bucket.json
+```bash
+python ./async_rag_pipeline.py \
+  --pipeline-mode async_bucket \
+  --index-path ./indexes/ivf4096_flat/faiss.index \
+  --corpus-path ./data/corpus.jsonl \
+  --generator-model meta-llama/Llama-3.1-8B-Instruct \
+  --queries-file ./data/queries.jsonl \
+  --sample-queries 256 \
+  --b 64 --xE 1 --xR 0 \
+  --nprobe 128 --topk 1 \
+  --output-json ./output/summary_async_bucket.json
 ```
 
 ## Example: compare all modes
 
-```powershell
-python .\run_comparison.py `
-  --workdir E:\R1\async_rag_pipeline_v0 `
-  --index-path E:\R1\async_rag_pipeline_v0\indexes\ivf4096_flat\faiss.index `
-  --corpus-path E:\R1\async_rag_pipeline_v0\data\corpus.jsonl `
-  --generator-model meta-llama/Llama-3.1-8B-Instruct `
-  --queries-file E:\R1\async_rag_pipeline_v0\data\queries.jsonl `
-  --sample-queries 256 `
-  --b 64 --xE 1 --xR 0 `
-  --nprobe 128 --topk 1 `
-  --output-dir E:\R1\async_rag_pipeline_v0\output\comparison
+```bash
+python ./run_comparison.py \
+  --workdir /path/to/async_rag_pipeline_v0 \
+  --index-path /path/to/async_rag_pipeline_v0/indexes/ivf4096_flat/faiss.index \
+  --corpus-path /path/to/async_rag_pipeline_v0/data/corpus.jsonl \
+  --generator-model meta-llama/Llama-3.1-8B-Instruct \
+  --queries-file /path/to/async_rag_pipeline_v0/data/queries.jsonl \
+  --sample-queries 256 \
+  --b 64 --xE 1 --xR 0 \
+  --nprobe 128 --topk 1 \
+  --output-dir /path/to/async_rag_pipeline_v0/output/comparison
 ```
 
 Outputs:
@@ -126,23 +126,6 @@ The live scheduler-related CLI surface in `async_rag_pipeline.py` is:
 - `--gpu-mem-medium-threshold-gb` — free memory below this triggers "medium" pressure (default: 10.0 GiB)
 - `--gpu-mem-high-batch-penalty` — score penalty for GPU-heavy actions under high pressure (default: 50.0 ms)
 - `--faiss-index-gb` — estimated FAISS GPU memory footprint for scheduling decisions (default: 2.0 GiB)
-- `--enable-lookahead-dispatch` — enable lookahead: push multiple micro-batches without waiting for feedback. **Critical for resource-constrained overlap** (CPU embed + GPU retrieve/generate can run in parallel). Default: off, must be passed explicitly.
-
-### Lookahead dispatch
-
-When `--enable-lookahead-dispatch` is set, the main thread pushes N batches ahead of the generation stage without waiting for feedback. This creates real pipeline overlap:
-
-```
-Without lookahead:  dispatch → [embed → retrieve → generate] → dispatch → ...
-With lookahead:    dispatch → dispatch → dispatch → [generate ← retrieve ← embed]
-```
-
-The number of lookahead steps is driven by memory pressure:
-| Pressure | Trigger | Max Lookahead |
-|---------|---------|--------------|
-| high   | q_rg >= 1 | 3 batches |
-| medium | q_rg >= 2 | 1-2 batches |
-| low    | q_rg >= 4 | 1 batch |
 
 ### Removed zombie parameters
 
@@ -163,34 +146,34 @@ The number of lookahead steps is driven by memory pressure:
 
 Example:
 
-```powershell
-python .\run_ablation.py `
-  --workdir E:\R1\async_rag_pipeline_v0 `
-  --index-path E:\R1\async_rag_pipeline_v0\indexes\ivf4096_flat\faiss.index `
-  --corpus-path E:\R1\async_rag_pipeline_v0\data\corpus.jsonl `
-  --generator-model meta-llama/Llama-3.1-8B-Instruct `
-  --queries-file E:\R1\async_rag_pipeline_v0\data\queries.jsonl `
-  --sample-queries 256 `
-  --b 16 --xE 1 --xR 0 `
-  --nprobe 128 --topk 1 `
-  --output-dir E:\R1\async_rag_pipeline_v0\ablation_output
+```bash
+python ./run_ablation.py \
+  --workdir /path/to/async_rag_pipeline_v0 \
+  --index-path /path/to/async_rag_pipeline_v0/indexes/ivf4096_flat/faiss.index \
+  --corpus-path /path/to/async_rag_pipeline_v0/data/corpus.jsonl \
+  --generator-model meta-llama/Llama-3.1-8B-Instruct \
+  --queries-file /path/to/async_rag_pipeline_v0/data/queries.jsonl \
+  --sample-queries 256 \
+  --b 16 --xE 1 --xR 0 \
+  --nprobe 128 --topk 1 \
+  --output-dir /path/to/async_rag_pipeline_v0/ablation_output
 ```
 
 ## Generation-target evaluation
 
 If you only want to answer whether `generation_target_v1` can beat the current strongest practical baseline, use:
 
-```powershell
-python .\run_generation_target_eval.py `
-  --workdir E:\R1\async_rag_pipeline_v0 `
-  --index-path E:\R1\async_rag_pipeline_v0\indexes\ivf4096_flat\faiss.index `
-  --corpus-path E:\R1\async_rag_pipeline_v0\data\corpus.jsonl `
-  --generator-model meta-llama/Llama-3.1-8B-Instruct `
-  --queries-file E:\R1\async_rag_pipeline_v0\data\queries.jsonl `
-  --sample-queries 256 `
-  --xE 1 --xR 0 `
-  --nprobe 128 --topk 1 `
-  --output-dir E:\R1\async_rag_pipeline_v0\generation_target_eval
+```bash
+python ./run_generation_target_eval.py \
+  --workdir /path/to/async_rag_pipeline_v0 \
+  --index-path /path/to/async_rag_pipeline_v0/indexes/ivf4096_flat/faiss.index \
+  --corpus-path /path/to/async_rag_pipeline_v0/data/corpus.jsonl \
+  --generator-model meta-llama/Llama-3.1-8B-Instruct \
+  --queries-file /path/to/async_rag_pipeline_v0/data/queries.jsonl \
+  --sample-queries 256 \
+  --xE 1 --xR 0 \
+  --nprobe 128 --topk 1 \
+  --output-dir /path/to/async_rag_pipeline_v0/generation_target_eval
 ```
 
 ## Reading results
@@ -206,4 +189,3 @@ Prioritize:
 - `scheduler.action_counts`
 
 Use `wall_*` metrics for cross-mode performance claims. They reflect real elapsed time; `total_ms` is just the sum of stage times.
-"# async_RAG" 

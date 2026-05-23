@@ -7,7 +7,7 @@
 ## 立即
 
 - [ ] 在资源受限场景下运行三模式对比（`gpu_memory_utilization=0.3`），验证显存感知调度的效果
-  - 包含：显存感知 action 选择、显存感知桶优先级、lookahead dispatch
+  - 包含：显存感知 action 选择、显存感知桶优先级
   - 预期：`async_bucket` 在低显存场景下比 `plain_b64` 表现更好
 
 ---
@@ -29,11 +29,6 @@
   - 高显存压力：long 查询是否被优先调度
   - 低显存压力：short 查询是否保持高优先级
   - 通过 `dispatch_trace` 中的 bucket 分布确认
-
-- [ ] Lookahead dispatch 效果验证
-  - `--enable-lookahead-dispatch` 开关对比：启用 vs 禁用
-  - 观察 `max_q_er` 是否在有 lookahead 时更高（pipeline 填得更满）
-  - 对比 wall_time 差异
 
 - [ ] 联合决策效果验证
   - `plain_b64` vs `async_bucket + 显存感知` 在低显存场景下的 QPS 差距
@@ -84,8 +79,7 @@
   - 主题：资源受限场景下的异步 RAG 流水线调度
   - 核心贡献：
     1. 显存感知调度的必要性证明（vs 充裕场景对比）
-    2. lookahead dispatch 的理论分析
-    3. 显存压力驱动的桶优先级策略
+    2. 显存压力驱动的桶优先级策略
 
 ---
 
@@ -117,6 +111,5 @@
 - [x] 实现 ResourceTracker 类（GPU 显存实时监控 + 各阶段预估）
 - [x] 改造 `_action_feasible()`（显存感知 action 过滤与打分）
 - [x] 改造 `_bucket_priority()`（显存压力驱动的桶优先级）
-- [x] 实现 lookahead dispatch（显存压力感知的提前 dispatch）
-- [x] 新增显存感知 CLI 参数（memory-aware、lookahead、thresholds）
+- [x] 新增显存感知 CLI 参数（memory-aware、thresholds）
 - [x] 整合 ResourceTracker 到 StandaloneRAGPipeline

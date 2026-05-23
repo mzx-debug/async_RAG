@@ -37,20 +37,6 @@ Under high memory pressure, long queries are dispatched first (they consume the 
 
 Under low memory pressure, short queries stay highest priority (追求高 throughput).
 
-### New: Lookahead dispatch
-
-The old behavior: dispatch one batch → wait for generation feedback → dispatch next.
-
-The new behavior: push N batches ahead of the generation stage without waiting. The value of N is driven by memory pressure:
-
-| Pressure | Trigger | Max Lookahead |
-|---------|---------|--------------|
-| high   | q_rg >= 1 | 3 batches |
-| medium | q_rg >= 2 | 1-2 batches |
-| low    | q_rg >= 4 | 1 batch |
-
-This creates real pipeline overlap: CPU embed (xE=0) runs in parallel with GPU retrieve + GPU generate.
-
 ### New CLI flags
 
 ```
@@ -58,7 +44,6 @@ This creates real pipeline overlap: CPU embed (xE=0) runs in parallel with GPU r
 --gpu-mem-low-threshold-gb        (default: 4.0 GiB)
 --gpu-mem-medium-threshold-gb     (default: 10.0 GiB)
 --gpu-mem-high-batch-penalty      (default: 50.0 ms)
---enable-lookahead-dispatch       (default: off; must be passed explicitly)
 --faiss-index-gb                 (default: 2.0 GiB)
 ```
 
@@ -74,42 +59,31 @@ All new parameters have `getattr(..., default)` guards. Existing runner scripts 
 
 1. Choose `xE=0, xR=0` more often under high memory pressure
 2. Prioritize long queries when GPU memory is tight
-3. Use lookahead dispatch to keep the pipeline saturated
 
 **Key experiment to run first**:
 
-```powershell
+```bash
 # Baseline (old behavior)
-python .\async_rag_pipeline.py `
-  --pipeline-mode async_bucket `
-  --gpu-memory-utilization 0.3 `
-  --b 16 --xE 1 --xR 0 `
-  --disable-memory-aware-scheduling `
-  --index-path ... --corpus-path ... --generator-model ... `
-  --queries-file .\data\queries_generated.jsonl `
-  --output-json .\output\baseline_0.3.json
+python ./async_rag_pipeline.py \
+  --pipeline-mode async_bucket \
+  --gpu-memory-utilization 0.3 \
+  --b 16 --xE 1 --xR 0 \
+  --disable-memory-aware-scheduling \
+  --index-path ... --corpus-path ... --generator-model ... \
+  --queries-file ./data/queries_generated.jsonl \
+  --output-json ./output/baseline_0.3.json
 
 # Memory-aware (new behavior)
-python .\async_rag_pipeline.py `
-  --pipeline-mode async_bucket `
-  --gpu-memory-utilization 0.3 `
-  --b 16 --xE 1 --xR 0 `
-  --index-path ... --corpus-path ... --generator-model ... `
-  --queries-file .\data\queries_generated.jsonl `
-  --output-json .\output\mem_aware_0.3.json
-
-# Memory-aware + lookahead
-python .\async_rag_pipeline.py `
-  --pipeline-mode async_bucket `
-  --gpu-memory-utilization 0.3 `
-  --b 16 --xE 1 --xR 0 `
-  --enable-lookahead-dispatch `
-  --index-path ... --corpus-path ... --generator-model ... `
-  --queries-file .\data\queries_generated.jsonl `
-  --output-json .\output\mem_aware_lookahead_0.3.json
+python ./async_rag_pipeline.py \
+  --pipeline-mode async_bucket \
+  --gpu-memory-utilization 0.3 \
+  --b 16 --xE 1 --xR 0 \
+  --index-path ... --corpus-path ... --generator-model ... \
+  --queries-file ./data/queries_generated.jsonl \
+  --output-json ./output/mem_aware_0.3.json
 ```
 
-Compare `wall_throughput_qps`, `action_counts`, and `bucket_counts` across the three runs.
+Compare `wall_throughput_qps`, `action_counts`, and `bucket_counts` across the two runs.
 
 ## Key Files to Reference
 
@@ -117,3 +91,4 @@ Compare `wall_throughput_qps`, `action_counts`, and `bucket_counts` across the t
 - `docs/session_experiments.md` — full experiment designs
 - `docs/session_code_changes.md` — detailed code change log
 - `docs/session_research_progress.md` — research motivation and direction
+- `docs/resource_constrained_test_guide.md` — test commands for resource-constrained scenarios

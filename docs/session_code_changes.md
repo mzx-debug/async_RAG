@@ -73,42 +73,7 @@ if mem_pressure == "high":
     elif bucket == "short": base -= 0.5  # 短查询便宜，可以等待
 ```
 
-#### 4. 实现 lookahead dispatch — 真正的流水线 overlap
-
-**旧逻辑**（等待 feedback 后再 dispatch 下一个）：
-```python
-while scheduler.has_pending():
-    dispatch = scheduler.next_dispatch(...)
-    q_er.put(dispatch)
-    # ← 这里阻塞等待 generation_worker 完成 feedback
-```
-
-**新逻辑**（显存压力驱动，提前 push 多个 batch）：
-```python
-# 1. 主 dispatch
-dispatch = scheduler.next_dispatch(...)
-q_er.put(dispatch)
-
-# 2. Lookahead dispatches（不等待 feedback）
-lookahead_count = scheduler._should_dispatch_ahead(
-    gpu_mem_gb=current_free_mem,
-    q_er_len=q_er_size,
-    q_rg_len=q_rg_size,
-    avg_generation_ms_per_query=ema_gen_ms,
-)
-for _ in range(lookahead_count):
-    dispatch = scheduler.next_dispatch(...)
-    q_er.put(dispatch)  # 直接 push，不等 feedback
-```
-
-**显存压力与 lookahead 强度**：
-| 压力等级 | 触发条件 | 最大 lookahead |
-|---------|---------|--------------|
-| high | q_rg >= 1 且 q_er 有余量 | 3 个 batch |
-| medium | q_rg >= 2 且 q_er 有余量 | 1-2 个 batch |
-| low | q_rg >= 4 且 q_er 有余量 | 1 个 batch |
-
-#### 5. 整合到 `StandaloneRAGPipeline.__init__`
+#### 4. 整合到 `StandaloneRAGPipeline.__init__`
 
 ```python
 # 创建 ResourceTracker
@@ -131,10 +96,9 @@ self.resource_tracker.set_vllm_init_complete(self.gpu_mem_total_gb)
 --enable-memory-aware-scheduling    # 默认 True，可被 --disable 关闭
 --disable-memory-aware-scheduling
 --gpu-mem-low-threshold-gb         # 默认 4.0 GiB
---gpu-mem-medium-threshold-gb      # 默认 10.0 GiB
---gpu-mem-high-batch-penalty       # 默认 50.0 分
---enable-lookahead-dispatch         # 默认关闭（需显式指定）
---faiss-index-gb                    # 默认 2.0 GiB
+--gpu-mem-medium-threshold-gb     # 默认 10.0 GiB
+--gpu-mem-high-batch-penalty      # 默认 50.0 分
+--faiss-index-gb                  # 默认 2.0 GiB
 ```
 
 ### 向后兼容性
@@ -149,7 +113,6 @@ self.resource_tracker.set_vllm_init_complete(self.gpu_mem_total_gb)
 |------|---------|---------|
 | vLLM gpu_util=0.3，可用 8 GiB | xR=1 静态禁用 | 动态评估显存，灵活降级 |
 | 显存高压（<4 GiB） | 固定 short 先调度 | long 查询优先（先调度先释放） |
-| CPU embed + GPU retrieve | 等待上一 batch 完成 | lookahead 提前 push，overlap 最大化 |
 
 ---
 

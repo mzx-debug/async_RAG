@@ -27,8 +27,7 @@
 1. `ResourceTracker` — GPU 显存实时监控 + 各阶段预估
 2. `_action_feasible()` — 显存感知 action 选择（替代硬编码 20 GiB 阈值）
 3. `_bucket_priority()` — 显存压力驱动的桶优先级
-4. `lookahead dispatch` — 真正的流水线 overlap
-5. 新增 6 个 CLI 参数控制上述行为
+4. 新增 CLI 参数控制上述行为
 
 ### 下一步
 

@@ -212,11 +212,6 @@ Generation: 162.98ms (87.6%)
 高显存压力时：long 查询优先调度（显存占用最大，先调度先释放）
 低显存压力时：保持 short > mid > long（追求 throughput）
 
-#### 4. Lookahead dispatch — 真正的流水线 overlap
-
-旧行为：dispatch 一个 batch → 等 generation 完成 feedback → 再 dispatch 下一个
-新行为：显存压力驱动，提前 push N 个 batch 而不等待 feedback
-
 ### 预期结论
 
 1. 资源受限场景下，`async_bucket`（显存感知）应该能接近或超过 `plain_b16`（受限下的实际可行 batch）
@@ -228,4 +223,4 @@ Generation: 162.98ms (87.6%)
 - `wall_throughput_qps`：吞吐量
 - `action_counts`：设备选择分布（是否在显存压力下选择了 `xE=0, xR=0`）
 - `bucket_counts`：调度分布（高显存压力时是否优先调度 long）
-- `max_q_er`：`lookahead` 是否让 pipeline 积压更深
+- `max_q_er`：embed 队列最大深度

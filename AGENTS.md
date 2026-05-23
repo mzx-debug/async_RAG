@@ -8,18 +8,18 @@ When adding new code, prefer small helper functions over new top-level scripts u
 ## Build, Test, and Development Commands
 Set up the environment:
 
-```powershell
+```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 Key workflows:
 
-```powershell
-python .\build_index.py --corpus-path .\data\corpus.jsonl --output-dir .\indexes\flat --device cuda
-python .\async_rag_pipeline.py --pipeline-mode async_bucket --index-path .\indexes\flat\faiss.index --corpus-path .\data\corpus.jsonl --generator-model meta-llama/Llama-3.1-8B-Instruct --queries-file .\data\queries_generated.jsonl
-python .\run_comparison.py --workdir . --index-path .\indexes\flat\faiss.index --corpus-path .\data\corpus.jsonl --generator-model meta-llama/Llama-3.1-8B-Instruct --queries-file .\data\queries_generated.jsonl --output-dir .\comparison
+```bash
+python ./build_index.py --corpus-path ./data/corpus.jsonl --output-dir ./indexes/flat --device cuda
+python ./async_rag_pipeline.py --pipeline-mode async_bucket --index-path ./indexes/flat/faiss.index --corpus-path ./data/corpus.jsonl --generator-model meta-llama/Llama-3.1-8B-Instruct --queries-file ./data/queries_generated.jsonl
+python ./run_comparison.py --workdir . --index-path ./indexes/flat/faiss.index --corpus-path ./data/corpus.jsonl --generator-model meta-llama/Llama-3.1-8B-Instruct --queries-file ./data/queries_generated.jsonl --output-dir ./comparison
 ```
 
 Use `docs/pipeline_execution_guide.md` for fuller parameter examples.

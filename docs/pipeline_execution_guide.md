@@ -162,18 +162,18 @@ embedding + retrieval + transfer + generation + batch_size_residual
 
 ## 8. 一条典型命令
 
-```powershell
-python .\async_rag_pipeline.py `
-  --pipeline-mode async_bucket `
-  --index-path .\indexes\ivf4096_flat\faiss.index `
-  --corpus-path .\data\corpus.jsonl `
-  --generator-model meta-llama/Llama-3.1-8B-Instruct `
-  --queries-file .\data\queries.jsonl `
-  --sample-queries 256 `
-  --b 64 --xE 1 --xR 0 `
-  --nprobe 128 --topk 1 `
-  --scheduler-ema-alpha 0.25 `
-  --output-json .\output\summary_async_bucket.json
+```bash
+python ./async_rag_pipeline.py \
+  --pipeline-mode async_bucket \
+  --index-path ./indexes/ivf4096_flat/faiss.index \
+  --corpus-path ./data/corpus.jsonl \
+  --generator-model meta-llama/Llama-3.1-8B-Instruct \
+  --queries-file ./data/queries.jsonl \
+  --sample-queries 256 \
+  --b 64 --xE 1 --xR 0 \
+  --nprobe 128 --topk 1 \
+  --scheduler-ema-alpha 0.25 \
+  --output-json ./output/summary_async_bucket.json
 ```
 
 ## 8.1 消融实验
