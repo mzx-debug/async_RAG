@@ -2013,6 +2013,25 @@ class StandaloneRAGPipeline:
             scheduled_batches = self._build_plain_microbatches()
             if not scheduled_batches:
                 raise ValueError("Scheduler returned no microbatches.")
+            # async_plain needs _pending_by_bucket populated so has_pending() works.
+            # Mirror the structure that prepare_queries() builds for async_bucket.
+            self.scheduler._pending_by_bucket = {"short": [], "mid": [], "long": []}
+            self.scheduler._pending_queries = []
+            self.scheduler._query_token_lengths = {}
+            for microbatch in scheduled_batches:
+                for idx, query, token_length in zip(
+                    microbatch.query_indices, microbatch.queries, microbatch.token_lengths
+                ):
+                    bucket = self.scheduler._bucket_name(token_length)
+                    self.scheduler._pending_by_bucket[bucket].append(
+                        PendingQuery(
+                            query_index=idx,
+                            query=query,
+                            token_length=token_length,
+                            estimated_cost=self.scheduler._estimate_embedding_cost(token_length),
+                        )
+                    )
+                    self.scheduler._query_token_lengths[idx] = token_length
             scheduler_mode = "plain_fixed_batch"
 
         self._warmup()
@@ -2189,36 +2208,6 @@ class StandaloneRAGPipeline:
                     with stats_lock:
                         q_rg_size += 1
                         q_rg_max_seen = max(q_rg_max_seen, q_rg_size)
-
-                    # ── Event-driven dispatch ─────────────────────────────────────
-                    # Embedding 结束的那一刻，立刻根据当前实时状态决定下一个 batch。
-                    # 只要 embed 始终有下一个可跑，retrieval 和 generation 自然饱和。
-                    if self.scheduler.has_pending():
-                        dispatch_start = time.perf_counter()
-                        with stats_lock:
-                            q_er_now = q_er_size
-                            q_rg_now = q_rg_size
-                        gpu_mem_now = self._detect_gpu_free_memory_gb()
-
-                        next_dispatch = self.scheduler.next_dispatch(
-                            gpu_available=self.gpu_available,
-                            gpu_mem_gb=gpu_mem_now,
-                            q_er_len=q_er_now,
-                            q_rg_len=q_rg_now,
-                            long_ratio=bucket_long_ratio,
-                        )
-                        scheduler_dispatch_sec_total += time.perf_counter() - dispatch_start
-
-                        if next_dispatch is not None:
-                            with stats_lock:
-                                action_key = (
-                                    f"xE{int(next_dispatch.action.get('xE', 0))}_"
-                                    f"xR{int(next_dispatch.action.get('xR', 0))}"
-                                )
-                                action_counts[action_key] = action_counts.get(action_key, 0) + 1
-                                q_er_size += 1
-                                q_er_max_seen = max(q_er_max_seen, q_er_size)
-                            q_er.put(next_dispatch)
             except Exception as exc:  # pragma: no cover - runtime guard
                 error_queue.put(exc)
                 q_rg.put(None)
@@ -2370,31 +2359,30 @@ class StandaloneRAGPipeline:
         t_retrieval.start()
         t_generation.start()
 
-        # Prime: dispatch the very first batch to kick off embed_worker.
-        # From then on, embed_worker self-dispatches at the end of each batch
-        # (event-driven: embedding-done → decide next → push to q_er).
-        if self.scheduler.has_pending():
-            first_dispatch = self.scheduler.next_dispatch(
+        # Prime & dispatch all batches: for both async_plain and async_bucket, the scheduler's
+        # pending queue holds all remaining microbatches. We drain them all into q_er first,
+        # then send None. Embed_worker processes each batch sequentially without self-dispatch.
+        while self.scheduler.has_pending():
+            dispatch = self.scheduler.next_dispatch(
                 gpu_available=self.gpu_available,
                 gpu_mem_gb=self._detect_gpu_free_memory_gb(),
                 q_er_len=0,
                 q_rg_len=0,
                 long_ratio=bucket_long_ratio,
             )
-            if first_dispatch is not None:
-                action_key = (
-                    f"xE{int(first_dispatch.action.get('xE', 0))}_"
-                    f"xR{int(first_dispatch.action.get('xR', 0))}"
-                )
-                action_counts[action_key] = action_counts.get(action_key, 0) + 1
-                q_er.put(first_dispatch)
-                with stats_lock:
-                    q_er_size += 1
-                    q_er_max_seen = max(q_er_max_seen, q_er_size)
+            if dispatch is None:
+                break
+            action_key = (
+                f"xE{int(dispatch.action.get('xE', 0))}_"
+                f"xR{int(dispatch.action.get('xR', 0))}"
+            )
+            action_counts[action_key] = action_counts.get(action_key, 0) + 1
+            q_er.put(dispatch)
+            with stats_lock:
+                q_er_size += 1
+                q_er_max_seen = max(q_er_max_seen, q_er_size)
 
-        # Sentinel: no more batches will ever be added to q_er.
-        # embed_worker will still drain whatever it pulled and self-dispatch,
-        # then see this None and propagate it through the pipeline.
+        # Sentinel: signals end of q_er stream.
         q_er.put(None)
         t_embed.join()
 

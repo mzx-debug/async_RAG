@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
-def run_one(mode: str, script: Path, base_args: List[str], out_dir: Path) -> Dict[str, Any]:
-    out_path = out_dir / f"summary_{mode}.json"
+def run_one(mode: str, script: Path, base_args: List[str], out_dir: Path, prefix: str = "") -> Dict[str, Any]:
+    out_name = f"summary_{prefix}_{mode}.json" if prefix else f"summary_{mode}.json"
+    out_path = out_dir / out_name
     cmd = [sys.executable, str(script)] + base_args + ["--pipeline-mode", mode, "--output-json", str(out_path)]
     print("Running:", " ".join(cmd))
     proc = subprocess.run(cmd, text=True)
@@ -22,6 +23,7 @@ def run_one(mode: str, script: Path, base_args: List[str], out_dir: Path) -> Dic
 
 def make_table(rows: List[Dict[str, Any]]) -> str:
     header = [
+        "group",
         "mode",
         "execution",
         "num_queries",
@@ -38,6 +40,7 @@ def make_table(rows: List[Dict[str, Any]]) -> str:
             "| "
             + " | ".join(
                 [
+                    str(row.get("group", "")),
                     str(row["mode"]),
                     str(row["execution"]),
                     str(row["num_queries"]),
@@ -112,25 +115,39 @@ def main() -> None:
     if args.queries_file:
         base_args += ["--queries-file", str(args.queries_file)]
 
-    modes = ["serial", "async_plain", "async_bucket"]
-    summaries = {mode: run_one(mode, script, base_args, out_dir) for mode in modes}
+    # Run with CPU retrieval (xR=0) and GPU retrieval (xR=1).
+    # Each retrieval config runs serial, async_plain, async_bucket.
+    modes_by_retrieval = {
+        "cpu_retrieval": {"xR": 0, "modes": ["serial", "async_plain", "async_bucket"]},
+        "gpu_retrieval": {"xR": 1, "modes": ["serial", "async_plain", "async_bucket"]},
+    }
 
     rows = []
-    for mode in modes:
-        s = summaries[mode]
-        rows.append(
-            {
-                "mode": mode,
-                "execution": s.get("scheduler", {}).get("execution", ""),
-                "num_queries": s.get("num_queries", 0),
-                "wall_time_ms": float(s.get("wall_time_ms", 0.0)),
-                "wall_qps": float(s.get("wall_throughput_qps", 0.0)),
-                "total_ms": float(s.get("total_ms", 0.0)),
-                "avg_emb_ms": float(s.get("avg_embedding_ms", 0.0)),
-                "avg_ret_ms": float(s.get("avg_retrieval_ms", 0.0)),
-                "avg_gen_ms": float(s.get("avg_generation_ms", 0.0)),
-            }
-        )
+    for group_name, group_cfg in modes_by_retrieval.items():
+        xR_val = group_cfg["xR"]
+        modes = group_cfg["modes"]
+        print(f"\n{'='*60}")
+        print(f"  {group_name.upper()} (xR={xR_val})")
+        print(f"{'='*60}")
+        group_args = base_args.copy()
+        group_args[group_args.index("--xR") + 1] = str(xR_val)
+        for mode in modes:
+            print(f"\n>>> {mode}")
+            s = run_one(mode, script, group_args, out_dir, prefix=group_name)
+            rows.append(
+                {
+                    "group": group_name,
+                    "mode": mode,
+                    "execution": s.get("scheduler", {}).get("execution", ""),
+                    "num_queries": s.get("num_queries", 0),
+                    "wall_time_ms": float(s.get("wall_time_ms", 0.0)),
+                    "wall_qps": float(s.get("wall_throughput_qps", 0.0)),
+                    "total_ms": float(s.get("total_ms", 0.0)),
+                    "avg_emb_ms": float(s.get("avg_embedding_ms", 0.0)),
+                    "avg_ret_ms": float(s.get("avg_retrieval_ms", 0.0)),
+                    "avg_gen_ms": float(s.get("avg_generation_ms", 0.0)),
+                }
+            )
 
     table_md = make_table(rows)
     (out_dir / "comparison_table.md").write_text(table_md, encoding="utf-8")
