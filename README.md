@@ -109,6 +109,7 @@ Outputs:
 
 The live scheduler-related CLI surface in `async_rag_pipeline.py` is:
 
+### Basic bucket / batch parameters
 - `--length-short-threshold`
 - `--length-long-threshold`
 - `--bucket-batch-short`
@@ -119,7 +120,31 @@ The live scheduler-related CLI surface in `async_rag_pipeline.py` is:
 - `--backpressure-high`
 - `--scheduler-ema-alpha`
 
-Removed zombie parameters:
+### Memory-aware scheduling (resource-constrained scenarios)
+- `--enable-memory-aware-scheduling` — enable GPU memory-aware action selection and batch shaping (default: True). Use `--disable-memory-aware-scheduling` to fall back to the old static threshold behavior.
+- `--gpu-mem-low-threshold-gb` — free memory below this triggers "high" pressure (default: 4.0 GiB)
+- `--gpu-mem-medium-threshold-gb` — free memory below this triggers "medium" pressure (default: 10.0 GiB)
+- `--gpu-mem-high-batch-penalty` — score penalty for GPU-heavy actions under high pressure (default: 50.0 ms)
+- `--faiss-index-gb` — estimated FAISS GPU memory footprint for scheduling decisions (default: 2.0 GiB)
+- `--enable-lookahead-dispatch` — enable lookahead: push multiple micro-batches without waiting for feedback. **Critical for resource-constrained overlap** (CPU embed + GPU retrieve/generate can run in parallel). Default: off, must be passed explicitly.
+
+### Lookahead dispatch
+
+When `--enable-lookahead-dispatch` is set, the main thread pushes N batches ahead of the generation stage without waiting for feedback. This creates real pipeline overlap:
+
+```
+Without lookahead:  dispatch → [embed → retrieve → generate] → dispatch → ...
+With lookahead:    dispatch → dispatch → dispatch → [generate ← retrieve ← embed]
+```
+
+The number of lookahead steps is driven by memory pressure:
+| Pressure | Trigger | Max Lookahead |
+|---------|---------|--------------|
+| high   | q_rg >= 1 | 3 batches |
+| medium | q_rg >= 2 | 1-2 batches |
+| low    | q_rg >= 4 | 1 batch |
+
+### Removed zombie parameters
 
 - `--length-hard-threshold`
 - `--max-processed-length`

@@ -165,3 +165,67 @@ Generation: 162.98ms (87.6%)
 3. **在线延迟跟踪替代静态评分**：用 EMA 跟踪实际延迟，替代硬编码的 action 评分系数
 4. **动态 batch_size 收敛验证**：用数千条 query 观察 hill-climbing 的收敛行为
 5. **量化 async 适用边界**：绘制 retrieval 占比 vs async 加速比曲线
+
+---
+
+## 新研究方向：资源受限场景（2026-05-23 开启）
+
+### 动机
+
+已有实验均在 GPU 显存充裕的服务器环境下运行。在此条件下：
+
+- `xE/xR` 的选择空间几乎不存在（最优策略固定为 `xE=1, xR=0`）
+- `plain_b64` 是最强实践基线，`async_bucket` 无法显著超过它
+- 调度器的在线决策几乎没有优化空间
+
+这并不意味着 async 调度没有价值，而是意味着**当前测试场景没有给调度器足够的优化空间**。
+
+### 资源受限场景的优化机会
+
+当 GPU 显存不足时（例如 vLLM `gpu_memory_utilization=0.3`）：
+
+| 充裕场景 | 资源受限场景 |
+|---------|------------|
+| xE=1, xR=0 是唯一最优解 | xE/xR/batch_size 必须权衡 |
+| 大 batch 是免费午餐 | 大 batch 受显存约束，调度器需动态调整 |
+| CPU embed 无意义（GPU 更快） | CPU embed 释放 GPU 给 retrieval + generation |
+| Bucketing 带来净损失（缩小 generation batch） | Bucketing 可以通过 overlap 带来净收益 |
+| xR=1 直接禁用 | xR=1 需要与 xR=0 权衡 |
+
+### 实现方案
+
+#### 1. ResourceTracker — GPU 显存感知基础
+
+实时追踪 GPU 显存状态，分三档压力：
+- **high**（< 4 GiB）：禁用 GPU-heavy actions，long 查询优先调度
+- **medium**（4-10 GiB）：适度惩罚 GPU retrieval
+- **low**（> 10 GiB）：最小惩罚，优先 throughput
+
+#### 2. 显存感知 action 选择（`_action_feasible`）
+
+替代旧的硬编码 `gpu_mem_gb < 20.0` 阈值：
+- 用 `ResourceTracker.max_batch_size_for_action()` 估算显存可行性
+- 根据压力等级动态打分，而非硬过滤
+
+#### 3. 显存压力驱动的桶优先级（`_bucket_priority`）
+
+高显存压力时：long 查询优先调度（显存占用最大，先调度先释放）
+低显存压力时：保持 short > mid > long（追求 throughput）
+
+#### 4. Lookahead dispatch — 真正的流水线 overlap
+
+旧行为：dispatch 一个 batch → 等 generation 完成 feedback → 再 dispatch 下一个
+新行为：显存压力驱动，提前 push N 个 batch 而不等待 feedback
+
+### 预期结论
+
+1. 资源受限场景下，`async_bucket`（显存感知）应该能接近或超过 `plain_b16`（受限下的实际可行 batch）
+2. 如果显存感知版本能超过 `plain_b16` 而接近 `plain_b64`，则说明调度器在资源受限时创造了真实的优化空间
+3. 如果显存感知版本无法超过 `plain_b16`，则说明 async 调度的价值仍然有限，需要进一步探索
+
+### 核心验证指标
+
+- `wall_throughput_qps`：吞吐量
+- `action_counts`：设备选择分布（是否在显存压力下选择了 `xE=0, xR=0`）
+- `bucket_counts`：调度分布（高显存压力时是否优先调度 long）
+- `max_q_er`：`lookahead` 是否让 pipeline 积压更深

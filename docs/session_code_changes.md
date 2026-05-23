@@ -4,6 +4,155 @@
 
 ---
 
+## 0. 2026-05-23 资源受限场景调度重构
+
+**背景**：原有实验在 GPU 显存充裕的服务器环境下运行，此时 `xE/xR` 的选择几乎没有约束（最优策略几乎固定为 `xE=1, xR=0, b=64`），调度器的在线决策空间几乎不存在，导致 `async_bucket` 无法显著超过 `plain_b64`。
+
+**研究转向**：将研究场景切换到**资源受限**（GPU 显存不足、FAISS index 无法全驻留 GPU、vLLM 被限制在低 `gpu_memory_utilization`）。在此场景下，`xE/xR/batch_size` 联合决策、流水线 overlap、显存感知的桶优先级才有真正的优化空间。
+
+### 核心改动
+
+#### 1. 新增 `ResourceTracker` 类（~150 行）
+
+**位置**：`GreedyBucketScheduler` 之前。
+
+**新增 dataclass**：
+- `MemoryPressureLevel`：显存压力等级（`"low" | "medium" | "high"`）+ 各阶段显存分布快照
+- `ResourceTrackerSnapshot`：实时显存快照，含可用显存、各阶段预估显存
+
+**新增类** `ResourceTracker`：
+```python
+# 核心方法：
+get_current_free_mem_gb()      # torch.cuda.mem_get_info() 实时查询
+pressure_level(gpu_mem_gb)     # high(<4GiB) / medium(<10GiB) / low
+estimate_embed_activations_gb() # embedding 激活显存预估
+estimate_generation_cost_gb()   # vLLM KV cache 显存预估
+max_batch_size_for_action()     # 估算 (xE, xR) 的最大可行 batch size
+get_snapshot()                  # 完整显存快照
+```
+
+**显存压力分级策略**：
+| 压力等级 | 阈值 | 策略 |
+|---------|------|------|
+| high | < 4 GiB | 禁用 GPU-heavy actions，优先长查询先释放显存 |
+| medium | 4-10 GiB | 适度惩罚 xR=1，轻度惩罚 xE=1 |
+| low | > 10 GiB | 最小惩罚，优先追求 throughput |
+
+#### 2. 改造 `_choose_action_for_batch` → `_action_feasible()`
+
+**旧逻辑**（静态阈值）：
+```python
+# 硬编码阈值，显存充裕时才有意义
+if x_r == 1 and gpu_mem_gb < 20.0:
+    continue
+```
+
+**新逻辑**（显存感知，默认启用）：
+```python
+# 1. 用 ResourceTracker 估算 (xE, xR, batch_size) 的显存可行性
+if batch_size > resource_tracker.max_batch_size_for_action(x_e, x_r):
+    return False  # 显存不够，拒绝
+
+# 2. 根据显存压力动态打分，而非硬过滤
+pressure = resource_tracker.pressure_level(gpu_mem_gb)
+if pressure == "high" and x_r == 1:
+    memory_penalty += 50.0  # 大幅惩罚 GPU retrieval
+```
+
+可通过 `--disable-memory-aware-scheduling` 回退到旧逻辑。
+
+#### 3. 改造 `_bucket_priority` — 显存驱动的桶优先级
+
+**旧逻辑**：固定 `short(3.0) > mid(2.0) > long(1.0)`
+
+**新逻辑**（高显存压力时反转）：
+```python
+if mem_pressure == "high":
+    if bucket == "long":   base += 3.0  # 长查询显存占用最大，优先调度以便提前释放
+    elif bucket == "mid":  base += 1.5
+    elif bucket == "short": base -= 0.5  # 短查询便宜，可以等待
+```
+
+#### 4. 实现 lookahead dispatch — 真正的流水线 overlap
+
+**旧逻辑**（等待 feedback 后再 dispatch 下一个）：
+```python
+while scheduler.has_pending():
+    dispatch = scheduler.next_dispatch(...)
+    q_er.put(dispatch)
+    # ← 这里阻塞等待 generation_worker 完成 feedback
+```
+
+**新逻辑**（显存压力驱动，提前 push 多个 batch）：
+```python
+# 1. 主 dispatch
+dispatch = scheduler.next_dispatch(...)
+q_er.put(dispatch)
+
+# 2. Lookahead dispatches（不等待 feedback）
+lookahead_count = scheduler._should_dispatch_ahead(
+    gpu_mem_gb=current_free_mem,
+    q_er_len=q_er_size,
+    q_rg_len=q_rg_size,
+    avg_generation_ms_per_query=ema_gen_ms,
+)
+for _ in range(lookahead_count):
+    dispatch = scheduler.next_dispatch(...)
+    q_er.put(dispatch)  # 直接 push，不等 feedback
+```
+
+**显存压力与 lookahead 强度**：
+| 压力等级 | 触发条件 | 最大 lookahead |
+|---------|---------|--------------|
+| high | q_rg >= 1 且 q_er 有余量 | 3 个 batch |
+| medium | q_rg >= 2 且 q_er 有余量 | 1-2 个 batch |
+| low | q_rg >= 4 且 q_er 有余量 | 1 个 batch |
+
+#### 5. 整合到 `StandaloneRAGPipeline.__init__`
+
+```python
+# 创建 ResourceTracker
+self.resource_tracker = ResourceTracker(
+    gpu_id=self.gpu_id,
+    vllm_gpu_memory_utilization=args.gpu_memory_utilization,
+    faiss_index_gb=args.faiss_index_gb,
+)
+self.scheduler = GreedyBucketScheduler(args, resource_tracker=self.resource_tracker)
+
+# ... 初始化各 stage ...
+
+# vLLM 加载后记录显存占用
+self.resource_tracker.set_vllm_init_complete(self.gpu_mem_total_gb)
+```
+
+### 新增 CLI 参数
+
+```powershell
+--enable-memory-aware-scheduling    # 默认 True，可被 --disable 关闭
+--disable-memory-aware-scheduling
+--gpu-mem-low-threshold-gb         # 默认 4.0 GiB
+--gpu-mem-medium-threshold-gb      # 默认 10.0 GiB
+--gpu-mem-high-batch-penalty       # 默认 50.0 分
+--enable-lookahead-dispatch         # 默认关闭（需显式指定）
+--faiss-index-gb                    # 默认 2.0 GiB
+```
+
+### 向后兼容性
+
+- `--enable-memory-aware-scheduling` 默认开启（不传参时为 True）
+- `--disable-memory-aware-scheduling` 可关闭，回退到旧版静态阈值逻辑
+- 所有新参数均有 `getattr(..., default)` 保护，旧版 runner 脚本无需修改
+
+### 预期效果（资源受限场景）
+
+| 场景 | 旧版行为 | 新版行为 |
+|------|---------|---------|
+| vLLM gpu_util=0.3，可用 8 GiB | xR=1 静态禁用 | 动态评估显存，灵活降级 |
+| 显存高压（<4 GiB） | 固定 short 先调度 | long 查询优先（先调度先释放） |
+| CPU embed + GPU retrieve | 等待上一 batch 完成 | lookahead 提前 push，overlap 最大化 |
+
+---
+
 ## 0. 2026-05-16 参数收口与死代码清理
 
 **目标**：删除“名义可配、实际不生效”的僵尸参数与伪动态逻辑，让 CLI、summary 和真实行为一致。

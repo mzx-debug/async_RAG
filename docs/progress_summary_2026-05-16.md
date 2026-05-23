@@ -1,5 +1,43 @@
 # Async RAG Pipeline 进展总结（2026-05-16）
 
+---
+
+## 0. 2026-05-23 更新：研究方向切换到资源受限场景
+
+### 为什么现在要切换场景
+
+已有实验在 GPU 显存充裕的服务器环境下运行。此时：
+- `xE=1, xR=0, b=64` 是固定最优解，调度器几乎无优化空间
+- `async_bucket` 无法显著超过 `plain_b64`
+- `generation_target_v1` 方向暂停（未验证）
+
+### 核心假设
+
+在**资源受限**场景（GPU 显存不足、FAISS index 无法全驻留 GPU、vLLM 被限制在低 `gpu_memory_utilization`），`xE/xR/batch_size` 的联合决策才真正有意义：
+
+| 充裕场景 | 资源受限场景 |
+|---------|------------|
+| xE=1, xR=0 是唯一最优 | xE/xR/batch_size 需权衡 |
+| 大 batch 是免费的 | 大 batch 受显存约束 |
+| CPU embed 无意义 | CPU embed 释放 GPU 给 retrieval+gen |
+| Bucketing 净损失 | Bucketing 可通过 overlap 获益 |
+
+### 已实现的改动
+
+1. `ResourceTracker` — GPU 显存实时监控 + 各阶段预估
+2. `_action_feasible()` — 显存感知 action 选择（替代硬编码 20 GiB 阈值）
+3. `_bucket_priority()` — 显存压力驱动的桶优先级
+4. `lookahead dispatch` — 真正的流水线 overlap
+5. 新增 6 个 CLI 参数控制上述行为
+
+### 下一步
+
+**先在资源受限场景下重新跑三模式对比**，验证显存感知调度是否打开了新的优化空间。
+
+---
+
+
+
 ## 1. 工作范围
 
 本文档用于总结 `async_rag_pipeline_v0` 到当前为止的代码与实验进展。

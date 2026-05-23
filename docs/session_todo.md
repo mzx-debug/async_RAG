@@ -1,71 +1,91 @@
 # 待办事项
 
-最后更新：2026-05-12
+最后更新：2026-05-23
 
 ---
 
 ## 立即
 
-- [ ] 重跑三模式对比（大库），验证所有改动的综合效果
-  - 包含：action 空间开放、动态 batch_size、切片嵌入仅限 bucket、per-batch action 记录
-  - 预期：async_bucket wall_time < 38s，per_batch 中可见 xE/xR/r 字段
+- [ ] 在资源受限场景下运行三模式对比（`gpu_memory_utilization=0.3`），验证显存感知调度的效果
+  - 包含：显存感知 action 选择、显存感知桶优先级、lookahead dispatch
+  - 预期：`async_bucket` 在低显存场景下比 `plain_b64` 表现更好
 
 ---
 
 ## 短期（1 周内）
 
-- [ ] 长 query 切分效果验证
-  - 用 `data/queries_long.jsonl`（100 条，128-226 token）
-  - 对比 async_bucket（有切片）vs serial（无切片）的检索质量
-  - 确认切片嵌入不引入 OOM 或性能退化
+### 资源受限实验
 
-- [ ] 在线延迟跟踪替代静态评分
-  - 用 EMA 跟踪每个 (bucket, action) 组合的实际 per_query_latency
-  - 冷启动用现有静态公式作为 prior
-  - 解决 comparison 实验中 nprobe=32 时错误选择 xE0_xR1 的问题
+- [ ] ResourceTracker 行为验证
+  - 观察 `resource_tracker.vllm_reserved_gb` 是否合理（应为 gpu_total * gpu_memory_utilization）
+  - 观察 `_detect_gpu_free_memory_gb()` 在 pipeline 运行期间的变化
 
-- [ ] nprobe 对比实验
-  - nprobe = 32 / 128 / 512，serial 模式，大库
-  - 目标：找到 retrieval 占比随 nprobe 的变化曲线
+- [ ] 显存感知 action 选择验证
+  - 低显存（<4 GiB）时 `xE=0, xR=0` 是否被优先选择
+  - 中显存（4-10 GiB）时 `xE=1, xR=0` 是否最优
+  - 通过 `dispatch_trace` 确认 action_counts 分布符合预期
 
-- [ ] 动态 batch_size 收敛验证
-  - 用 2000+ 条 query 跑 async_bucket
-  - 观察 _batch_state 的 size 变化轨迹
-  - 确认 3-5 个 batch 后收敛
+- [ ] 显存压力感知的桶优先级验证
+  - 高显存压力：long 查询是否被优先调度
+  - 低显存压力：short 查询是否保持高优先级
+  - 通过 `dispatch_trace` 中的 bucket 分布确认
 
-- [ ] FAISS 线程数扫描（边缘设备）
-  - 在大库场景固定其他参数，测试 `--faiss-omp-threads = 1 / 2 / 4 / 8`
-  - 记录 wall_time、QPS、CPU 占用
-  - 目标：确定"边缘设备默认推荐线程数"
+- [ ] Lookahead dispatch 效果验证
+  - `--enable-lookahead-dispatch` 开关对比：启用 vs 禁用
+  - 观察 `max_q_er` 是否在有 lookahead 时更高（pipeline 填得更满）
+  - 对比 wall_time 差异
+
+- [ ] 联合决策效果验证
+  - `plain_b64` vs `async_bucket + 显存感知` 在低显存场景下的 QPS 差距
+  - 确认显存感知版本在资源受限时不再输 `plain_b64`
+
+### 参数调优
+
+- [ ] 调整 `--gpu-mem-low-threshold-gb` 和 `--gpu-mem-medium-threshold-gb`
+  - 根据实际 GPU 规格（总显存）重新设定阈值
+  - 建议：总显存 24 GiB → high<6, medium<12；总显存 40 GiB → high<8, medium<16
+
+- [ ] 调整 `--gpu-mem-high-batch-penalty`
+  - 50.0 分可能过重，导致即使在中等显存压力下也无法使用 xR=1
+  - 建议先用 `--gpu-mem-high-batch-penalty 30.0` 跑一次看效果
 
 ---
 
 ## 中期（2-4 周）
 
-- [ ] 绘制 retrieval 占比 vs async 加速比曲线
-  - X 轴：retrieval 占比（通过 nprobe 控制）
-  - Y 轴：async_plain 和 async_bucket 相对 serial 的加速比
-  - 目标：量化 async 流水线的适用边界
+- [ ] nprobe 对比实验（资源受限场景）
+  - nprobe=32/128/512，显存受限下 async 收益曲线
+  - 目标：找到 retrieval 占比对显存受限下调度收益的影响
 
-- [ ] 探索 generation batch 动态调整
-  - 当前：batch size 以 query 数为单位
-  - 目标：以 token 数为单位打包 batch，让每个 generation batch 的 token 总量接近 vLLM 最优吞吐点
+- [ ] vLLM gpu_memory_utilization 梯度实验
+  - gpu_util=0.3/0.4/0.5/0.8 下对比 async_bucket vs plain_b64
+  - 目标：找到显存利用率阈值，超过后显存感知调度收益归零
 
-- [ ] 生成更长的问题集（>256 token）
-  - 当前 queries_long.jsonl 最长只有 226 token
-  - 需要生成 300-500 token 的问题集，充分测试多 chunk 切分
+- [ ] CPU embed 在显存受限场景的效果
+  - `--xE 0 --xR 0` 在低显存场景下是否反而比 `--xE 1 --xR 0` 更快（避免 GPU embedding 争抢显存）
+
+- [ ] FAISS index 分片策略
+  - 当 FAISS index 无法全驻留 GPU 时，部分驻留策略
+  - 目标：在显存受限场景下找到 retrieval 性能与显存占用的最优平衡
+
+- [ ] 动态显存感知 batch shaping
+  - 根据实时显存状态，在运行时调整 batch size 上限
+  - 替代当前的静态 `_bucket_batch_size` 逻辑
 
 ---
 
 ## 长期（研究方向）
 
-- [ ] 量化 async 流水线的适用边界
-  - 结论形式："当 retrieval 占比 > X% 时，async 才有 Y% 的收益"
-  - 对应论文场景（TELERAG 1.53×，PipeRAG 2.6×）的条件
+- [ ] 资源受限场景下的最优调度策略形式化
+  - 目标：找到"在 GPU 显存约束下，最大化 generation throughput"的理论最优解
+  - 与资源充裕场景的策略对比，形成完整的调度策略图谱
 
 - [ ] 写论文/报告
-  - 主题：async RAG pipeline 的适用边界与优化策略
-  - 核心贡献：量化 retrieval 占比对 async 收益的影响 + 动态调度策略
+  - 主题：资源受限场景下的异步 RAG 流水线调度
+  - 核心贡献：
+    1. 显存感知调度的必要性证明（vs 充裕场景对比）
+    2. lookahead dispatch 的理论分析
+    3. 显存压力驱动的桶优先级策略
 
 ---
 
@@ -93,4 +113,10 @@
 - [x] run_comparison.py 透传子进程输出
 - [x] 实现动态 batch_size（hill-climbing 延迟反馈）
 - [x] 开放 action 空间（运行时过滤替代 CLI 限制）
-- [x] Per-Batch Action 记录（BatchStats 新增 xE/xR/r 字段）
+- [x] Per-Batch Action 记录（BatchStats 新增 xE/xR 字段）
+- [x] 实现 ResourceTracker 类（GPU 显存实时监控 + 各阶段预估）
+- [x] 改造 `_action_feasible()`（显存感知 action 过滤与打分）
+- [x] 改造 `_bucket_priority()`（显存压力驱动的桶优先级）
+- [x] 实现 lookahead dispatch（显存压力感知的提前 dispatch）
+- [x] 新增显存感知 CLI 参数（memory-aware、lookahead、thresholds）
+- [x] 整合 ResourceTracker 到 StandaloneRAGPipeline

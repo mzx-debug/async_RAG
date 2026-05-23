@@ -662,9 +662,172 @@ class BatchShapingTraceEntry:
     shaping_applied: bool
 
 
+@dataclass
+@dataclass
+class ResourceTrackerSnapshot:
+    gpu_free_mem_gb: float
+    gpu_total_mem_gb: float
+    pressure_level: str
+    estimated_vllm_kv_gb: float
+    estimated_faiss_index_gb: float
+    estimated_embed_activations_gb: float
+    available_for_new_batch_gb: float
+
+
+class ResourceTracker:
+    """
+    Tracks GPU memory state in real time and estimates per-stage memory costs.
+
+    In resource-constrained scenarios, the scheduler makes better decisions when it
+    knows how much GPU memory is actually available for the current batch, rather
+    than relying on a static threshold.
+    """
+
+    # e5-large-v2 embedding activations: ~(bytes_per_token * layers * hidden/2) for fp16
+    # Rough model: ~0.4 GiB for model weights + ~0.001 GiB per query in activations
+    EMBED_MODEL_WEIGHTS_GB = 0.4
+    EMBED_ACTIVATIONS_PER_QUERY_GB = 0.0002  # 0.2 MiB per query (fp16)
+
+    # FAISS index GPU memory: loaded on-demand, typically 1-4 GiB for small corpuses
+    FAISS_INDEX_DEFAULT_GB = 2.0
+
+    # vLLM KV cache: roughly proportional to gpu_memory_utilization and max_model_len
+    # The actual reserved amount is set by vLLM at init time.
+    VLLM_RESERVED_FRACTION = 0.5  # default vLLM gpu_memory_utilization baseline
+
+    def __init__(
+        self,
+        gpu_id: int,
+        vllm_gpu_memory_utilization: float,
+        faiss_index_gb: float = FAISS_INDEX_DEFAULT_GB,
+        embed_model_weights_gb: float = EMBED_MODEL_WEIGHTS_GB,
+    ) -> None:
+        self.gpu_id = gpu_id
+        self.vllm_reserved_gb = 0.0  # set after vLLM loads
+        self.vllm_utilization = vllm_gpu_memory_utilization
+        self.faiss_index_gb = faiss_index_gb
+        self.embed_model_weights_gb = embed_model_weights_gb
+
+        self._vllm_init_done = False
+        self._snapshot_count = 0
+
+    def set_vllm_init_complete(self, gpu_total_gb: float) -> None:
+        """Call after vLLM is loaded; records how much GPU RAM vLLM reserved."""
+        self.vllm_reserved_gb = gpu_total_gb * self.vllm_utilization
+        self._vllm_init_done = True
+
+    def get_current_free_mem_gb(self) -> float:
+        """Returns real-time free GPU memory in GiB."""
+        if not torch.cuda.is_available():
+            return 0.0
+        try:
+            free, _total = torch.cuda.mem_get_info(self.gpu_id)
+            return float(free) / (1024 ** 3)
+        except Exception:
+            return 0.0
+
+    def get_current_total_mem_gb(self) -> float:
+        """Returns total GPU memory in GiB."""
+        if not torch.cuda.is_available():
+            return 0.0
+        try:
+            props = torch.cuda.get_device_properties(self.gpu_id)
+            return float(props.total_memory) / (1024 ** 3)
+        except Exception:
+            return 0.0
+
+    def estimate_embed_activations_gb(self, batch_size: int, x_e: int) -> float:
+        """Estimated GPU memory consumed by embedding activations for this batch."""
+        if x_e == 0:
+            return 0.0  # CPU embed, no GPU activations
+        return batch_size * self.EMBED_ACTIVATIONS_PER_QUERY_GB
+
+    def estimate_retrieval_cost_gb(self, batch_size: int, x_r: int) -> float:
+        """Estimated GPU memory consumed by FAISS GPU retrieval for this batch."""
+        if x_r == 0:
+            return 0.0  # CPU retrieval, FAISS stays on CPU
+        # FAISS GPU index: stays resident while xR=1, shared with vLLM
+        return 0.0  # index memory is tracked separately as self.faiss_index_gb
+
+    def estimate_generation_cost_gb(self, batch_size: int, avg_input_tokens: int, max_output_tokens: int) -> float:
+        """Rough estimate of additional GPU memory needed for generation of this batch.
+
+        The dominant cost is in vLLM's KV cache, which scales with:
+        - batch_size
+        - total tokens (input + output)
+        - hidden_dim
+        For Llama-3.1-8B at fp16: ~0.00004 GiB per token per layer.
+        """
+        if not self._vllm_init_done:
+            return 0.0
+        layers = 32  # Llama-3.1-8B
+        hidden = 4096
+        bytes_per_param = 2.0  # fp16
+        tokens_per_sample = avg_input_tokens + max_output_tokens
+        # KV cache: 2 * layers * hidden * tokens_per_sample * bytes_per_param
+        kv_per_sample = 2 * layers * hidden * bytes_per_param
+        return batch_size * tokens_per_sample * kv_per_sample / (1024 ** 3)
+
+    def pressure_level(self, gpu_free_mem_gb: float) -> str:
+        """Classifies current memory pressure into three tiers."""
+        if gpu_free_mem_gb < 4.0:
+            return "high"
+        if gpu_free_mem_gb < 10.0:
+            return "medium"
+        return "low"
+
+    def get_snapshot(self, batch_size: int = 0, x_e: int = 0, x_r: int = 0) -> ResourceTrackerSnapshot:
+        """Returns a complete snapshot of memory state, optionally for a pending batch."""
+        free = self.get_current_free_mem_gb()
+        total = self.get_current_total_mem_gb()
+        embed_act_gb = self.estimate_embed_activations_gb(batch_size, x_e)
+        available = free - embed_act_gb
+        if x_r == 1:
+            available -= self.faiss_index_gb
+
+        return ResourceTrackerSnapshot(
+            gpu_free_mem_gb=free,
+            gpu_total_mem_gb=total,
+            pressure_level=self.pressure_level(free),
+            estimated_vllm_kv_gb=self.vllm_reserved_gb,
+            estimated_faiss_index_gb=(self.faiss_index_gb if x_r == 1 else 0.0),
+            estimated_embed_activations_gb=embed_act_gb,
+            available_for_new_batch_gb=max(0.0, available),
+        )
+
+    def max_batch_size_for_action(
+        self,
+        x_e: int,
+        x_r: int,
+        max_theoretical: int = 128,
+    ) -> int:
+        """Estimates the maximum batch size that fits in GPU memory for a given action.
+
+        This is a conservative estimate used to bound the scheduler's batch size search.
+        """
+        if not torch.cuda.is_available():
+            return 1
+
+        free = self.get_current_free_mem_gb()
+
+        # Memory budget breakdown
+        reserved = self.vllm_reserved_gb
+        faiss = self.faiss_index_gb if x_r == 1 else 0.0
+        embed_weights = self.embed_model_weights_gb if x_e == 1 else 0.0
+
+        available = free - reserved - faiss - embed_weights
+
+        # Generous per-query overhead (embedding activations + retrieval buffers + generation KV)
+        per_query_gb = self.EMBED_ACTIVATIONS_PER_QUERY_GB + 0.0005
+
+        max_by_mem = int(available / per_query_gb)
+        return max(1, min(max_by_mem, max_theoretical))
+
+
 class GreedyBucketScheduler:
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, resource_tracker: Optional[ResourceTracker] = None) -> None:
         self.args = args
+        self.resource_tracker = resource_tracker
         self.scheduler_mode_choice = getattr(args, "scheduler_mode_choice", "legacy_bucket")
         self.short_threshold = int(args.length_short_threshold)
         self.long_threshold = int(args.length_long_threshold)
@@ -677,6 +840,12 @@ class GreedyBucketScheduler:
         self.retrieve_gpu_batch_threshold = int(args.retrieve_gpu_batch_threshold)
         self.backpressure_high = int(args.backpressure_high)
         self.ema_alpha = float(getattr(args, "scheduler_ema_alpha", 0.25))
+
+        # Memory-aware thresholds (GiB) — these replace the static 20 GiB hard cap on xR=1.
+        self.gpu_mem_low_threshold_gb = float(getattr(args, "gpu_mem_low_threshold_gb", 4.0))
+        self.gpu_mem_medium_threshold_gb = float(getattr(args, "gpu_mem_medium_threshold_gb", 10.0))
+        self.gpu_mem_high_batch_penalty = float(getattr(args, "gpu_mem_high_batch_penalty", 50.0))
+        self.enable_memory_aware_scheduling = getattr(args, "enable_memory_aware_scheduling", True)
 
         # async_bucket 模式下调度器拥有完整 action 空间。
         self.available_actions = [
@@ -818,16 +987,49 @@ class GreedyBucketScheduler:
 
     @staticmethod
     def _bucket_priority(
+        self,
         bucket: str,
         waiting_count: int,
         q_er_len: int,
         q_rg_len: int,
         long_ratio: float,
+        gpu_mem_gb: float = 999.0,
     ) -> float:
+        """
+        Memory-pressure-aware bucket priority.
+
+        When GPU memory is tight, we want to:
+        - Prioritize 'long' queries (biggest memory footprint) first, so they
+          are released early and free up memory for subsequent batches.
+        - Prioritize 'short' queries when memory is abundant, since they pack
+          well into large batches for generation throughput.
+        - 'mid' queries are always a reasonable middle ground.
+        """
         base = {"short": 3.0, "mid": 2.0, "long": 1.0}[bucket]
         pressure = waiting_count * 0.05 + q_er_len * 0.04 + q_rg_len * 0.06
         if bucket == "long":
             pressure += long_ratio
+
+        # Memory pressure bonus: in tight memory, long queries deserve higher priority
+        # because they consume the most memory and should be dispatched early to be
+        # released early (especially important when xE=1/xR=1 is constrained).
+        if self.enable_memory_aware_scheduling and self.resource_tracker is not None:
+            mem_pressure = self.resource_tracker.pressure_level(gpu_mem_gb)
+            if mem_pressure == "high":
+                # Long queries take the most GPU memory per query; dispatch them first
+                # to avoid being stuck in pending queue when memory runs out.
+                if bucket == "long":
+                    base += 3.0
+                elif bucket == "mid":
+                    base += 1.5
+                elif bucket == "short":
+                    base -= 0.5  # de-prioritize: short queries are cheap, can wait
+            elif mem_pressure == "medium":
+                if bucket == "long":
+                    base += 1.0
+                elif bucket == "short":
+                    base -= 0.5
+
         return base + pressure
 
     @staticmethod
@@ -916,6 +1118,53 @@ class GreedyBucketScheduler:
             + self._estimate_generation_cost_for_bucket(bucket, lengths)
             + self._estimate_batch_size_residual(bucket, batch_size)
         )
+
+    def _compute_overlap_potential(
+        self,
+        x_e: int,
+        x_r: int,
+        gpu_mem_gb: float,
+    ) -> float:
+        """
+        Estimates how much pipeline overlap is possible for a given action.
+
+        Returns a score from 0.0 to 1.0:
+        - 1.0 = full overlap possible (CPU embed + GPU retrieve/generate can run in parallel)
+        - 0.0 = no overlap (all stages on GPU, GPU is saturated)
+
+        When xE=0 (CPU embed), the embedding runs on CPU and can fully overlap with
+        GPU-based retrieval and generation. When xE=1 and xR=0, embeddings stay on GPU
+        but compete with retrieval/generation, so overlap is reduced.
+
+        In resource-constrained scenarios, maximizing overlap potential is critical
+        because CPU embed + GPU retrieve is the key strategy to keep GPU utilization high.
+        """
+        if not self.enable_memory_aware_scheduling or self.resource_tracker is None:
+            return 0.5  # neutral default
+
+        pressure = self.resource_tracker.pressure_level(gpu_mem_gb)
+
+        if pressure == "high":
+            # In high memory pressure, xE=0 (CPU embed) is the best choice because it
+            # frees GPU entirely for retrieval + generation. Overlap potential is maximum.
+            if x_e == 0:
+                return 1.0
+            # xE=1 + xR=0: embedding competes with retrieval for GPU — overlap is poor
+            if x_e == 1 and x_r == 0:
+                return 0.2
+            return 0.0
+
+        if pressure == "medium":
+            if x_e == 0:
+                return 0.9
+            if x_e == 1 and x_r == 0:
+                return 0.4
+            return 0.3
+
+        # Low pressure: GPU has headroom, overlap is less critical
+        if x_e == 0:
+            return 0.7
+        return 0.3
 
     def _record_batch_feedback(
         self,
@@ -1032,6 +1281,56 @@ class GreedyBucketScheduler:
         del pending[:take]
         return batch
 
+    def _action_feasible(
+        self,
+        x_e: int,
+        x_r: int,
+        batch_size: int,
+        gpu_available: bool,
+        gpu_mem_gb: float,
+    ) -> Tuple[bool, float]:
+        """
+        Checks if an (xE, xR, batch_size) combination is feasible under current GPU memory.
+
+        Returns (feasible, memory_penalty).
+        The memory_penalty is a rough estimate of the additional cost if this action
+        would push the GPU into a tighter memory regime.
+        """
+        if (x_e == 1 or x_r == 1) and not gpu_available:
+            return False, 0.0
+
+        if not self.enable_memory_aware_scheduling:
+            # Fallback to old static threshold behavior
+            if x_r == 1 and gpu_mem_gb < 20.0:
+                return False, 0.0
+            if x_r == 1 and batch_size < self.retrieve_gpu_batch_threshold:
+                return False, 0.0
+            return True, 0.0
+
+        # --- Memory-aware feasibility check ---
+        if self.resource_tracker is not None:
+            max_feasible = self.resource_tracker.max_batch_size_for_action(x_e, x_r)
+            if batch_size > max_feasible:
+                return False, 0.0
+
+        pressure = self.resource_tracker.pressure_level(gpu_mem_gb) if self.resource_tracker else "low"
+
+        # Memory pressure penalties: the tighter the memory, the more we penalize
+        # actions that consume GPU resources heavily.
+        memory_penalty = 0.0
+        if pressure == "high":
+            if x_r == 1:
+                memory_penalty += self.gpu_mem_high_batch_penalty
+            elif x_e == 1:
+                memory_penalty += self.gpu_mem_high_batch_penalty * 0.5
+        elif pressure == "medium":
+            if x_r == 1 and gpu_mem_gb < self.gpu_mem_medium_threshold_gb:
+                memory_penalty += 10.0
+            if x_e == 1 and gpu_mem_gb < self.gpu_mem_low_threshold_gb:
+                memory_penalty += 5.0
+
+        return True, memory_penalty
+
     def _choose_action_for_batch(
         self,
         bucket: str,
@@ -1051,11 +1350,10 @@ class GreedyBucketScheduler:
             x_e = int(action["xE"])
             x_r = int(action["xR"])
 
-            if (x_e == 1 or x_r == 1) and not gpu_available:
-                continue
-            if x_r == 1 and gpu_mem_gb < 20.0:
-                continue
-            if x_r == 1 and batch_size < self.retrieve_gpu_batch_threshold:
+            feasible, memory_penalty = self._action_feasible(
+                x_e, x_r, batch_size, gpu_available, gpu_mem_gb
+            )
+            if not feasible:
                 continue
 
             score = self._estimate_action_cost(bucket, lengths, batch_size, x_e, x_r)
@@ -1067,6 +1365,7 @@ class GreedyBucketScheduler:
                 score += 20.0
             if l_max >= self.long_threshold and x_e == 1:
                 score -= 0.5
+            score += memory_penalty
             candidates.append((score, {"xE": x_e, "xR": x_r}))
 
         if not candidates:
@@ -1294,11 +1593,8 @@ class GreedyBucketScheduler:
                 for candidate_action in self.available_actions:
                     cx_e = int(candidate_action["xE"])
                     cx_r = int(candidate_action["xR"])
-                    if (cx_e == 1 or cx_r == 1) and not gpu_available:
-                        continue
-                    if cx_r == 1 and gpu_mem_gb < 20.0:
-                        continue
-                    if cx_r == 1 and batch_size < self.retrieve_gpu_batch_threshold:
+                    feasible, _ = self._action_feasible(cx_e, cx_r, batch_size, gpu_available, gpu_mem_gb)
+                    if not feasible:
                         continue
                     candidate_action_rows.append(
                         {
@@ -1326,7 +1622,7 @@ class GreedyBucketScheduler:
                     x_e=int(action["xE"]),
                     x_r=int(action["xR"]),
                 )
-                score = self._bucket_priority(bucket, waiting_batches, q_er_len, q_rg_len, long_ratio)
+                score = self._bucket_priority(bucket, waiting_batches, q_er_len, q_rg_len, long_ratio, gpu_mem_gb)
                 score -= dispatch_ms / 50.0
                 if score > best_score:
                     best_score = score
@@ -1374,7 +1670,23 @@ class StandaloneRAGPipeline:
         self.gpu_id = parse_primary_gpu_id(args.gpu_id)
         self.gpu_available = torch.cuda.is_available()
         self.gpu_mem_total_gb = self._detect_gpu_memory_gb()
-        self.scheduler = GreedyBucketScheduler(args)
+
+        # ResourceTracker monitors GPU memory in real time and estimates per-stage costs.
+        # In resource-constrained scenarios, this is the foundation for memory-aware scheduling.
+        self.resource_tracker = ResourceTracker(
+            gpu_id=self.gpu_id,
+            vllm_gpu_memory_utilization=args.gpu_memory_utilization,
+            faiss_index_gb=float(getattr(args, "faiss_index_gb", 2.0)),
+        )
+
+        final_enable = getattr(args, "enable_memory_aware_scheduling", True)
+        self.scheduler = GreedyBucketScheduler(args, resource_tracker=self.resource_tracker)
+        # propagate the value to the scheduler (avoids getattr at every dispatch call)
+        self.scheduler.enable_memory_aware_scheduling = final_enable
+        self.logger.info(
+            "Memory-aware scheduling: %s",
+            "ENABLED" if final_enable else "DISABLED",
+        )
 
         self.embedding_backend = self._map_binary_backend(args.xE, "xE")
         self.retrieval_backend = self._map_binary_backend(args.xR, "xR")
@@ -1414,6 +1726,10 @@ class StandaloneRAGPipeline:
             enforce_eager=args.vllm_enforce_eager,
             max_model_len=args.max_model_len,
         )
+        # After vLLM is loaded, record how much GPU memory it consumed.
+        self.resource_tracker.set_vllm_init_complete(self.gpu_mem_total_gb)
+        self.logger.info("vLLM GPU memory reserved: %.1f GiB (utilization=%.2f)",
+                         self.resource_tracker.vllm_reserved_gb, args.gpu_memory_utilization)
         self.queries = load_queries(args)
         token_prep_start = time.perf_counter()
         self.query_token_lengths = self._compute_query_token_lengths(self.queries)
@@ -1874,6 +2190,37 @@ class StandaloneRAGPipeline:
                     with stats_lock:
                         q_rg_size += 1
                         q_rg_max_seen = max(q_rg_max_seen, q_rg_size)
+
+                    # ── Event-driven dispatch ─────────────────────────────────────
+                    # Embedding 结束的那一刻，立刻根据当前实时状态决定下一个 batch。
+                    # 只要 embed 始终有下一个可跑，retrieval 和 generation 自然饱和。
+                    # 不再需要主线程 lookahead。
+                    if self.scheduler.has_pending():
+                        dispatch_start = time.perf_counter()
+                        with stats_lock:
+                            q_er_now = q_er_size
+                            q_rg_now = q_rg_size
+                        gpu_mem_now = self._detect_gpu_free_memory_gb()
+
+                        next_dispatch = self.scheduler.next_dispatch(
+                            gpu_available=self.gpu_available,
+                            gpu_mem_gb=gpu_mem_now,
+                            q_er_len=q_er_now,
+                            q_rg_len=q_rg_now,
+                            long_ratio=bucket_long_ratio,
+                        )
+                        scheduler_dispatch_sec_total += time.perf_counter() - dispatch_start
+
+                        if next_dispatch is not None:
+                            with stats_lock:
+                                action_key = (
+                                    f"xE{int(next_dispatch.action.get('xE', 0))}_"
+                                    f"xR{int(next_dispatch.action.get('xR', 0))}"
+                                )
+                                action_counts[action_key] = action_counts.get(action_key, 0) + 1
+                                q_er_size += 1
+                                q_er_max_seen = max(q_er_max_seen, q_er_size)
+                            q_er.put(next_dispatch)
             except Exception as exc:  # pragma: no cover - runtime guard
                 error_queue.put(exc)
                 q_rg.put(None)
@@ -2025,46 +2372,34 @@ class StandaloneRAGPipeline:
         t_retrieval.start()
         t_generation.start()
 
-        if use_bucket_dispatch:
-            while self.scheduler.has_pending():
-                with stats_lock:
-                    q_er_now = q_er_size
-                    q_rg_now = q_rg_size
-                dispatch_start = time.perf_counter()
-                dispatch = self.scheduler.next_dispatch(
-                    gpu_available=self.gpu_available,
-                    gpu_mem_gb=self._detect_gpu_free_memory_gb(),
-                    q_er_len=q_er_now,
-                    q_rg_len=q_rg_now,
-                    long_ratio=bucket_long_ratio,
+        # Prime: dispatch the very first batch to kick off embed_worker.
+        # From then on, embed_worker self-dispatches at the end of each batch
+        # (event-driven: embedding-done → decide next → push to q_er).
+        if self.scheduler.has_pending():
+            first_dispatch = self.scheduler.next_dispatch(
+                gpu_available=self.gpu_available,
+                gpu_mem_gb=self._detect_gpu_free_memory_gb(),
+                q_er_len=0,
+                q_rg_len=0,
+                long_ratio=bucket_long_ratio,
+            )
+            if first_dispatch is not None:
+                action_key = (
+                    f"xE{int(first_dispatch.action.get('xE', 0))}_"
+                    f"xR{int(first_dispatch.action.get('xR', 0))}"
                 )
-                scheduler_dispatch_sec_total += time.perf_counter() - dispatch_start
-                if dispatch is None:
-                    break
-                microbatch = dispatch
-                action = microbatch.action
-                x_e = int(action.get("xE", self.args.xE))
-                x_r = int(action.get("xR", self.args.xR))
-                action_key = f"xE{x_e}_xR{x_r}"
                 action_counts[action_key] = action_counts.get(action_key, 0) + 1
-                q_er.put(microbatch)
-                with stats_lock:
-                    q_er_size += 1
-                    q_er_max_seen = max(q_er_max_seen, q_er_size)
-        else:
-            for microbatch in scheduled_batches:
-                action = microbatch.action
-                x_e = int(action.get("xE", self.args.xE))
-                x_r = int(action.get("xR", self.args.xR))
-                action_key = f"xE{x_e}_xR{x_r}"
-                action_counts[action_key] = action_counts.get(action_key, 0) + 1
-                q_er.put(microbatch)
+                q_er.put(first_dispatch)
                 with stats_lock:
                     q_er_size += 1
                     q_er_max_seen = max(q_er_max_seen, q_er_size)
 
+        # Sentinel: no more batches will ever be added to q_er.
+        # embed_worker will still drain whatever it pulled and self-dispatch,
+        # then see this None and propagate it through the pipeline.
         q_er.put(None)
         t_embed.join()
+
         t_retrieval.join()
         t_generation.join()
         pbar.close()
@@ -2174,6 +2509,47 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--embed-long-gpu-threshold", type=int, default=128)
     parser.add_argument("--retrieve-gpu-batch-threshold", type=int, default=64)
+
+    # Memory-aware scheduling parameters (resource-constrained scenarios)
+    parser.add_argument(
+        "--enable-memory-aware-scheduling",
+        action="store_const",
+        const=True,
+        default=True,
+        help="Enable memory-aware action selection and batch shaping (default: True). "
+             "Disable via --disable-memory-aware-scheduling.",
+    )
+    parser.add_argument(
+        "--disable-memory-aware-scheduling",
+        action="store_const",
+        const=False,
+        dest="enable_memory_aware_scheduling",
+        help="Disable memory-aware scheduling.",
+    )
+    parser.add_argument(
+        "--gpu-mem-low-threshold-gb",
+        type=float,
+        default=4.0,
+        help="GPU free memory below this threshold triggers 'high' memory pressure (default: 4.0 GiB).",
+    )
+    parser.add_argument(
+        "--gpu-mem-medium-threshold-gb",
+        type=float,
+        default=10.0,
+        help="GPU free memory below this threshold triggers 'medium' pressure (default: 10.0 GiB).",
+    )
+    parser.add_argument(
+        "--gpu-mem-high-batch-penalty",
+        type=float,
+        default=50.0,
+        help="Score penalty applied to GPU-heavy actions (xR=1) under high memory pressure (default: 50.0).",
+    )
+    parser.add_argument(
+        "--faiss-index-gb",
+        type=float,
+        default=2.0,
+        help="Estimated FAISS index GPU memory footprint for scheduling decisions (default: 2.0 GiB).",
+    )
 
     parser.add_argument("--backpressure-high", type=int, default=8)
     parser.add_argument("--scheduler-ema-alpha", type=float, default=0.25)

@@ -207,3 +207,168 @@ b = 16 / 32 / 64
 - [x] 不再卡死
 - [x] action 正确选择 xE=1, xR=0（xR=1 被显存过滤排除）
 - [x] per_batch 中可见 xE/xR/r 字段
+
+---
+
+## 实验 7：资源受限场景对比（待做）
+
+**日期**：2026-05-23
+**目的**：验证显存感知调度在资源受限场景下的效果
+
+### 核心研究假设
+
+在 GPU 显存充裕时（已有实验），`async_bucket` 无法超过 `plain_b64`，因为 `xE/xR/batch_size` 的选择空间几乎不存在。最优策略就是 `xE=1, xR=0, b=64`。
+
+在**资源受限**时：
+- vLLM 被限制在低 `gpu_memory_utilization`（如 0.3）
+- GPU 可用显存减少，`xR=1` 不再是"直接禁用"，而是一个需要权衡的选择
+- 生成 batch size 受显存约束变小，需要调度器动态调整
+- `xE=0` (CPU embed) 释放 GPU 给 retrieval + generation 的策略开始有价值
+
+### 实验设计
+
+#### 实验 7.1：显存感知 action 选择验证
+
+**目标**：验证显存感知 action 选择在高/中/低显存压力下的行为
+
+```
+参数（高显存压力）：
+  --gpu-memory-utilization 0.3
+  --gpu-mem-low-threshold-gb 4.0
+  --gpu-mem-medium-threshold-gb 10.0
+  --pipeline-mode async_bucket
+  --b 16
+  --xE 1 --xR 0
+
+对比：
+  --disable-memory-aware-scheduling  # 旧版静态阈值
+  vs
+  （默认 --enable-memory-aware-scheduling）  # 新版显存感知
+
+关注指标：
+  - action_counts 分布（xE0_xR0 / xE1_xR0 / xE0_xR1 / xE1_xR1）
+  - wall_time_ms
+  - dispatch_trace 中每个 action 的 predicted_action_cost
+```
+
+#### 实验 7.2：显存压力感知的桶优先级验证
+
+**目标**：验证高显存压力下 long 查询是否被优先调度
+
+```
+命令（高显存压力 + long 查询集）：
+  --pipeline-mode async_bucket
+  --queries-file ./data/queries_long.jsonl
+  --sample-queries 100
+  --gpu-memory-utilization 0.3
+  --gpu-mem-low-threshold-gb 4.0
+
+对比：
+  （默认 --enable-memory-aware-scheduling）  # 新版（显存驱动桶优先级）
+  vs
+  --disable-memory-aware-scheduling  # 旧版（固定 short > mid > long）
+
+关注指标：
+  - dispatch_trace 中各 bucket 的 dispatch 顺序
+  - 显存使用随时间的变化
+```
+
+#### 实验 7.3：Lookahead dispatch 效果验证
+
+**目标**：验证 lookahead dispatch 在显存受限时是否提升 pipeline 利用率
+
+```
+命令：
+  --pipeline-mode async_bucket
+  --b 16
+  --gpu-memory-utilization 0.3
+
+对比：
+  --enable-lookahead-dispatch  # 新版（提前 push 多 batch）
+  vs
+  （无 --enable-lookahead-dispatch）  # 旧版（等 feedback 后再 dispatch）
+
+关注指标：
+  - max_q_er（pipeline 积压深度）
+  - wall_time_ms
+  - q_rg/q_out 队列积压情况
+```
+
+#### 实验 7.4：显存受限场景完整对比
+
+**目标**：在资源受限时比较 `plain_b64` vs `async_bucket`（显存感知）
+
+```
+场景设置（模拟资源受限）：
+  --gpu-memory-utilization 0.3
+  --gpu-mem-low-threshold-gb 4.0
+  --gpu-mem-medium-threshold-gb 10.0
+  --nprobe 128
+
+对比组：
+  1. plain_b64（async_plain, b=64）：显存充裕时的最强基线
+  2. plain_b16（async_plain, b=16）：显存受限下的实际可行 batch size
+  3. async_bucket（显存感知 + 禁用 lookahead）
+  4. async_bucket（显存感知 + 启用 lookahead）
+
+关注指标：
+  - wall_throughput_qps（核心）
+  - avg_generation_ms
+  - action_counts
+  - bucket_counts
+
+预期：
+  - plain_b64 在显存受限时可能 OOM 或被强制降 batch
+  - async_bucket（显存感知）在 b=16 的约束下仍能通过调度优化
+  - 如果 async_bucket 无法超过 plain_b16，则说明调度器的价值只在显存充裕时存在
+```
+
+#### 实验 7.5：vLLM gpu_memory_utilization 梯度实验
+
+**目标**：找到显存利用率阈值，超过该阈值后显存感知调度收益归零
+
+```
+gpu_memory_utilization = 0.3 / 0.4 / 0.5 / 0.6 / 0.8
+其他参数固定：--nprobe 128, --b 16
+
+每个值跑 async_bucket + plain_b64，对比 QPS 差值
+画出 gpu_utilization vs QPS_gain 曲线
+找到交叉点
+```
+
+---
+
+## 实验 8：显存感知消融实验（待做）
+
+### 消融维度
+
+```
+1. plain_b64_baseline               # async_plain, b=64
+2. async_bucket_no_mem             # --disable-memory-aware-scheduling
+3. async_bucket_mem_act           # 显存感知 action + 旧版桶优先级
+4. async_bucket_mem_bucket        # 显存感知 action + 显存感知桶优先级
+5. async_bucket_mem_lookahead     # 显存感知 action + 显存感知桶优先级 + lookahead
+```
+
+### 关键对比
+
+| 对比组 | 控制变量 | 增量效应 |
+|-------|---------|---------|
+| 2 vs 1 | async_bucket 基础效应 | 调度算法本身的收益 |
+| 3 vs 2 | 显存感知 action | action 空间细粒度控制的收益 |
+| 4 vs 3 | 显存感知桶优先级 | 动态 bucket 调度的收益 |
+| 5 vs 4 | lookahead dispatch | pipeline overlap 的收益 |
+
+---
+
+## 实验记录总表
+
+| 实验 | 状态 | 核心发现 |
+|------|------|---------|
+| 小库三模式对比 | 已完成 | async_plain 无收益，async_bucket +36%（来自 batch size） |
+| 大库三模式对比 | 已完成 | async_bucket 2.54x，retrieval 占比 11.3% |
+| 长 Query 实验 | 待做 | 验证切片嵌入的检索质量 |
+| nprobe 对比 | 待做 | 量化 retrieval 占比对 async 收益的影响 |
+| 资源受限对比 | 待做 | 显存感知调度的效果验证 |
+| 显存感知消融 | 待做 | 各组件的增量收益 |
+| gpu_util 梯度 | 待做 | 显存感知收益的临界条件 |

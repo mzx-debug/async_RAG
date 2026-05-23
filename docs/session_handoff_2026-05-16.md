@@ -1,5 +1,37 @@
 # Session Handoff (2026-05-16)
 
+**最新更新：2026-05-23 — 研究方向切换到资源受限场景**
+
+---
+
+## 0. 2026-05-23 重大变更：研究方向切换
+
+### 发生了什么
+
+经代码分析确认，在 GPU 显存充裕的环境下，`async_bucket` 的调度器几乎没有优化空间（最优策略固定为 `xE=1, xR=0, b=64`），导致 `async_bucket` 无法显著超过 `plain_b64`。
+
+### 决策
+
+**暂停** `generation_target_v1` 的验证工作（未完成但不是当前优先目标）。
+
+**切换**研究方向到**资源受限场景**：主动限制 GPU 显存（降低 `gpu_memory_utilization`），使 `xE/xR/batch_size` 的联合决策成为有意义的优化问题。
+
+### 已完成的代码改动
+
+见 `docs/session_code_changes.md` 第 0 节 "2026-05-23 资源受限场景调度重构"。
+
+### 接下来要做什么
+
+见 `docs/session_todo.md` 的"立即"和"短期"部分。核心是：
+
+1. 先跑一次 `--disable-memory-aware-scheduling` 的 baseline
+2. 再跑一次默认（显存感知启用）对比
+3. 验证 `lookahead dispatch` 的效果
+
+---
+
+
+
 ## 1. Current Goal
 
 Current research direction is now:
