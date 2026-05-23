@@ -2456,8 +2456,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nprobe", type=int, default=128, help="Retrieval search depth (default: 128).")
     parser.add_argument("--topk", type=int, default=1, help="Number of retrieved docs per query.")
 
-    parser.add_argument("--embedding-model", type=str, default="intfloat/e5-large-v2")
-    parser.add_argument("--embedding-max-length", type=int, default=512)
+    parser.add_argument("--embedding-model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
+    parser.add_argument("--embedding-max-length", type=int, default=384)
     parser.add_argument("--pooling-method", type=str, default="mean", choices=["mean", "cls", "pooler"])
     parser.add_argument("--embedding-use-fp16", action="store_true")
 

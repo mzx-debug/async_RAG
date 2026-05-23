@@ -66,6 +66,10 @@ def main() -> None:
     parser.add_argument("--embedding-model", type=str,
                         default="sentence-transformers/all-MiniLM-L6-v2",
                         help="Embedding model path or HuggingFace id. Must match the index.")
+    parser.add_argument("--embedding-max-length", type=int, default=384)
+    parser.add_argument("--pooling-method", type=str, default="mean",
+                        choices=["mean", "cls", "pooler"])
+    parser.add_argument("--embedding-use-fp16", action="store_true", default=True)
     parser.add_argument("--queries-file", type=str, default=None,
                         help="Query file (queries.jsonl from generate_queries.py). "
                              "Example: ./data/beir_nfcorpus/queries.jsonl")
@@ -101,6 +105,9 @@ def main() -> None:
         "--gpu-id",             str(args.gpu_id),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--embedding-model",       str(args.embedding_model),
+        "--embedding-max-length",  str(args.embedding_max_length),
+        "--pooling-method",       str(args.pooling_method),
+        "--embedding-use-fp16",
     ]
     if args.queries_file:
         base_args += ["--queries-file", str(args.queries_file)]
