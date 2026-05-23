@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 
 import argparse
 import json
@@ -55,20 +55,26 @@ def make_table(rows: List[Dict[str, Any]]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run serial/async_plain/async_bucket comparison.")
+    parser = argparse.ArgumentParser(description="Run serial/async_plain/async_bucket comparison (V1: resource-constrained defaults).")
     parser.add_argument("--workdir", type=str, default=".", help="Directory containing async_rag_pipeline.py")
-    parser.add_argument("--index-path", type=str, required=True)
-    parser.add_argument("--corpus-path", type=str, required=True)
-    parser.add_argument("--generator-model", type=str, required=True)
-    parser.add_argument("--queries-file", type=str, default=None)
+    parser.add_argument("--index-path", type=str,
+                        default="./indexes/flat/faiss.index")
+    parser.add_argument("--corpus-path", type=str,
+                        default="./data/corpus_small.jsonl")
+    parser.add_argument("--generator-model", type=str,
+                        default="Qwen/Qwen2.5-3B-Instruct")
+    parser.add_argument("--queries-file", type=str, default=None,
+                        help="Query file (queries.jsonl from generate_queries.py). "
+                             "Example: ./data/beir_nfcorpus/queries.jsonl")
     parser.add_argument("--sample-queries", type=int, default=256)
-    parser.add_argument("--b", type=int, default=64)
+    parser.add_argument("--b", type=int, default=32)
     parser.add_argument("--xE", type=int, default=1)
     parser.add_argument("--xR", type=int, default=0)
-    parser.add_argument("--nprobe", type=int, default=128)
+    parser.add_argument("--nprobe", type=int, default=1)
     parser.add_argument("--topk", type=int, default=1)
     parser.add_argument("--gpu-id", type=str, default="0")
-    parser.add_argument("--output-dir", type=str, default="./comparison_output")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
+    parser.add_argument("--output-dir", type=str, default="./output/comparison")
     args = parser.parse_args()
 
     workdir = Path(args.workdir).expanduser().resolve()
@@ -80,26 +86,17 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     base_args: List[str] = [
-        "--index-path",
-        str(args.index_path),
-        "--corpus-path",
-        str(args.corpus_path),
-        "--generator-model",
-        str(args.generator_model),
-        "--b",
-        str(args.b),
-        "--xE",
-        str(args.xE),
-        "--xR",
-        str(args.xR),
-        "--nprobe",
-        str(args.nprobe),
-        "--topk",
-        str(args.topk),
-        "--sample-queries",
-        str(args.sample_queries),
-        "--gpu-id",
-        str(args.gpu_id),
+        "--index-path",         str(args.index_path),
+        "--corpus-path",        str(args.corpus_path),
+        "--generator-model",    str(args.generator_model),
+        "--b",                  str(args.b),
+        "--xE",                 str(args.xE),
+        "--xR",                 str(args.xR),
+        "--nprobe",             str(args.nprobe),
+        "--topk",               str(args.topk),
+        "--sample-queries",     str(args.sample_queries),
+        "--gpu-id",             str(args.gpu_id),
+        "--gpu-memory-utilization", str(args.gpu_memory_utilization),
     ]
     if args.queries_file:
         base_args += ["--queries-file", str(args.queries_file)]

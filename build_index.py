@@ -1,8 +1,24 @@
 #!/usr/bin/env python3
 """
-FAISS index builder.
+FAISS index builder for resource-constrained V1 experiments.
 
-Encodes a corpus with an embedding model and builds a FAISS index.
+Changes vs V0 build_index.py:
+  - Default embedding model: sentence-transformers/all-MiniLM-L6-v2 (384-dim, ~80MB)
+  - Default FAISS type: Flat  (no IVF clustering needed for ~10K passages)
+  - Default max-length: 384   (matches MiniLM's training context)
+  - No --faiss-gpu flag      (Flat index is tiny, CPU is fine)
+
+Build index:
+    python ./build_index.py \
+      --corpus-path ./data/corpus_small.jsonl \
+      --output-dir ./indexes/flat \
+      --model-path sentence-transformers/all-MiniLM-L6-v2 \
+      --batch-size 256 \
+      --max-length 384 \
+      --pooling-method mean \
+      --use-fp16 \
+      --faiss-type Flat \
+      --device cuda
 """
 
 import argparse
@@ -20,10 +36,11 @@ from transformers import AutoModel, AutoTokenizer
 
 
 def load_corpus(corpus_path: str) -> List[Dict[str, Any]]:
-    """Load corpus from a local JSONL/JSON file or a HuggingFace dataset id."""
+    """Load corpus from a local file (JSONL/JSON/Arrow/Parquet) or a HuggingFace dataset id."""
     path = Path(os.path.expandvars(os.path.expanduser(corpus_path)))
     if path.exists():
-        if path.suffix.lower() == ".jsonl":
+        suffix = path.suffix.lower()
+        if suffix == ".jsonl":
             records = []
             with path.open("r", encoding="utf-8") as f:
                 for line in f:
@@ -31,17 +48,22 @@ def load_corpus(corpus_path: str) -> List[Dict[str, Any]]:
                     if line:
                         records.append(json.loads(line))
             return records
-        if path.suffix.lower() == ".json":
+        if suffix == ".json":
             content = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(content, list):
                 return content
             if isinstance(content, dict) and "data" in content:
                 return content["data"]
             raise ValueError("JSON corpus must be a list or dict with 'data' key.")
+        if suffix in (".arrow", ".parquet"):
+            from datasets import load_from_disk
+            return list(load_from_disk(str(path)))
+        if path.is_dir():
+            from datasets import load_from_disk
+            return list(load_from_disk(str(path)))
 
     # Fallback: treat as HuggingFace dataset id
     from datasets import load_dataset
-
     dataset = load_dataset(corpus_path)
     split = "train" if "train" in dataset else next(iter(dataset.keys()))
     return list(dataset[split])
@@ -121,10 +143,7 @@ def build_faiss_index(embeddings: np.ndarray, faiss_type: str, use_gpu: bool) ->
         index.train(embeddings)
 
     print("Adding vectors to index...")
-    chunk_size = 100000
-    for i in tqdm(range(0, embeddings.shape[0], chunk_size), desc="FAISS add"):
-        j = min(i + chunk_size, embeddings.shape[0])
-        index.add(embeddings[i:j])
+    index.add(embeddings)
 
     if use_gpu:
         index = faiss.index_gpu_to_cpu(index)
@@ -132,18 +151,26 @@ def build_faiss_index(embeddings: np.ndarray, faiss_type: str, use_gpu: bool) ->
     return index
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Build a FAISS index from a corpus.")
-    parser.add_argument("--corpus-path", type=str, required=True, help="Path to corpus file (JSONL/JSON) or HuggingFace dataset id.")
-    parser.add_argument("--output-dir", type=str, required=True, help="Directory to save the index file.")
-    parser.add_argument("--model-path", type=str, default="intfloat/e5-large-v2", help="Embedding model path or HuggingFace id.")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build a FAISS index from a corpus (V1: resource-constrained defaults).")
+    parser.add_argument("--corpus-path", type=str, required=True,
+                        help="Path to corpus file (JSONL/JSON) or HuggingFace dataset id.")
+    parser.add_argument("--output-dir", type=str, required=True,
+                        help="Directory to save the index file.")
+    parser.add_argument("--model-path", type=str,
+                        default="sentence-transformers/all-MiniLM-L6-v2",
+                        help="Embedding model path or HuggingFace id.")
     parser.add_argument("--batch-size", type=int, default=256, help="Encoding batch size.")
-    parser.add_argument("--max-length", type=int, default=512, help="Max token length for encoding.")
-    parser.add_argument("--pooling-method", type=str, default="mean", choices=["mean", "cls"], help="Pooling method.")
+    parser.add_argument("--max-length", type=int, default=384,
+                        help="Max token length for encoding (default: 384, matches MiniLM).")
+    parser.add_argument("--pooling-method", type=str, default="mean",
+                        choices=["mean", "cls"], help="Pooling method.")
     parser.add_argument("--use-fp16", action="store_true", help="Use FP16 for encoding.")
-    parser.add_argument("--faiss-type", type=str, default="Flat", help="FAISS index type (e.g. Flat, IVF4096,Flat).")
+    parser.add_argument("--faiss-type", type=str, default="Flat",
+                        help="FAISS index type (default: Flat; use IVF for larger corpora).")
     parser.add_argument("--faiss-gpu", action="store_true", help="Use GPU for FAISS index building.")
-    parser.add_argument("--device", type=str, default=None, help="Encoding device (cuda/cpu). Auto-detected if omitted.")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Encoding device (cuda/cpu). Auto-detected if omitted.")
     parser.add_argument("--save-embeddings", action="store_true", help="Also save raw embeddings as .npy file.")
     args = parser.parse_args()
 
@@ -174,6 +201,7 @@ def main():
     )
     encode_time = time.perf_counter() - t0
     print(f"Encoding done: {embeddings.shape}, took {encode_time:.1f}s")
+    print(f"  Embedding memory: {embeddings.nbytes / 1024 / 1024:.1f} MB")
 
     # Build index
     t0 = time.perf_counter()
@@ -188,14 +216,17 @@ def main():
     index_path = output_dir / "faiss.index"
     faiss.write_index(index, str(index_path))
     print(f"Index saved to: {index_path}")
+    print(f"  Index file size: {index_path.stat().st_size / 1024 / 1024:.2f} MB")
 
     if args.save_embeddings:
         emb_path = output_dir / "embeddings.npy"
         np.save(str(emb_path), embeddings)
         print(f"Embeddings saved to: {emb_path}")
 
-    # Summary
-    print(f"\nDone. Use --index-path {index_path} with standalone_rag_pipeline.py")
+    print(f"\nDone.")
+    print(f"  Corpus:     {len(corpus)} passages")
+    print(f"  Embedding:  {args.model_path}  dim={embeddings.shape[1]}")
+    print(f"  Index:      {args.faiss_type}  {index.ntotal} vectors")
 
 
 if __name__ == "__main__":

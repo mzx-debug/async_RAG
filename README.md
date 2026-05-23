@@ -1,191 +1,190 @@
-# Async RAG Pipeline V0
+# Async RAG Pipeline V1 — Resource-Constrained Edition
 
-This repository compares three standalone RAG execution modes:
+This is a fork of V0, re-targeted for **resource-constrained devices** (laptops, embedded inference boxes, edge GPUs with 4–16 GB VRAM).
 
-- `serial`: strict `Embedding -> Retrieval -> Generation`
-- `async_plain`: fixed microbatch threaded pipeline
-- `async_bucket`: three-bucket greedy dispatch plus threaded pipeline
+The core research question: when the entire tech stack is downsized to match real constrained hardware, does the async_bucket scheduler still outperform static baselines?
 
-The current implementation is intentionally narrow:
+## What's different from V0
 
-- `nprobe` is fixed by CLI and is not part of scheduling.
-- Query compression is not implemented.
-- `async_bucket` now uses tokenized query lengths cached at load time.
-- `async_bucket` re-selects `xE/xR` online for each outgoing microbatch using stage-specific EMA latency feedback.
-- `async_bucket` also chooses batch size online from a small candidate set instead of using only fixed per-bucket constants.
-- `xE=1, xR=1` keeps embeddings on GPU between embedding and retrieval when possible.
+| Component | V0 (server) | V1 (constrained) |
+|-----------|-------------|-----------------|
+| Generation model | Llama-3.1-8B-Instruct | Qwen2.5-3B-Instruct |
+| Embedding model | e5-large-v2 (1024-dim) | all-MiniLM-L6-v2 (384-dim) |
+| Corpus | 8.8M passages (Arrow) | BEIR benchmarks (3.6K–8.7K real docs) |
+| FAISS index | IVF4096 (~34 GB) | Flat (~1–2 MB) |
+| Vector dimension | 1024 | 384 |
+| Default nprobe | 128 | 1 (Flat index) |
+| Default batch size | 64 | 32 |
+| Default vLLM util | 0.3 (simulated) | 0.6 (real constrained) |
+
+The **scheduling logic itself (`async_rag_pipeline.py`) is unchanged** — only the data, models, and CLI defaults differ.
 
 ## Files
 
-- `async_rag_pipeline.py`: main executable pipeline
-- `run_comparison.py`: runs the three modes and writes comparison artifacts
-- `run_ablation.py`: runs named ablation variants and writes ablation artifacts
-- `run_generation_target_eval.py`: compares `generation_target_v1` directly against the `plain_b64` throughput baseline
-- `build_index.py`: builds embeddings and FAISS indexes
-- `data/`: input corpus and queries
-- `comparison/`, `comparison_large/`: saved experiment outputs
-- `docs/`: run notes and execution docs
+- `async_rag_pipeline.py` — main pipeline (copied verbatim from V0)
+- `corpus_builder.py` — downloads a BEIR dataset (corpus + queries + qrels)
+- `build_index.py` — builds the FAISS index with MiniLM embeddings
+- `generate_queries.py` — post-processes BEIR queries (adds bucket hints + token lengths)
+- `run_comparison.py` — serial vs async_plain vs async_bucket
+- `run_ablation.py` — named ablation variants
+- `run_generation_target_eval.py` — generation_target_v1 vs baseline
+- `data/` — corpus and queries (populate with `corpus_builder.py`)
+- `indexes/` — FAISS indexes (build with `build_index.py`)
+- `docs/` — experiment guide and parameter reference
+
+## BEIR Datasets Available
+
+| Dataset | Docs | Queries | Domain | Index size | Recommended for |
+|---------|------|---------|--------|-----------|---------------|
+| `nfcorpus` | ~3,600 | ~323 | Biomedical (diet/health) | ~0.7 MB | <= 6 GB VRAM |
+| `scifact` | ~5,180 | ~1,109 | Scientific claims | ~1.0 MB | 6–12 GB VRAM |
+| `arguana` | ~8,700 | ~1,409 | Arguments | ~1.7 MB | 12+ GB VRAM |
+| `fiqa` | ~56,000 | ~6,600 | Finance QA | ~11 MB | Larger devices |
+| `scidocs` | ~25,000 | ~1,000 | Scientific papers | ~5 MB | Larger devices |
+
+All datasets have **real queries written by experts**, **real relevance judgments (qrels)**, and **real distractor documents** — unlike randomly sampled corpora which can make retrieval trivially easy.
 
 ## Setup
 
 ```bash
-cd /path/to/async_rag_pipeline_v0
+cd /path/to/async_rag_pipeline_v1
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -U pip
 pip install -r requirements.txt
 ```
 
-If generation uses vLLM, install a vLLM build compatible with your CUDA environment.
+**Additional vLLM installation** (match your CUDA version):
+```bash
+pip install vllm  # or: pip install vllm --index-url https://wheels.mycuda.example.com
+```
 
-## Input formats
-
-Corpus files accept:
-
-- `{"contents": "..."}`
-- `{"title": "...", "text": "..."}`
-- `{"text": "..."}`
-
-Query files accept `.txt`, `.jsonl`, or `.json`. The loader prefers the `question` field and falls back to `query`, `question_text`, or `text`.
-
-## Example: build index
+## Step 1: Download BEIR corpus
 
 ```bash
-python ./build_index.py \
-  --corpus-path ./data/corpus.jsonl \
-  --output-dir ./indexes/ivf4096_flat \
-  --model-path intfloat/e5-large-v2 \
+# Tiny corpus (recommended for <= 6GB GPU)
+python corpus_builder.py --dataset nfcorpus --output ./data/beir_nfcorpus
+
+# Small corpus (6–12GB GPU)
+python corpus_builder.py --dataset scifact --output ./data/beir_scifact
+```
+
+Downloads corpus + queries + qrels from HuggingFace BeIR benchmark. Output: `data/beir_*/corpus.jsonl`, `queries_beir.jsonl`.
+
+## Step 2: Build index
+
+```bash
+python build_index.py \
+  --corpus-path ./data/beir_nfcorpus/corpus.jsonl \
+  --output-dir ./indexes/beir_nfcorpus \
+  --model-path sentence-transformers/all-MiniLM-L6-v2 \
   --batch-size 256 \
-  --max-length 512 \
+  --max-length 384 \
   --pooling-method mean \
   --use-fp16 \
-  --faiss-type IVF4096,Flat \
+  --faiss-type Flat \
   --device cuda
 ```
 
-Output:
+Output: `indexes/beir_nfcorpus/faiss.index` (~0.7 MB)
 
-- `indexes/ivf4096_flat/faiss.index`
+## Step 3: Post-process queries
 
-## Example: run one mode
-
-```bash
-python ./async_rag_pipeline.py \
-  --pipeline-mode async_bucket \
-  --index-path ./indexes/ivf4096_flat/faiss.index \
-  --corpus-path ./data/corpus.jsonl \
-  --generator-model meta-llama/Llama-3.1-8B-Instruct \
-  --queries-file ./data/queries.jsonl \
-  --sample-queries 256 \
-  --b 64 --xE 1 --xR 0 \
-  --nprobe 128 --topk 1 \
-  --output-json ./output/summary_async_bucket.json
-```
-
-## Example: compare all modes
+BEIR queries are real expert queries, but lack bucket hints. This step adds them:
 
 ```bash
-python ./run_comparison.py \
-  --workdir /path/to/async_rag_pipeline_v0 \
-  --index-path /path/to/async_rag_pipeline_v0/indexes/ivf4096_flat/faiss.index \
-  --corpus-path /path/to/async_rag_pipeline_v0/data/corpus.jsonl \
-  --generator-model meta-llama/Llama-3.1-8B-Instruct \
-  --queries-file /path/to/async_rag_pipeline_v0/data/queries.jsonl \
-  --sample-queries 256 \
-  --b 64 --xE 1 --xR 0 \
-  --nprobe 128 --topk 1 \
-  --output-dir /path/to/async_rag_pipeline_v0/output/comparison
+python generate_queries.py \
+  --queries-file ./data/beir_nfcorpus/queries_beir.jsonl \
+  --output ./data/beir_nfcorpus/queries.jsonl \
+  --tokenizer-model sentence-transformers/all-MiniLM-L6-v2 \
+  --auto-threshold
 ```
 
-Outputs:
+`--auto-threshold` computes short/mid/long boundaries from the actual token-length distribution.
 
-- `summary_serial.json`
-- `summary_async_plain.json`
-- `summary_async_bucket.json`
-- `comparison_rows.json`
-- `comparison_table.md`
-
-## Current scheduler parameters
-
-The live scheduler-related CLI surface in `async_rag_pipeline.py` is:
-
-### Basic bucket / batch parameters
-- `--length-short-threshold`
-- `--length-long-threshold`
-- `--bucket-batch-short`
-- `--bucket-batch-mid`
-- `--bucket-batch-long`
-- `--embed-long-gpu-threshold`
-- `--retrieve-gpu-batch-threshold`
-- `--backpressure-high`
-- `--scheduler-ema-alpha`
-
-### Memory-aware scheduling (resource-constrained scenarios)
-- `--enable-memory-aware-scheduling` — enable GPU memory-aware action selection and batch shaping (default: True). Use `--disable-memory-aware-scheduling` to fall back to the old static threshold behavior.
-- `--gpu-mem-low-threshold-gb` — free memory below this triggers "high" pressure (default: 4.0 GiB)
-- `--gpu-mem-medium-threshold-gb` — free memory below this triggers "medium" pressure (default: 10.0 GiB)
-- `--gpu-mem-high-batch-penalty` — score penalty for GPU-heavy actions under high pressure (default: 50.0 ms)
-- `--faiss-index-gb` — estimated FAISS GPU memory footprint for scheduling decisions (default: 2.0 GiB)
-
-### Removed zombie parameters
-
-- `--length-hard-threshold`
-- `--max-processed-length`
-- `--embed-mid-gpu-threshold`
-- `--backpressure-low`
-
-## Ablation
-
-`run_ablation.py` runs a fixed set of named variants that separate:
-
-- plain large-batch gain
-- bucketing gain
-- online batch-size gain
-- online action-selection gain
-- chunking gain
-
-Example:
+## Step 4: Run comparison
 
 ```bash
-python ./run_ablation.py \
-  --workdir /path/to/async_rag_pipeline_v0 \
-  --index-path /path/to/async_rag_pipeline_v0/indexes/ivf4096_flat/faiss.index \
-  --corpus-path /path/to/async_rag_pipeline_v0/data/corpus.jsonl \
-  --generator-model meta-llama/Llama-3.1-8B-Instruct \
-  --queries-file /path/to/async_rag_pipeline_v0/data/queries.jsonl \
+python run_comparison.py \
+  --workdir . \
+  --index-path ./indexes/beir_nfcorpus/faiss.index \
+  --corpus-path ./data/beir_nfcorpus/corpus.jsonl \
+  --generator-model Qwen/Qwen2.5-3B-Instruct \
+  --queries-file ./data/beir_nfcorpus/queries.jsonl \
   --sample-queries 256 \
-  --b 16 --xE 1 --xR 0 \
-  --nprobe 128 --topk 1 \
-  --output-dir /path/to/async_rag_pipeline_v0/ablation_output
+  --b 32 --xE 1 --xR 0 \
+  --nprobe 1 --topk 1 \
+  --gpu-memory-utilization 0.6 \
+  --output-dir ./output/comparison_nfcorpus
 ```
 
-## Generation-target evaluation
-
-If you only want to answer whether `generation_target_v1` can beat the current strongest practical baseline, use:
+## One-shot build + run
 
 ```bash
-python ./run_generation_target_eval.py \
-  --workdir /path/to/async_rag_pipeline_v0 \
-  --index-path /path/to/async_rag_pipeline_v0/indexes/ivf4096_flat/faiss.index \
-  --corpus-path /path/to/async_rag_pipeline_v0/data/corpus.jsonl \
-  --generator-model meta-llama/Llama-3.1-8B-Instruct \
-  --queries-file /path/to/async_rag_pipeline_v0/data/queries.jsonl \
-  --sample-queries 256 \
-  --xE 1 --xR 0 \
-  --nprobe 128 --topk 1 \
-  --output-dir /path/to/async_rag_pipeline_v0/generation_target_eval
+# Linux / macOS
+DATASET=nfcorpus bash build_and_run.sh
+
+# Or with environment variables:
+DATASET=scifact GEN_MODEL=Qwen/Qwen2.5-3B-Instruct GPU_UTIL=0.6 bash build_and_run.sh
 ```
 
-## Reading results
+Or manually:
+```bash
+python corpus_builder.py --dataset nfcorpus --output ./data/beir_nfcorpus
+python build_index.py --corpus-path ./data/beir_nfcorpus/corpus.jsonl \
+  --output-dir ./indexes/beir_nfcorpus \
+  --model-path sentence-transformers/all-MiniLM-L6-v2 \
+  --batch-size 256 --max-length 384 \
+  --pooling-method mean --use-fp16 --faiss-type Flat --device cuda
+python generate_queries.py --queries-file ./data/beir_nfcorpus/queries_beir.jsonl \
+  --output ./data/beir_nfcorpus/queries.jsonl \
+  --tokenizer-model sentence-transformers/all-MiniLM-L6-v2 --auto-threshold
+python run_comparison.py --workdir . \
+  --index-path ./indexes/beir_nfcorpus/faiss.index \
+  --corpus-path ./data/beir_nfcorpus/corpus.jsonl \
+  --generator-model Qwen/Qwen2.5-3B-Instruct \
+  --b 32 --nprobe 1 --gpu-memory-utilization 0.6 \
+  --output-dir ./output/comparison_nfcorpus
+```
 
-Prioritize:
+## Expected bottleneck distribution
 
-- `wall_time_ms`
-- `wall_throughput_qps`
-- `avg_embedding_ms`
-- `avg_retrieval_ms`
-- `avg_generation_ms`
-- `scheduler.bucket_counts`
-- `scheduler.action_counts`
+```
+V0 (server):
+  Embedding:   ~2ms  ( 1.1%)
+  Retrieval:  ~21ms  (11.3%)
+  Generation: ~163ms (87.6%)  ← dominated by generation
 
-Use `wall_*` metrics for cross-mode performance claims. They reflect real elapsed time; `total_ms` is just the sum of stage times.
+V1 (constrained, expected):
+  Embedding:   ~1ms  ( 5-10%)
+  Retrieval:   ~3ms  (15-25%)  ← retrieval占比上升, xR=1开始可行
+  Generation:  ~15ms (65-80%)  ← generation不再是绝对主导
+```
+
+The **key research question** is: does async_bucket's scheduling advantage survive when all three stages are faster and more balanced?
+
+## Key metrics to compare
+
+```python
+wall_throughput_qps   # primary: real throughput
+wall_time_ms          # wall-clock latency
+avg_embedding_ms
+avg_retrieval_ms
+avg_generation_ms
+action_counts          # xE/xR distribution — does scheduler use xR=1 more?
+bucket_counts          # short/mid/long dispatch counts
+```
+
+## Choosing a generation model for your GPU
+
+| GPU VRAM | Recommended model | vLLM util |
+|----------|-----------------|------------|
+| 4–6 GB | Qwen2.5-1.5B-Instruct | 0.7–0.8 |
+| 6–8 GB | Qwen2.5-3B-Instruct | 0.6–0.7 |
+| 8–12 GB | Qwen2.5-3B-Instruct | 0.8–0.9 |
+| 12–16 GB | Qwen2.5-7B-Instruct | 0.5–0.7 |
+
+Override with `--generator-model` on any run script:
+```bash
+GEN_MODEL=Qwen/Qwen2.5-1.5B-Instruct bash build_and_run.sh
+```

@@ -1,332 +1,176 @@
 #!/usr/bin/env python3
 """
-Generate a well-distributed query set from msmarco_2k.jsonl corpus.
+Post-process BEIR queries for the V1 async pipeline.
 
-Strategy:
-- Filter docs to those with clean noun-phrase titles (strict rules)
-- Use the title directly as the topic — no text parsing
-- Generate one question per doc, sampling templates to hit target distribution
-- Target 512 queries: 50% short (≤20 words), 35% mid (21-60), 15% long (61+)
-- Output: data/queries_generated.jsonl
+BEIR queries are real expert-crafted queries. This script:
+  1. Loads queries from a BEIR queries JSONL file (from corpus_builder.py).
+  2. Tokenizes them with the embedding tokenizer.
+  3. Assigns bucket_hint (short/mid/long) based on token length.
+  4. Writes a queries.jsonl in the same format as V0 queries_generated.jsonl.
+
+The short/mid/long thresholds are derived from the actual distribution of the dataset,
+so bucket boundaries reflect the real query-length profile of that domain.
+
+Usage:
+    python generate_queries.py \
+      --queries-file ./data/beir_nfcorpus/queries_beir.jsonl \
+      --output ./data/beir_nfcorpus/queries.jsonl \
+      --tokenizer-model sentence-transformers/all-MiniLM-L6-v2
 """
 
+import argparse
 import json
 import random
-import re
-import sys
-import unicodedata
-from collections import defaultdict
+import statistics
 from pathlib import Path
-from typing import Dict, List, Optional
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
-
-CORPUS_PATH = Path("E:/R1/async_rag_pipeline_v0/data/msmarco_2k.jsonl")
-OUTPUT_PATH = Path("E:/R1/async_rag_pipeline_v0/data/queries_generated.jsonl")
-
-# ── question templates ────────────────────────────────────────────────────────
-
-SHORT_Q = [
-    "What is {t}?",
-    "What does {t} mean?",
-    "Define {t}.",
-    "What is {t} used for?",
-    "What is the main purpose of {t}?",
-    "How does {t} work?",
-    "What causes {t}?",
-    "What are the effects of {t}?",
-    "Who or what is {t}?",
-    "What role does {t} play?",
-    "What is a key characteristic of {t}?",
-    "What is the origin of {t}?",
-    "Where does {t} come from?",
-    "When was {t} first established?",
-    "What distinguishes {t} from similar things?",
-]
-
-MID_Q = [
-    "Explain the significance of {t} and describe its main characteristics, including how it works and why it matters.",
-    "How does {t} function in practice, and what are its most important real-world applications or consequences?",
-    "What are the key components of {t}, how do they interact with each other, and what outcomes do they produce?",
-    "Describe the history and development of {t}, highlighting the major milestones and how understanding has evolved over time.",
-    "What are the main advantages and disadvantages of {t}, and under what conditions does each outweigh the other?",
-    "Compare {t} with closely related concepts, explain the key differences, and clarify when each is most relevant.",
-    "What factors most strongly influence {t}, why does it matter, and how is it typically studied or measured?",
-    "Explain the process involved in {t} step by step, and identify the most critical points where things can go wrong.",
-    "What are the most important things to understand about {t}, and what common mistakes do people make when dealing with it?",
-    "How has understanding of {t} changed over time, what is its current state, and what trends are shaping its future?",
-    "What are the most common misconceptions about {t}, what does the evidence actually show, and why do the myths persist?",
-    "Describe the relationship between {t} and its broader context, explaining how external factors shape and are shaped by it.",
-    "What evidence best supports the importance of {t}, and how do experts evaluate or interpret that evidence today?",
-    "How is {t} measured or evaluated in practice, what metrics are used, and what are the known limitations of those approaches?",
-    "What challenges are most commonly associated with {t}, how have practitioners addressed them, and what remains unresolved?",
-]
-
-LONG_Q = [
-    (
-        "Provide a comprehensive overview of {t}, including its precise definition, "
-        "historical background, key mechanisms or components, practical applications in "
-        "real-world settings, and its current relevance or status. Where applicable, "
-        "discuss any major controversies, open research questions, or competing "
-        "interpretations that experts hold about it, and explain what evidence or "
-        "reasoning supports the mainstream view."
-    ),
-    (
-        "Write a detailed analytical essay on {t}. Begin with a clear definition "
-        "and historical context, then explain how it functions or operates in practice. "
-        "Identify who or what is most affected by it, describe the major debates or "
-        "disagreements in the field, and summarize what leading experts currently "
-        "recommend or believe. Conclude with the most important practical takeaways "
-        "for someone encountering {t} for the first time."
-    ),
-    (
-        "Explain {t} in depth across multiple dimensions: what it is and why it "
-        "matters, how it developed over time, what its main components or stages are, "
-        "what the available evidence says about its effectiveness or impact, and what "
-        "practical implications follow from a thorough understanding of it. Also "
-        "address common misconceptions and clarify what distinguishes {t} from "
-        "closely related concepts."
-    ),
-    (
-        "Give a thorough account of {t}, systematically addressing its definition "
-        "and scope, its causes or origins, its effects or outcomes on individuals and "
-        "broader systems, the methods commonly used to study or manage it, the key "
-        "lessons learned from documented real-world examples, and any unresolved "
-        "challenges that researchers or practitioners still face when dealing with it."
-    ),
-    (
-        "Discuss {t} comprehensively: trace its historical development from early "
-        "origins to the present day, explain the underlying principles or theories "
-        "that govern it, describe how different stakeholders or communities are "
-        "affected, outline the main approaches or strategies that have been taken to "
-        "understand or address it, evaluate their relative effectiveness based on "
-        "available evidence, and identify the most promising directions for future "
-        "work or policy in this area."
-    ),
-]
-
-# ── title filtering ───────────────────────────────────────────────────────────
-
-_QUESTION_START = re.compile(
-    r"^(how|what|where|when|why|who|which|can|does|is|are|do|will|should|was|were"
-    r"|define|list|name|give|find|tell|show|explain|describe|compare|calculate"
-    r"|difference|advantages|disadvantages|benefits|types|examples)\b",
-    re.IGNORECASE,
-)
-_DANGLING_END = frozenset(
-    "the a an of in on at to and or for with by from into about near "
-    "between among through during after before since".split()
-)
-_BAD_CHARS = re.compile(r"[#@\[\]{}<>|\\^~`\xe2]")
-_DIGITS = re.compile(r"\d")
-_GENERIC_TITLES = frozenset(
-    "overview introduction biography anatomy summary conclusion "
-    "background history references notes contents abstract".split()
-)
+from tqdm import tqdm
+from transformers import AutoTokenizer
 
 
-def clean_title(raw: str) -> Optional[str]:
-    """
-    Return a cleaned title string if it passes all quality checks, else None.
-    """
-    t = unicodedata.normalize("NFKC", raw).strip()
-    if not t or t == "-":
-        return None
-
-    # Fix common mojibake (Windows-1252 mis-decoded as Latin-1)
-    t = t.replace("\u00e2\u0080\u0099", "'").replace("\u00e2\u0080\u009c", '"') \
-         .replace("\u00e2\u0080\u009d", '"').replace("\u00e2\u0080\u0093", "-") \
-         .replace("\u00e2\u0080\u0094", "-")
-    # Drop any remaining non-ASCII-printable characters
-    t = re.sub(r"[^\x20-\x7e]", "", t).strip()
-    t = re.sub(r"\s*[\(\[].*", "", t).strip(" :-–?!.,;")
-    if not t:
-        return None
-
-    # Reject question/imperative starts
-    if _QUESTION_START.match(t):
-        return None
-
-    # Reject titles with digits (ZIP codes, IDs, version numbers, etc.)
-    if _DIGITS.search(t):
-        return None
-
-    # Reject titles with special characters
-    if _BAD_CHARS.search(t):
-        return None
-
-    # Reject URLs
-    if "http" in t or "www." in t:
-        return None
-
-    words = t.split()
-
-    # Must be 1–7 words
-    if len(words) < 1 or len(words) > 7:
-        return None
-
-    # Reject single generic words
-    if len(words) == 1 and words[0].lower() in _GENERIC_TITLES:
-        return None
-
-    # Reject if last word is a dangling function word
-    if words[-1].lower() in _DANGLING_END:
-        return None
-
-    # Reject if it looks like a sentence (contains a conjugated verb mid-phrase)
-    _VERB_MID = re.compile(
-        r"\b(is|was|are|were|has|have|had|does|do|did|will|would|can|could"
-        r"|should|may|might|must|shall|need|dare|used to)\b",
-        re.IGNORECASE,
-    )
-    if _VERB_MID.search(" ".join(words[1:])):  # allow first word to be a noun
-        return None
-
-    return t
+# Thresholds: these define short / mid / long in terms of token count.
+# They are matched to the real distribution of each dataset (printed after analysis).
+# For nfcorpus (avg ~60-80 tokens), scifact (~80-120), arguana (~20-40).
+DEFAULT_SHORT_THRESHOLD = 48
+DEFAULT_LONG_THRESHOLD = 96
 
 
-# ── bucket / word count ───────────────────────────────────────────────────────
-
-def word_count(s: str) -> int:
-    return len(s.split())
-
-
-def bucket_of(q: str) -> str:
-    wc = word_count(q)
-    if wc <= 20:
-        return "short"
-    if wc <= 60:
-        return "mid"
-    return "long"
-
-
-# ── main ──────────────────────────────────────────────────────────────────────
-
-def load_corpus(path: Path) -> List[Dict]:
-    docs = []
+def load_queries(path: Path) -> list[dict]:
+    records = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
-                docs.append(json.loads(line))
-    return docs
+                records.append(json.loads(line))
+    return records
 
 
-def generate_queries(
-    docs: List[Dict],
-    target: int = 512,
-    seed: int = 42,
-    short_ratio: float = 0.50,
-    mid_ratio: float = 0.35,
-    long_ratio: float = 0.15,
-) -> List[Dict]:
-    rng = random.Random(seed)
+def compute_thresholds(token_lengths: list[int]) -> tuple[int, int]:
+    """
+    Derive short/long thresholds from the actual distribution.
+    short: below 33rd percentile
+    long:  above 67th percentile
+    mid:   everything else
+    """
+    short_thr = int(statistics.quantiles(token_lengths, n=3)[0])
+    long_thr = int(statistics.quantiles(token_lengths, n=3)[2])
+    return short_thr, long_thr
 
-    n_short = int(target * short_ratio)
-    n_mid   = int(target * mid_ratio)
-    n_long  = target - n_short - n_mid
-    targets = {"short": n_short, "mid": n_mid, "long": n_long}
 
-    # Build candidate list: (clean_title, doc_idx)
-    candidates = []
-    for i, doc in enumerate(docs):
-        title = clean_title(doc.get("title", ""))
-        if title:
-            candidates.append((title, i))
-
-    print(f"  Docs with clean title: {len(candidates)} / {len(docs)}")
-
-    if len(candidates) < target:
-        print(f"  WARNING: only {len(candidates)} clean titles, target={target}. "
-              f"Will repeat pool.")
-
-    # Repeat pool enough times to fill target
-    pool = candidates * max(1, (target * 2 // max(len(candidates), 1)) + 1)
-    rng.shuffle(pool)
-
-    counters: Dict[str, int] = {"short": 0, "mid": 0, "long": 0}
-    queries: List[Dict] = []
-    seen: set = set()
-
-    for title, doc_idx in pool:
-        if all(counters[b] >= targets[b] for b in targets):
-            break
-
-        remaining = {b: max(0, targets[b] - counters[b]) for b in targets}
-        weights = [remaining["short"], remaining["mid"], remaining["long"]]
-        if sum(weights) == 0:
-            break
-
-        chosen = rng.choices(["short", "mid", "long"], weights=weights, k=1)[0]
-
-        if chosen == "short":
-            tmpl = rng.choice(SHORT_Q)
-        elif chosen == "mid":
-            tmpl = rng.choice(MID_Q)
-        else:
-            tmpl = rng.choice(LONG_Q)
-
-        question = tmpl.format(t=title)
-
-        if bucket_of(question) != chosen:
-            continue
-
-        key = question.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-
-        queries.append({
-            "id": f"{chosen}_{counters[chosen]:04d}",
-            "question": question,
-            "bucket_hint": chosen,
-            "source_doc_idx": doc_idx,
-            "topic": title,
-        })
-        counters[chosen] += 1
-
-    # Shuffle and re-assign IDs
-    rng.shuffle(queries)
-    id_counters: Dict[str, int] = {"short": 0, "mid": 0, "long": 0}
-    for q in queries:
-        b = q["bucket_hint"]
-        q["id"] = f"{b}_{id_counters[b]:04d}"
-        id_counters[b] += 1
-
-    return queries
+def assign_bucket(token_len: int, short_thr: int, long_thr: int) -> str:
+    if token_len <= short_thr:
+        return "short"
+    elif token_len >= long_thr:
+        return "long"
+    else:
+        return "mid"
 
 
 def main() -> None:
-    print(f"Loading corpus from {CORPUS_PATH} ...")
-    docs = load_corpus(CORPUS_PATH)
-    print(f"  {len(docs)} documents loaded.")
+    parser = argparse.ArgumentParser(
+        description="Post-process BEIR queries: add token lengths and bucket hints."
+    )
+    parser.add_argument(
+        "--queries-file",
+        type=str,
+        required=True,
+        help="Path to queries_beir.jsonl (from corpus_builder.py).",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        required=True,
+        help="Output path for processed queries (e.g. queries.jsonl).",
+    )
+    parser.add_argument(
+        "--tokenizer-model",
+        type=str,
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        help="Tokenizer for token-length computation.",
+    )
+    parser.add_argument(
+        "--short-threshold",
+        type=int,
+        default=DEFAULT_SHORT_THRESHOLD,
+        help="Token length <= this is 'short'.",
+    )
+    parser.add_argument(
+        "--long-threshold",
+        type=int,
+        default=DEFAULT_LONG_THRESHOLD,
+        help="Token length >= this is 'long'.",
+    )
+    parser.add_argument(
+        "--auto-threshold",
+        action="store_true",
+        help="Auto-compute short/long thresholds from query distribution.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=2026,
+    )
+    args = parser.parse_args()
 
-    queries = generate_queries(docs, target=512)
+    rng = random.Random(args.seed)
 
-    from collections import Counter
-    dist = Counter(q["bucket_hint"] for q in queries)
-    total = len(queries)
-    print(f"\nGenerated {total} queries:")
-    for b in ("short", "mid", "long"):
-        print(f"  {b:5s} : {dist[b]:4d}  ({dist[b]/total*100:.1f}%)")
+    queries_path = Path(args.queries_file).expanduser().resolve()
+    output_path = Path(args.output).expanduser().resolve()
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with OUTPUT_PATH.open("w", encoding="utf-8") as f:
-        for q in queries:
-            f.write(json.dumps(q, ensure_ascii=False) + "\n")
-    print(f"\nSaved to {OUTPUT_PATH}")
+    print(f"Loading queries from {queries_path}...")
+    queries = load_queries(queries_path)
+    print(f"  Loaded {len(queries)} queries")
 
-    # Print 3 samples per bucket
-    by_bucket: Dict[str, List] = defaultdict(list)
+    print(f"Loading tokenizer: {args.tokenizer_model}")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_model, use_fast=True)
+
+    # Step 1: tokenize all queries to get lengths
+    print("Tokenizing queries...")
+    token_lengths = []
+    for q in tqdm(queries, desc="Tokenizing"):
+        text = q.get("question") or q.get("text") or q.get("query") or ""
+        tokens = tokenizer.encode(text, add_special_tokens=True)
+        q["token_length"] = len(tokens)
+        token_lengths.append(len(tokens))
+
+    # Step 2: compute thresholds
+    if args.auto_threshold:
+        short_thr, long_thr = compute_thresholds(token_lengths)
+        print(f"  Auto thresholds: short<={short_thr}, long>={long_thr}")
+    else:
+        short_thr = args.short_threshold
+        long_thr = args.long_threshold
+        print(f"  Fixed thresholds: short<={short_thr}, long>={long_thr}")
+
+    # Step 3: assign buckets and finalise
     for q in queries:
-        by_bucket[q["bucket_hint"]].append(q)
+        q["bucket_hint"] = assign_bucket(q["token_length"], short_thr, long_thr)
 
-    print("\n── Sample queries ──")
-    for b in ("short", "mid", "long"):
-        print(f"\n[{b}]")
-        for q in by_bucket[b][:4]:
-            print(f"  [{q['id']}] {q['question']}")
+    # Shuffle to avoid ordering bias
+    rng.shuffle(queries)
+
+    # Step 4: write output
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        for q in queries:
+            record = {
+                "id": q.get("id", ""),
+                "question": q.get("question") or q.get("text") or q.get("query", ""),
+                "bucket_hint": q["bucket_hint"],
+                "token_length": q["token_length"],
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    # Report distribution
+    lens = token_lengths
+    bucket_counts = {"short": 0, "mid": 0, "long": 0}
+    for q in queries:
+        bucket_counts[q["bucket_hint"]] += 1
+
+    print(f"\nDone. Wrote {len(queries)} queries to {output_path}")
+    print(f"  Token lengths: min={min(lens)}, max={max(lens)}, "
+          f"avg={statistics.mean(lens):.1f}, median={statistics.median(lens):.0f}")
+    print(f"  Buckets: {bucket_counts}")
 
 
 if __name__ == "__main__":
