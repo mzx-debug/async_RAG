@@ -985,7 +985,6 @@ class GreedyBucketScheduler:
         sorted_items = sorted(candidate_items, key=lambda item: item.token_length)
         return sorted_items[:target_batch_size]
 
-    @staticmethod
     def _bucket_priority(
         self,
         bucket: str,
