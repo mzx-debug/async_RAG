@@ -35,7 +35,9 @@ The core idea: embedding, retrieval, and generation are scheduled in a three-sta
 **Python environment must be activated with `source`** (not `conda activate`) to ensure `LD_LIBRARY_PATH` points to the correct CUDA version:
 
 ```bash
-source /home/cloudteam/Software/conda/bin/activate p702
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate pytorch310
+# or: conda activate pytorch310
+# or if using system Python: pip install -r requirements.txt
 ```
 
 > If you use a different conda environment, make sure `LD_LIBRARY_PATH` includes your CUDA `lib64` directory, e.g. `export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH`.
@@ -45,7 +47,8 @@ source /home/cloudteam/Software/conda/bin/activate p702
 ## Setup
 
 ```bash
-cd /home/cloudteam/rag_mzx/async_RAG
+git clone https://github.com/mzx-debug/async_RAG.git
+cd async_RAG
 pip install -U pip
 pip install -r requirements.txt
 ```
@@ -134,7 +137,9 @@ bash build_and_run.sh
 For single-mode runs (debugging or targeted experiments):
 
 ```bash
-source /home/cloudteam/Software/conda/bin/activate p702
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate pytorch310
+# or: conda activate pytorch310
+# or if using system Python: pip install -r requirements.txt
 
 HF_ENDPOINT=https://hf-mirror.com python async_rag_pipeline.py \
   --xE 0 --xR 0 \

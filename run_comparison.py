@@ -16,8 +16,7 @@ def run_one(mode: str, script: Path, base_args: List[str], out_dir: Path, prefix
     import os
     env = os.environ.copy()
     env["HF_ENDPOINT"] = "https://hf-mirror.com"
-    conda_python = "/home/cloudteam/Software/conda/envs/p702/bin/python"
-    proc = subprocess.run([conda_python] + cmd[1:], text=True, env=env)
+    proc = subprocess.run(cmd, text=True, env=env)
     if proc.returncode != 0:
         raise RuntimeError(f"Mode {mode} failed with code {proc.returncode}")
     if not out_path.exists():

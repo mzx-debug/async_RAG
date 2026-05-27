@@ -19,9 +19,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Activate conda environment (must use source activate, not conda activate)
+# Adapt the path to your conda installation
 if [ -n "${CONDA_PREFIX:-}" ] || ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-    if [ -f "/home/cloudteam/Software/conda/bin/activate" ]; then
-        source /home/cloudteam/Software/conda/bin/activate p702
+    if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+        source "$HOME/miniconda3/etc/profile.d/conda.sh" && conda activate pytorch310
+    elif [ -f "$HOME/miniconda/bin/activate" ]; then
+        source "$HOME/miniconda/bin/activate" pytorch310
+    elif [ -f "/usr/local/conda/etc/profile.d/conda.sh" ]; then
+        source /usr/local/conda/etc/profile.d/conda.sh && conda activate pytorch310
     fi
 fi
 
