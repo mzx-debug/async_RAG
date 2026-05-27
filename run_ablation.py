@@ -115,10 +115,10 @@ def main() -> None:
     variants: List[Dict[str, Any]] = [
         {"name": "plain_b16",  "args": ["--pipeline-mode", "async_plain", "--b", "16"]},
         {"name": "plain_b32",  "args": ["--pipeline-mode", "async_plain", "--b", "32"]},
-        {"name": "bucket_fixed_batch_fixed_action", "args": ["--pipeline-mode", "async_bucket", "--ablate-online-batch", "--ablate-online-action"]},
-        {"name": "bucket_online_batch_fixed_action", "args": ["--pipeline-mode", "async_bucket", "--ablate-online-action"]},
-        {"name": "bucket_online_batch_online_action", "args": ["--pipeline-mode", "async_bucket"]},
-        {"name": "bucket_online_batch_online_action_no_chunk", "args": ["--pipeline-mode", "async_bucket", "--ablate-chunking"]},
+        {"name": "v2_fixed_batch_fixed_action", "args": ["--pipeline-mode", "async_v2", "--ablate-online-batch", "--ablate-online-action"]},
+        {"name": "v2_online_batch_fixed_action", "args": ["--pipeline-mode", "async_v2", "--ablate-online-action"]},
+        {"name": "v2_online_batch_online_action", "args": ["--pipeline-mode", "async_v2"]},
+        {"name": "v2_online_batch_online_action_no_chunk", "args": ["--pipeline-mode", "async_v2", "--ablate-chunking"]},
     ]
 
     rows: List[Dict[str, Any]] = []

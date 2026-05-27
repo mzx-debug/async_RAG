@@ -102,20 +102,17 @@ def main() -> None:
             "args": ["--pipeline-mode", "async_plain", "--b", "32"],
         },
         {
-            "name": "generation_target_v1_no_shaping",
+            "name": "v2_baseline",
             "args": [
-                "--pipeline-mode", "async_bucket",
-                "--scheduler-mode-choice", "generation_target_v1",
+                "--pipeline-mode", "async_v2",
                 "--b", "16",
             ],
         },
         {
-            "name": "generation_target_v1_with_shaping",
+            "name": "v2_baseline_b32",
             "args": [
-                "--pipeline-mode", "async_bucket",
-                "--scheduler-mode-choice", "generation_target_v1",
-                "--enable-batch-shaping",
-                "--b", "16",
+                "--pipeline-mode", "async_v2",
+                "--b", "32",
             ],
         },
     ]

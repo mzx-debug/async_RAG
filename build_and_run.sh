@@ -6,7 +6,7 @@
 #
 #   Step 1: Download a BEIR dataset (corpus + queries + qrels)
 #   Step 2: Build FAISS index
-#   Step 3: Post-process queries (bucket hints)
+#   Step 3: Post-process queries
 #   Step 4: Run comparison
 #
 # Prerequisites:
@@ -17,6 +17,13 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# Activate conda environment (must use source activate, not conda activate)
+if [ -n "${CONDA_PREFIX:-}" ] || ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    if [ -f "/home/cloudteam/Software/conda/bin/activate" ]; then
+        source /home/cloudteam/Software/conda/bin/activate p702
+    fi
+fi
 
 echo "=============================================="
 echo "  Async RAG Pipeline V1 — BEIR Corpus Edition"
@@ -33,7 +40,7 @@ QUERIES_OUT="./data/beir_${DATASET}/queries.jsonl"
 INDEX_PATH="./indexes/beir_${DATASET}/faiss.index"
 
 EMBED_MODEL="sentence-transformers/all-MiniLM-L6-v2"
-GEN_MODEL="${GEN_MODEL:-Qwen/Qwen2.5-3B-Instruct}"
+GEN_MODEL="${GEN_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 BATCH="${BATCH:-32}"
 GPU_UTIL="${GPU_UTIL:-0.6}"
 GPU_ID="${GPU_ID:-0}"
@@ -78,11 +85,11 @@ else
 fi
 echo ""
 
-# Step 3: Post-process queries (add bucket hints)
+# Step 3: Post-process queries
 if [ -f "$QUERIES_OUT" ]; then
     echo "[SKIP] Queries already post-processed: $QUERIES_OUT"
 else
-    echo "[3/4] Post-processing queries (bucket hints, token lengths) ..."
+    echo "[3/4] Post-processing queries (token lengths) ..."
     python generate_queries.py \
         --queries-file "$QUERIES_BEIR" \
         --output "$QUERIES_OUT" \
@@ -92,7 +99,7 @@ fi
 echo ""
 
 # Step 4: Run comparison
-echo "[4/4] Running comparison (serial / async_plain / async_bucket) ..."
+echo "[4/4] Running comparison (serial / async_plain / async_v2) ..."
 mkdir -p "./output/comparison_${DATASET}"
 python run_comparison.py \
     --workdir . \

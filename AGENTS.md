@@ -7,7 +7,7 @@ V1 is a **minimal fork of V0** for resource-constrained hardware. The scheduling
 ## What must stay identical to V0
 
 - `async_rag_pipeline.py` — copy verbatim from V0, no modifications
-- Scheduling logic (bucket dispatch, EMA feedback, action selection)
+- Scheduling logic (online dispatch, EMA feedback, action selection)
 - Output JSON schema
 - Argument names and semantics for scheduler-related flags
 

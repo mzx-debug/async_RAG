@@ -13,7 +13,11 @@ def run_one(mode: str, script: Path, base_args: List[str], out_dir: Path, prefix
     out_path = out_dir / out_name
     cmd = [sys.executable, str(script)] + base_args + ["--pipeline-mode", mode, "--output-json", str(out_path)]
     print("Running:", " ".join(cmd))
-    proc = subprocess.run(cmd, text=True)
+    import os
+    env = os.environ.copy()
+    env["HF_ENDPOINT"] = "https://hf-mirror.com"
+    conda_python = "/home/cloudteam/Software/conda/envs/p702/bin/python"
+    proc = subprocess.run([conda_python] + cmd[1:], text=True, env=env)
     if proc.returncode != 0:
         raise RuntimeError(f"Mode {mode} failed with code {proc.returncode}")
     if not out_path.exists():
@@ -58,14 +62,17 @@ def make_table(rows: List[Dict[str, Any]]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run serial/async_plain/async_bucket comparison (V1: resource-constrained defaults).")
+    parser = argparse.ArgumentParser(description="Run serial/async_plain/async_v2 comparison (V1: resource-constrained defaults).")
     parser.add_argument("--workdir", type=str, default=".", help="Directory containing async_rag_pipeline.py")
     parser.add_argument("--index-path", type=str,
-                        default="./indexes/flat/faiss.index")
+                        default="./indexes/beir_nfcorpus/faiss.index",
+                        help="FAISS index path (default: ./indexes/beir_nfcorpus/faiss.index)")
     parser.add_argument("--corpus-path", type=str,
-                        default="./data/corpus_small.jsonl")
+                        default="./data/beir_nfcorpus/corpus.jsonl",
+                        help="Corpus path (default: ./data/beir_nfcorpus/corpus.jsonl)")
     parser.add_argument("--generator-model", type=str,
-                        default="Qwen/Qwen2.5-3B-Instruct")
+                        default="Qwen/Qwen2.5-3B-Instruct",
+                        help="Generator model for vLLM (default: Qwen/Qwen2.5-1.5B-Instruct)")
     parser.add_argument("--embedding-model", type=str,
                         default="sentence-transformers/all-MiniLM-L6-v2",
                         help="Embedding model path or HuggingFace id. Must match the index.")
@@ -80,11 +87,16 @@ def main() -> None:
     parser.add_argument("--b", type=int, default=32)
     parser.add_argument("--xE", type=int, default=1)
     parser.add_argument("--xR", type=int, default=0)
-    parser.add_argument("--nprobe", type=int, default=1)
+    parser.add_argument("--nprobe", type=int, default=1,
+                        help="FAISS nprobe for IVF index, or 1 for Flat index (default: 1)")
     parser.add_argument("--topk", type=int, default=1)
     parser.add_argument("--gpu-id", type=str, default="0")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--output-dir", type=str, default="./output/comparison")
+    parser.add_argument("--ema-params-path", type=str,
+                        default=None,
+                        help="Path to EMA parameters JSON from auto_tune.py. "
+                             "If not set, EMA params are not loaded.")
     args = parser.parse_args()
 
     workdir = Path(args.workdir).expanduser().resolve()
@@ -114,12 +126,14 @@ def main() -> None:
     ]
     if args.queries_file:
         base_args += ["--queries-file", str(args.queries_file)]
+    if args.ema_params_path:
+        base_args += ["--ema-params-path", str(args.ema_params_path)]
 
     # Run with CPU retrieval (xR=0) and GPU retrieval (xR=1).
-    # Each retrieval config runs serial, async_plain, async_bucket.
+    # Each retrieval config runs serial, async_plain, async_v2.
     modes_by_retrieval = {
-        "cpu_retrieval": {"xR": 0, "modes": ["serial", "async_plain", "async_bucket"]},
-        "gpu_retrieval": {"xR": 1, "modes": ["serial", "async_plain", "async_bucket"]},
+        "cpu_retrieval": {"xR": 0, "modes": ["serial", "async_plain", "async_v2"]},
+        "gpu_retrieval": {"xR": 1, "modes": ["serial", "async_plain", "async_v2"]},
     }
 
     rows = []

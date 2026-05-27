@@ -1,11 +1,27 @@
-# V1 resource-constrained dependencies
-# Pin versions for reproducibility; upgrade with `pip install -U -r requirements.txt`
+# Async RAG Pipeline V1 — Resource-Constrained Edition
+# Tested with Python 3.13, PyTorch 2.11, CUDA 12.4, vLLM 0.21
 
+# Core framework
 torch>=2.5.0
 transformers>=4.40.0
 datasets>=3.0.0
 sentence-transformers>=3.0.0
+
+# FAISS: pick ONE variant based on your needs and Python version
+# Python < 3.13: use conda-forge (no build required)
+#   conda install -c conda-forge faiss-gpu   # GPU-accelerated retrieval (xR=1)
+#   conda install -c conda-forge faiss-cpu   # CPU-only retrieval
+# Python >= 3.13: faiss-gpu not yet available on PyPI/conda-forge
+#   pip install faiss-cpu  # CPU-only (xR=1 will not work)
+#   Build from source for GPU support: https://github.com/facebookresearch/faiss
 faiss-cpu
+# faiss-gpu  # uncomment if using Python < 3.13 and want GPU retrieval
+
+# vLLM for fast LLM inference
 vllm>=0.6.0
+
+# Data processing
 numpy>=1.24.0
+
+# Utilities
 tqdm

@@ -61,7 +61,7 @@ python build_index.py \
   --batch-size 256 --max-length 384 \
   --pooling-method mean --use-fp16 --faiss-type Flat --device cuda
 
-# 3. 后处理查询（添加 bucket 标注）
+# 3. 后处理查询（添加 token 长度）
 python generate_queries.py \
   --queries-file ./data/beir_nfcorpus/queries_beir.jsonl \
   --output ./data/beir_nfcorpus/queries.jsonl \
@@ -125,7 +125,7 @@ python ./async_rag_pipeline.py \
 
 ```bash
 python ./async_rag_pipeline.py \
-  --pipeline-mode async_bucket \
+  --pipeline-mode async_v2 \
   --index-path ./indexes/beir_nfcorpus/faiss.index \
   --corpus-path ./data/beir_nfcorpus/corpus.jsonl \
   --queries-file ./data/beir_nfcorpus/queries.jsonl \
@@ -135,7 +135,7 @@ python ./async_rag_pipeline.py \
   --nprobe 1 --topk 1 \
   --gpu-memory-utilization 0.6 \
   --enable-memory-aware-scheduling \
-  --output-json ./output/resource_test/bucket_mem_aware.json
+  --output-json ./output/resource_test/v2_mem_aware.json
 ```
 
 #### 实验组 B: 测试 xR=1 可行性（V1 特有实验）
@@ -143,7 +143,7 @@ python ./async_rag_pipeline.py \
 ```bash
 # xR=1 在 V1 中变得可行，因为 Flat 索引只有 ~1MB
 python ./async_rag_pipeline.py \
-  --pipeline-mode async_bucket \
+  --pipeline-mode async_v2 \
   --index-path ./indexes/beir_nfcorpus/faiss.index \
   --corpus-path ./data/beir_nfcorpus/corpus.jsonl \
   --queries-file ./data/beir_nfcorpus/queries.jsonl \
@@ -153,7 +153,7 @@ python ./async_rag_pipeline.py \
   --nprobe 1 --topk 1 \
   --gpu-memory-utilization 0.6 \
   --enable-memory-aware-scheduling \
-  --output-json ./output/resource_test/bucket_xR1.json
+  --output-json ./output/resource_test/v2_xR1.json
 ```
 
 ### 5.4 消融实验
@@ -161,7 +161,7 @@ python ./async_rag_pipeline.py \
 ```bash
 # 消融 A: 关闭显存感知调度
 python ./async_rag_pipeline.py \
-  --pipeline-mode async_bucket \
+  --pipeline-mode async_v2 \
   --index-path ./indexes/beir_nfcorpus/faiss.index \
   --corpus-path ./data/beir_nfcorpus/corpus.jsonl \
   --queries-file ./data/beir_nfcorpus/queries.jsonl \
@@ -171,11 +171,11 @@ python ./async_rag_pipeline.py \
   --nprobe 1 --topk 1 \
   --gpu-memory-utilization 0.6 \
   --disable-memory-aware-scheduling \
-  --output-json ./output/resource_test/bucket_no_mem_aware.json
+  --output-json ./output/resource_test/v2_no_mem_aware.json
 
 # 消融 B: 固定 batch size
 python ./async_rag_pipeline.py \
-  --pipeline-mode async_bucket \
+  --pipeline-mode async_v2 \
   --index-path ./indexes/beir_nfcorpus/faiss.index \
   --corpus-path ./data/beir_nfcorpus/corpus.jsonl \
   --queries-file ./data/beir_nfcorpus/queries.jsonl \
@@ -186,11 +186,11 @@ python ./async_rag_pipeline.py \
   --gpu-memory-utilization 0.6 \
   --enable-memory-aware-scheduling \
   --ablate-online-batch \
-  --output-json ./output/resource_test/bucket_fixed_batch.json
+  --output-json ./output/resource_test/v2_fixed_batch.json
 
 # 消融 C: 固定 action
 python ./async_rag_pipeline.py \
-  --pipeline-mode async_bucket \
+  --pipeline-mode async_v2 \
   --index-path ./indexes/beir_nfcorpus/faiss.index \
   --corpus-path ./data/beir_nfcorpus/corpus.jsonl \
   --queries-file ./data/beir_nfcorpus/queries.jsonl \
@@ -201,7 +201,7 @@ python ./async_rag_pipeline.py \
   --gpu-memory-utilization 0.6 \
   --enable-memory-aware-scheduling \
   --ablate-online-action \
-  --output-json ./output/resource_test/bucket_fixed_action.json
+  --output-json ./output/resource_test/v2_fixed_action.json
 ```
 
 ## 6. 结果分析
@@ -215,14 +215,13 @@ avg_emb_ms            # embedding 延迟
 avg_ret_ms            # retrieval 延迟
 avg_gen_ms            # generation 延迟
 action_counts          # 各 action 被选中的次数
-bucket_counts          # 各 bucket 被调度的次数
 ```
 
 ### 6.2 预期结论（V1 特有）
 
 | 判断 | 标准 |
 |------|------|
-| **调度器在 V1 中仍然有效** | `async_bucket` 的 QPS > `plain_b32` |
+| **调度器在 V1 中仍然有效** | `async_v2` 的 QPS > `plain_b32` |
 | **xR=1 在 V1 中有价值** | `action_counts` 中出现 `xR=1` 且 wall_time 更短 |
 | **xE=0 策略有价值** | `action_counts` 中出现 `xE0` |
 | **V1 vs V0 差异** | V1 中 retrieval 占比更高，xR=1 更常用 |
@@ -235,14 +234,14 @@ V1 与 V0 最大的不同在于 **xR=1 的可行性**：
 - V0: 34GB 索引，xR=1 几乎不可行
 - V1: ~1MB 索引，xR=1 完全可行，且可能比 xR=0 更快
 
-如果 async_bucket 频繁选择 xR=1 并获得更好的 QPS，这说明在小索引场景下，GPU retrieval 确实有优势——这是 V0 无法验证的。
+如果 async_v2 频繁选择 xR=1 并获得更好的 QPS，这说明在小索引场景下，GPU retrieval 确实有优势——这是 V0 无法验证的。
 
 ## 8. 显存感知参数调优
 
 ```bash
 # 低显存 GPU (如 6GB 总显存)
 python ./async_rag_pipeline.py \
-  --pipeline-mode async_bucket \
+  --pipeline-mode async_v2 \
   --gpu-memory-utilization 0.5 \
   --gpu-mem-low-threshold-gb 1.5 \
   --gpu-mem-medium-threshold-gb 3.0 \
@@ -251,7 +250,7 @@ python ./async_rag_pipeline.py \
 
 # 高显存 GPU (如 12GB 总显存)
 python ./async_rag_pipeline.py \
-  --pipeline-mode async_bucket \
+  --pipeline-mode async_v2 \
   --gpu-memory-utilization 0.7 \
   --gpu-mem-low-threshold-gb 2.5 \
   --gpu-mem-medium-threshold-gb 6.0 \

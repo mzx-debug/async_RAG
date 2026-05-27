@@ -180,6 +180,8 @@ def main() -> None:
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda requested but CUDA is not available.")
 
     # Load corpus
     print("Loading corpus...")

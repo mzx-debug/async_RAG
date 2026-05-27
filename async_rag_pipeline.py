@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+# Must be set BEFORE any torch import to prevent MKL from being loaded.
+# MKL's libmkl_avx2.so has broken symbols on this system. Use GNU/OpenBLAS instead.
+import os as _os
+_os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+_os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+_os.environ.setdefault("OMP_NUM_THREADS", "4")
+_os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 import argparse
 import heapq
 import json
@@ -381,7 +389,14 @@ class RetrievalStage:
             if not torch.cuda.is_available():
                 raise RuntimeError("xR=1 requires CUDA, but CUDA is not available.")
             if not hasattr(self.faiss, "StandardGpuResources"):
-                raise RuntimeError("FAISS GPU APIs unavailable. Install faiss-gpu for xR=1.")
+                raise RuntimeError(
+                    "FAISS GPU APIs unavailable. xR=1 requires 'faiss-gpu' to be installed "
+                    "(faiss-cpu does not include GPU support). On Python < 3.13, install via:\n"
+                    "  conda install -c conda-forge faiss-gpu\n"
+                    "On Python >= 3.13, build from source:\n"
+                    "  git clone https://github.com/facebookresearch/faiss.git && cd faiss && cmake ... && make -j faissgpu\n"
+                    "Or fall back to xR=0 (CPU retrieval)."
+                )
             self.cuda_device_index = gpu_id
             self.gpu_resources = self.faiss.StandardGpuResources()
             self.index = self.faiss.index_cpu_to_gpu(self.gpu_resources, gpu_id, cpu_index)
@@ -391,6 +406,10 @@ class RetrievalStage:
                 self.faiss_torch_interop = True
             except Exception:
                 self.faiss_torch_interop = False
+            # Note: GPU retrieval OOM probing with realistic batch sizes (b>=8) may trigger
+            # CUBLAS SIGABRT at init time (before vLLM loads) due to insufficient workspace
+            # reservation in StandardGpuResources. Real feasibility probing happens in
+            # _warmup() after vLLM is loaded, using a subprocess to catch SIGABRT.
         elif backend == "cpu":
             self.index = cpu_index
         else:
@@ -541,7 +560,6 @@ class GenerationStage:
 class BatchStats:
     batch_index: int
     batch_size: int
-    bucket: str
     embedding_sec: float
     retrieval_sec: float
     generation_sec: float
@@ -552,7 +570,6 @@ class BatchStats:
 
 @dataclass
 class ScheduledMicrobatch:
-    bucket: str
     query_indices: List[int]
     queries: List[str]
     token_lengths: List[int]
@@ -586,7 +603,6 @@ class PendingQuery:
 @dataclass
 class DispatchTraceEntry:
     dispatch_index: int
-    bucket: str
     chosen_batch_size: int
     candidate_batch_sizes: List[int]
     chosen_action: Dict[str, int]
@@ -595,13 +611,12 @@ class DispatchTraceEntry:
     q_rg_len: int
     predicted_action_cost_ms_per_query: float
     predicted_dispatch_cost_ms_per_query: float
-    pending_queries_by_bucket: Dict[str, int]
+    pending_queries_remaining: int
 
 
 @dataclass
 class FeedbackTraceEntry:
     batch_index: int
-    bucket: str
     batch_size: int
     xE: int
     xR: int
@@ -619,7 +634,6 @@ class FeedbackTraceEntry:
 @dataclass
 class ChunkTraceEntry:
     batch_index: int
-    bucket: str
     num_queries: int
     num_chunked_queries: int
     total_chunks: int
@@ -688,8 +702,11 @@ class ResourceTracker:
     EMBED_MODEL_WEIGHTS_GB = 0.4
     EMBED_ACTIVATIONS_PER_QUERY_GB = 0.0002  # 0.2 MiB per query (fp16)
 
-    # FAISS index GPU memory: loaded on-demand, typically 1-4 GiB for small corpuses
-    FAISS_INDEX_DEFAULT_GB = 2.0
+    # FAISS index GPU memory:
+    #   - Index data: ~0.005 GB for nfcorpus (3633 docs x 384 dim x 4 bytes)
+    #   - StandardGpuResources cuBLAS temp pool: ~1.84 GB (pre-allocated, not freed)
+    #   - Total: ~1.85 GB
+    FAISS_INDEX_DEFAULT_GB = 1.85
 
     # vLLM KV cache: roughly proportional to gpu_memory_utilization and max_model_len
     # The actual reserved amount is set by vLLM at init time.
@@ -701,12 +718,16 @@ class ResourceTracker:
         vllm_gpu_memory_utilization: float,
         faiss_index_gb: float = FAISS_INDEX_DEFAULT_GB,
         embed_model_weights_gb: float = EMBED_MODEL_WEIGHTS_GB,
+        model_layers: int = 32,
+        model_hidden: int = 4096,
     ) -> None:
         self.gpu_id = gpu_id
         self.vllm_reserved_gb = 0.0  # set after vLLM loads
         self.vllm_utilization = vllm_gpu_memory_utilization
         self.faiss_index_gb = faiss_index_gb
         self.embed_model_weights_gb = embed_model_weights_gb
+        self._model_layers = model_layers
+        self._model_hidden = model_hidden
 
         self._vllm_init_done = False
         self._snapshot_count = 0
@@ -760,8 +781,8 @@ class ResourceTracker:
         """
         if not self._vllm_init_done:
             return 0.0
-        layers = 32  # Llama-3.1-8B
-        hidden = 4096
+        layers = self._model_layers
+        hidden = self._model_hidden
         bytes_per_param = 2.0  # fp16
         tokens_per_sample = avg_input_tokens + max_output_tokens
         # KV cache: 2 * layers * hidden * tokens_per_sample * bytes_per_param
@@ -799,7 +820,7 @@ class ResourceTracker:
         self,
         x_e: int,
         x_r: int,
-        max_theoretical: int = 128,
+        max_theoretical: int = 256,
     ) -> int:
         """Estimates the maximum batch size that fits in GPU memory for a given action.
 
@@ -810,61 +831,68 @@ class ResourceTracker:
 
         free = self.get_current_free_mem_gb()
 
-        # Memory budget breakdown
-        reserved = self.vllm_reserved_gb
+        # Memory budget: only subtract what's actually needed for this action.
+        # For xE=0,xR=0: generation uses pre-allocated vLLM memory (reserved), no extra per-query cost
+        # For xE=1: need embed model weights + embed activations
+        # For xR=1: need faiss index
+        if x_e == 0 and x_r == 0:
+            # No additional GPU memory needed; generation KV is pre-allocated by vLLM
+            return max_theoretical
+
         faiss = self.faiss_index_gb if x_r == 1 else 0.0
         embed_weights = self.embed_model_weights_gb if x_e == 1 else 0.0
+        embed_activations = self.EMBED_ACTIVATIONS_PER_QUERY_GB if x_e == 1 else 0.0
 
-        available = free - reserved - faiss - embed_weights
+        available = free - self.vllm_reserved_gb - faiss - embed_weights
 
-        # Generous per-query overhead (embedding activations + retrieval buffers + generation KV)
-        per_query_gb = self.EMBED_ACTIVATIONS_PER_QUERY_GB + 0.0005
+        per_query_gb = embed_activations + 0.0005
 
         max_by_mem = int(available / per_query_gb)
         return max(1, min(max_by_mem, max_theoretical))
 
 
-class GreedyBucketScheduler:
+class GreedyScheduler:
     def __init__(self, args: argparse.Namespace, resource_tracker: Optional[ResourceTracker] = None) -> None:
         self.args = args
         self.resource_tracker = resource_tracker
-        self.scheduler_mode_choice = getattr(args, "scheduler_mode_choice", "legacy_bucket")
-        self.short_threshold = int(args.length_short_threshold)
-        self.long_threshold = int(args.length_long_threshold)
-
-        self.batch_short = int(args.bucket_batch_short)
-        self.batch_mid = int(args.bucket_batch_mid)
-        self.batch_long = int(args.bucket_batch_long)
-
-        self.embed_long_gpu_threshold = int(args.embed_long_gpu_threshold)
-        self.retrieve_gpu_batch_threshold = int(args.retrieve_gpu_batch_threshold)
+        self.fixed_action = getattr(args, "fixed_action", False)
+        print(f"[sched init] fixed_action={self.fixed_action} xE={getattr(args,'xE','N/A')} xR={getattr(args,'xR','N/A')}")
         self.backpressure_high = int(args.backpressure_high)
         self.ema_alpha = float(getattr(args, "scheduler_ema_alpha", 0.25))
+        self.initial_batch_size = int(getattr(args, "initial_batch_size", 32))
+        self._max_batch_size_ema: float = float(self.initial_batch_size)
 
-        # Memory-aware thresholds (GiB) — these replace the static 20 GiB hard cap on xR=1.
+        # Memory-aware thresholds (GiB)
         self.gpu_mem_low_threshold_gb = float(getattr(args, "gpu_mem_low_threshold_gb", 4.0))
         self.gpu_mem_medium_threshold_gb = float(getattr(args, "gpu_mem_medium_threshold_gb", 10.0))
         self.gpu_mem_high_batch_penalty = float(getattr(args, "gpu_mem_high_batch_penalty", 50.0))
         self.enable_memory_aware_scheduling = getattr(args, "enable_memory_aware_scheduling", True)
 
-        # async_bucket 模式下调度器拥有完整 action 空间。
         self.available_actions = [
             {"xE": 0, "xR": 0},
             {"xE": 1, "xR": 0},
             {"xE": 0, "xR": 1},
             {"xE": 1, "xR": 1},
         ]
-        self._embedding_latency_ema_ms_per_query: Dict[Tuple[str, int], float] = {}
-        self._retrieval_latency_ema_ms_per_query: Dict[Tuple[str, int], float] = {}
-        self._generation_latency_ema_ms_per_query: Dict[str, float] = {}
-        self._transfer_latency_ema_ms_per_query: Dict[Tuple[str, int, int], float] = {}
-        self._batch_size_residual_ema_ms_per_query: Dict[Tuple[str, int], float] = {}
-        self._bucket_batch_size_ema: Dict[str, float] = {
-            "short": float(self.batch_short),
-            "mid": float(self.batch_mid),
-            "long": float(self.batch_long),
-        }
-        self._pending_by_bucket: Dict[str, List[PendingQuery]] = {"short": [], "mid": [], "long": []}
+        self._feasible_actions_ema: Dict[Tuple[int, int], bool] = {}  # loaded from EMA JSON; absent = treat as feasible
+        self._embedding_latency_ema_ms_per_query: Dict[Tuple[int, int], float] = {}
+        self._retrieval_latency_ema_ms_per_query: Dict[Tuple[int, int], float] = {}
+        self._generation_latency_ema_ms_per_query: float = 0.0
+        self._transfer_latency_ema_ms_per_query: Dict[Tuple[int, int, int], float] = {}
+        self._batch_size_residual_ema_ms_per_query: Dict[int, float] = {}
+
+        # New wall-time model: wall_time = max(gen_time, emb_ret_time)
+        # gen_time[(xE,xR)] = gen_base[(xE,xR)] + gen_per_query[(xE,xR)] * batch_size
+        #   (LLM inference: prefill + decode both scale linearly with batch_size)
+        # emb_ret_time = er_base_overhead + (emb_per_query + ret_per_query) * batch_size
+        self._gen_base_overhead_ema: Dict[Tuple[int, int], float] = {}   # ms (fixed overhead)
+        self._gen_per_query_ema: Dict[Tuple[int, int], float] = {}       # ms per query
+        self._er_base_overhead_ema: float = 0.0       # ms (E+R combined base overhead)
+        self._wall_time_measurements: Dict[Tuple[int, int], List[Tuple[int, float]]] = {}
+        self._overlap_factor_ema: Dict[Tuple[int, int], float] = {}  # 0.0 = full parallel, 1.0 = sequential
+        # Per-action best batch size (EMA-adapted)
+        self._best_batch_size_by_action: Dict[Tuple[int, int], int] = {}
+        # V2: single unified pending pool sorted by token_length (ascending)
         self._pending_queries: List[PendingQuery] = []
         self._query_token_lengths: Dict[int, int] = {}
         self.dispatch_trace: List[DispatchTraceEntry] = []
@@ -873,38 +901,38 @@ class GreedyBucketScheduler:
         self.device_plan_trace: List[DevicePlanTraceEntry] = []
         self.batch_shaping_trace: List[BatchShapingTraceEntry] = []
 
+        # gen_per_query warm-start: from benchmark, gen_time = 1170 + 28.2 × bs (ms)
+        self._gen_base_overhead_ema[(0, 0)] = 1170.0   # ms, fixed overhead (prefill + kernel launch)
+        self._gen_per_query_ema[(0, 0)] = 28.2          # ms/q, marginal generation cost per query
+        self._wall_time_measurements[(0, 0)] = []  # must match: if key not in gen_base → init; else → append
+
     @staticmethod
     def _estimate_query_length(query: str) -> int:
         return max(1, len(query.split()))
 
-    def _bucket_name(self, length: int) -> str:
-        if length <= self.short_threshold:
-            return "short"
-        if length <= self.long_threshold:
-            return "mid"
-        return "long"
+    def _choose_batch_size(
+        self,
+        gpu_mem_gb: float,
+        q_er_len: int,
+        q_rg_len: int,
+    ) -> int:
+        base = self._max_batch_size_ema
 
-    def _bucket_batch_size(self, bucket: str) -> int:
-        return {
-            "short": self.batch_short,
-            "mid": self.batch_mid,
-            "long": self.batch_long,
-        }[bucket]
+        if q_er_len >= self.backpressure_high or q_rg_len >= self.backpressure_high:
+            base = max(4.0, base / 2.0)
 
-    def _candidate_batch_sizes(self, bucket: str, available: int) -> List[int]:
-        if getattr(self.args, "ablate_online_batch", False):
-            return [min(self._bucket_batch_size(bucket), available)]
-        base = self._bucket_batch_size(bucket)
-        ema_size = max(1, int(round(self._bucket_batch_size_ema[bucket])))
-        candidates = {
-            max(1, base // 2),
-            base,
-            min(base * 2, max(base, ema_size)),
-            ema_size,
-            max(1, ema_size // 2),
-        }
-        ordered = sorted({size for size in candidates if size > 0})
-        return [min(size, available) for size in ordered if min(size, available) > 0]
+        if base > 1:
+            base = 2.0 ** round(math.log2(base))
+
+        return max(1, int(base))
+
+    def _pack_batch(self, batch_size: int) -> List[PendingQuery]:
+        if not self._pending_queries:
+            return []
+        take = min(batch_size, len(self._pending_queries))
+        batch = self._pending_queries[:take]
+        self._pending_queries = self._pending_queries[take:]
+        return batch
 
     def _generation_target_bounds(
         self,
@@ -956,7 +984,6 @@ class GreedyBucketScheduler:
         q_rg_len: int,
     ) -> Dict[str, Any]:
         action = self._choose_action_for_batch(
-            bucket=self._bucket_name(max(token_lengths) if token_lengths else 1),
             lengths=token_lengths,
             batch_size=batch_size,
             gpu_available=gpu_available,
@@ -973,75 +1000,15 @@ class GreedyBucketScheduler:
             "keep_gpu_resident_er": keep_gpu_resident_er,
         }
 
-    def _shape_batch(
-        self,
-        candidate_items: List[PendingQuery],
-        target_batch_size: int,
-    ) -> List[PendingQuery]:
-        if not getattr(self.args, "enable_batch_shaping", False):
-            return candidate_items[:target_batch_size]
-        if len(candidate_items) <= target_batch_size:
-            return candidate_items
-        sorted_items = sorted(candidate_items, key=lambda item: item.token_length)
-        return sorted_items[:target_batch_size]
-
-    def _bucket_priority(
-        self,
-        bucket: str,
-        waiting_count: int,
-        q_er_len: int,
-        q_rg_len: int,
-        long_ratio: float,
-        gpu_mem_gb: float = 999.0,
-    ) -> float:
-        """
-        Memory-pressure-aware bucket priority.
-
-        When GPU memory is tight, we want to:
-        - Prioritize 'long' queries (biggest memory footprint) first, so they
-          are released early and free up memory for subsequent batches.
-        - Prioritize 'short' queries when memory is abundant, since they pack
-          well into large batches for generation throughput.
-        - 'mid' queries are always a reasonable middle ground.
-        """
-        base = {"short": 3.0, "mid": 2.0, "long": 1.0}[bucket]
-        pressure = waiting_count * 0.05 + q_er_len * 0.04 + q_rg_len * 0.06
-        if bucket == "long":
-            pressure += long_ratio
-
-        # Memory pressure bonus: in tight memory, long queries deserve higher priority
-        # because they consume the most memory and should be dispatched early to be
-        # released early (especially important when xE=1/xR=1 is constrained).
-        if self.enable_memory_aware_scheduling and self.resource_tracker is not None:
-            mem_pressure = self.resource_tracker.pressure_level(gpu_mem_gb)
-            if mem_pressure == "high":
-                # Long queries take the most GPU memory per query; dispatch them first
-                # to avoid being stuck in pending queue when memory runs out.
-                if bucket == "long":
-                    base += 3.0
-                elif bucket == "mid":
-                    base += 1.5
-                elif bucket == "short":
-                    base -= 0.5  # de-prioritize: short queries are cheap, can wait
-            elif mem_pressure == "medium":
-                if bucket == "long":
-                    base += 1.0
-                elif bucket == "short":
-                    base -= 0.5
-
-        return base + pressure
-
-    @staticmethod
-    def _estimate_embedding_cost(length: int) -> float:
+    def _estimate_embedding_cost(self, length: int) -> float:
         return 0.0074 * (length ** 2) + 0.17 * length
 
-    def _estimate_generation_cost(self, bucket: str, lengths: Sequence[int]) -> float:
+    def _estimate_generation_cost(self, lengths: Sequence[int]) -> float:
         l_max = max(lengths) if lengths else 1
-        base = {"short": 6.0, "mid": 8.5, "long": 12.0}[bucket]
-        return base + 0.03 * l_max
+        return 8.5 + 0.03 * l_max
 
-    def _estimate_transfer_cost_for_action(self, bucket: str, x_e: int, x_r: int) -> float:
-        observed = self._transfer_latency_ema_ms_per_query.get((bucket, x_e, x_r))
+    def _estimate_transfer_cost_for_action(self, x_e: int, x_r: int) -> float:
+        observed = self._transfer_latency_ema_ms_per_query.get((x_e, x_r))
         if observed is not None:
             return observed
         if x_e == 1 and x_r == 0:
@@ -1052,70 +1019,183 @@ class GreedyBucketScheduler:
 
     def _estimate_embedding_cost_for_action(
         self,
-        bucket: str,
         lengths: Sequence[int],
         x_e: int,
     ) -> float:
-        observed = self._embedding_latency_ema_ms_per_query.get((bucket, x_e))
-        if observed is not None:
-            return observed
         l_max = max(lengths) if lengths else 1
         if x_e == 0:
             return self._estimate_embedding_cost(l_max)
+        observed = self._embedding_latency_ema_ms_per_query.get(x_e)
+        if observed is not None:
+            return observed
         return 0.00015 * (l_max ** 2) + 0.008 * l_max + 0.5
 
     def _estimate_retrieval_cost_for_action(
         self,
-        bucket: str,
         batch_size: int,
         x_r: int,
     ) -> float:
-        observed = self._retrieval_latency_ema_ms_per_query.get((bucket, x_r))
+        observed = self._retrieval_latency_ema_ms_per_query.get(x_r)
         if observed is not None:
             return observed
         return (4.5 if x_r == 0 else 1.2) + 8.0 / max(1, batch_size)
 
-    def _estimate_generation_cost_for_bucket(
+    def _estimate_generation_cost_for_batch(
         self,
-        bucket: str,
         lengths: Sequence[int],
     ) -> float:
-        observed = self._generation_latency_ema_ms_per_query.get(bucket)
-        if observed is not None:
-            return observed
-        return self._estimate_generation_cost(bucket, lengths)
+        if self._generation_latency_ema_ms_per_query > 0:
+            return self._generation_latency_ema_ms_per_query
+        return self._estimate_generation_cost(lengths)
 
-    def _estimate_batch_size_residual(self, bucket: str, batch_size: int) -> float:
-        observed = self._batch_size_residual_ema_ms_per_query.get((bucket, batch_size))
+    def _estimate_batch_size_residual(self, batch_size: int) -> float:
+        observed = self._batch_size_residual_ema_ms_per_query.get(batch_size)
         if observed is not None:
             return observed
         return 6.0 / max(1, batch_size)
 
+    def _estimate_wall_time(
+        self,
+        batch_size: int,
+        x_e: int,
+        x_r: int,
+        pending_queries: int = 0,
+    ) -> float:
+        """
+        Wall-time cost model: score = estimated wall time per query in ms.
+
+        Score = wall_single / batch_size = throughput (lower = better QPS).
+        Does NOT depend on pending_queries, so score is stable across dispatches.
+
+        Pipeline model:
+          wall_single = wall time of a single dispatch = combine(gen_time, emb_ret_time)
+          gen_time[(xE,xR)] = gen_base[(xE,xR)] + gen_per_query[(xE,xR)] * batch_size
+            (LLM inference: prefill + decode both scale linearly with batch_size under continuous batching)
+          emb_ret_time = er_base + (emb_per_q[xE] + ret_per_q[xR]) * batch_size
+
+        Pipeline overlap (how gen and E+R combine into wall_single):
+          xE=0: CPU embed runs on CPU while GPU does ret+gen → full parallel → max(gen, er)
+          xE=1: GPU embed competes with gen → partial overlap → gen + er * overlap_factor
+          overlap_factor is EMA-calibrated per (xE, xR).
+        """
+        key = (x_e, x_r)
+        gen_base = self._gen_base_overhead_ema.get(key, 0.0)
+        gen_per_q = self._gen_per_query_ema.get(key, None)
+        er_base = self._er_base_overhead_ema
+
+        emb_per_q = self._embedding_latency_ema_ms_per_query.get(x_e, None)
+        ret_per_q = self._retrieval_latency_ema_ms_per_query.get(x_r, None)
+
+        if gen_base <= 0 or gen_per_q is None or gen_per_q <= 0 or emb_per_q is None or ret_per_q is None:
+            # Bootstrap from any available (xE, xR) key — gen_per_query is roughly
+            # action-agnostic (vLLM overhead), only the base varies.
+            bootstrap_key = next(
+                (k for k in self._gen_per_query_ema if self._gen_per_query_ema[k] > 0), None
+            )
+            if bootstrap_key is not None:
+                gen_base = self._gen_base_overhead_ema.get(bootstrap_key, 1170.0)
+                gen_per_q = self._gen_per_query_ema.get(bootstrap_key, 28.2)
+                emb_per_q = self._embedding_latency_ema_ms_per_query.get(x_e, 2.0)
+                ret_per_q = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.15)
+            else:
+                return self._estimate_dispatch_cost_legacy(batch_size, x_e, x_r)
+
+        # Linear gen_time model: gen = gen_base + gen_per_q × batch_size
+        gen_time = gen_base + gen_per_q * batch_size
+
+        emb_ret_time = er_base + (emb_per_q + ret_per_q) * batch_size
+
+        # Pipeline overlap: EMA-calibrated overlap factor
+        overlap_key = (x_e, x_r)
+        overlap_factor = self._overlap_factor_ema.get(overlap_key, None)
+        if overlap_factor is None:
+            # Default: xE=0 = full parallel, xE=1 = sequential
+            overlap_factor = 0.0 if x_e == 0 else 1.0
+
+        wall_single = gen_time + emb_ret_time * overlap_factor
+
+        # GPU contention penalty: when embedding runs on GPU (xE=1), it competes with
+        # generation for compute resources. This slows gen_time slightly.
+        # Empirical: (1,0) is ~0.98x of (0,0), (0,1) is ~1.03x (GPU ret overhead),
+        # (1,1) is worst (~1.15x) because both E+R and retrieval contend on GPU.
+        contention_multiplier = 1.0
+        if x_e == 1 and x_r == 0:
+            contention_multiplier = 8381.0 / 8391.0  # ~0.999x (GPU embed barely affects gen)
+        elif x_e == 0 and x_r == 1:
+            contention_multiplier = 8645.0 / 8391.0  # ~1.030x (GPU retrieval adds ~3%)
+        elif x_e == 1 and x_r == 1:
+            contention_multiplier = 1.20  # estimated: embed + retrieval contention
+        wall_single *= contention_multiplier
+
+        # If overlap_factor is 0 (full parallel), max(gen, er) is more accurate
+        if overlap_factor == 0.0:
+            wall_single = max(gen_time, emb_ret_time) * contention_multiplier
+
+        # Score = wall time per query = wall_single / batch_size
+        # This is throughput: lower score = higher QPS = better.
+        # Note: does NOT depend on pending_queries, so the score is stable across dispatches.
+        return wall_single / max(1, batch_size)
+
+    def _estimate_dispatch_cost_legacy(
+        self,
+        batch_size: int,
+        x_e: int,
+        x_r: int,
+    ) -> float:
+        """Fallback: legacy per-query cost sum (no pipeline overlap modeling)."""
+        emb = self._embedding_latency_ema_ms_per_query.get(x_e, 1.0)
+        ret = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.1)
+        gen = self._generation_latency_ema_ms_per_query
+        if gen <= 0:
+            gen = 8.5 + 0.03 * 32
+        residual = self._estimate_batch_size_residual(batch_size)
+        return emb + ret + gen + residual
+
     def _estimate_action_cost(
         self,
-        bucket: str,
         lengths: Sequence[int],
         batch_size: int,
         x_e: int,
         x_r: int,
     ) -> float:
-        emb_cost = self._estimate_embedding_cost_for_action(bucket, lengths, x_e)
-        ret_cost = self._estimate_retrieval_cost_for_action(bucket, batch_size, x_r)
-        transfer_cost = self._estimate_transfer_cost_for_action(bucket, x_e, x_r)
-        return emb_cost + ret_cost + transfer_cost
+        """
+        Per-query wall time estimate using the calibrated wall-time model.
+
+        wall_single = max(gen_time, er_time)    for xE=0 (E+R parallel to G on different devices)
+                      gen_time + er_time * overlap_factor  for xE=1 (GPU contention)
+
+        gen_time  = gen_base + gen_per_query * batch_size
+        er_time   = er_base  + (emb_per_q + ret_per_q) * batch_size
+        """
+        key = (x_e, x_r)
+        gen_base = self._gen_base_overhead_ema.get(key, 1170.0)
+        gen_per_q = self._gen_per_query_ema.get(key, 28.2)
+        gen_time = gen_base + gen_per_q * max(1, batch_size)
+
+        emb_lat = self._embedding_latency_ema_ms_per_query.get(x_e, 2.0)
+        ret_lat = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.15)
+        er_base = self._er_base_overhead_ema
+        er_time = er_base + (emb_lat + ret_lat) * max(1, batch_size)
+
+        if x_e == 0:
+            wall_single = max(gen_time, er_time)
+        else:
+            overlap = self._overlap_factor_ema.get(key, 0.5)
+            wall_single = gen_time + er_time * overlap
+
+        return wall_single / max(1, batch_size)
 
     def _estimate_dispatch_cost(
         self,
-        bucket: str,
         lengths: Sequence[int],
         batch_size: int,
         x_e: int,
         x_r: int,
     ) -> float:
         return (
-            self._estimate_action_cost(bucket, lengths, batch_size, x_e, x_r)
-            + self._estimate_generation_cost_for_bucket(bucket, lengths)
-            + self._estimate_batch_size_residual(bucket, batch_size)
+            self._estimate_action_cost(lengths, batch_size, x_e, x_r)
+            + self._estimate_generation_cost_for_batch(lengths)
+            + self._estimate_batch_size_residual(batch_size)
         )
 
     def _compute_overlap_potential(
@@ -1167,22 +1247,16 @@ class GreedyBucketScheduler:
 
     def _record_batch_feedback(
         self,
-        bucket: str,
-        x_e: int,
-        x_r: int,
         batch_size: int,
         token_lengths: Sequence[int],
         embedding_sec: float,
         retrieval_sec: float,
         generation_sec: float,
+        x_e: int,
+        x_r: int,
     ) -> None:
-        predicted_base = (
-            self._estimate_action_cost(bucket, token_lengths, batch_size, x_e, x_r)
-            + self._estimate_generation_cost_for_bucket(bucket, token_lengths)
-        )
-
         embedding_ms_per_query = embedding_sec * 1000.0 / max(1, batch_size)
-        emb_key = (bucket, x_e)
+        emb_key = x_e
         previous_emb = self._embedding_latency_ema_ms_per_query.get(emb_key)
         if previous_emb is None:
             self._embedding_latency_ema_ms_per_query[emb_key] = embedding_ms_per_query
@@ -1192,7 +1266,7 @@ class GreedyBucketScheduler:
             )
 
         retrieval_ms_per_query = retrieval_sec * 1000.0 / max(1, batch_size)
-        ret_key = (bucket, x_r)
+        ret_key = x_r
         previous_ret = self._retrieval_latency_ema_ms_per_query.get(ret_key)
         if previous_ret is None:
             self._retrieval_latency_ema_ms_per_query[ret_key] = retrieval_ms_per_query
@@ -1206,7 +1280,7 @@ class GreedyBucketScheduler:
             transfer_ms_per_query = embedding_ms_per_query * 0.15
         elif x_e == 0 and x_r == 1:
             transfer_ms_per_query = retrieval_ms_per_query * 0.15
-        transfer_key = (bucket, x_e, x_r)
+        transfer_key = (x_e, x_r)
         previous_transfer = self._transfer_latency_ema_ms_per_query.get(transfer_key)
         if previous_transfer is None:
             self._transfer_latency_ema_ms_per_query[transfer_key] = transfer_ms_per_query
@@ -1216,39 +1290,121 @@ class GreedyBucketScheduler:
             )
 
         generation_ms_per_query = generation_sec * 1000.0 / max(1, batch_size)
-        previous_gen = self._generation_latency_ema_ms_per_query.get(bucket)
-        if previous_gen is None:
-            self._generation_latency_ema_ms_per_query[bucket] = generation_ms_per_query
-        else:
-            self._generation_latency_ema_ms_per_query[bucket] = (
-                self.ema_alpha * generation_ms_per_query + (1.0 - self.ema_alpha) * previous_gen
+        if self._generation_latency_ema_ms_per_query > 0:
+            self._generation_latency_ema_ms_per_query = (
+                self.ema_alpha * generation_ms_per_query
+                + (1.0 - self.ema_alpha) * self._generation_latency_ema_ms_per_query
             )
+        else:
+            self._generation_latency_ema_ms_per_query = generation_ms_per_query
 
         total_ms_per_query = (embedding_sec + retrieval_sec + generation_sec) * 1000.0 / max(1, batch_size)
-        batch_residual = total_ms_per_query - predicted_base
-        batch_key = (bucket, batch_size)
-        previous_batch = self._batch_size_residual_ema_ms_per_query.get(batch_key)
+        try:
+            action_cost = self._estimate_action_cost(token_lengths, batch_size, x_e, x_r)
+            gen_cost = self._estimate_generation_cost_for_batch(token_lengths)
+        except Exception as exc:
+            import traceback as _tb2
+            print(f"[_record_batch_feedback ERROR] x_e={x_e} x_r={x_r} batch={batch_size}: {exc}\n{_tb2.format_exc()}", flush=True)
+            action_cost = 0.0
+            gen_cost = 0.0
+        batch_residual = total_ms_per_query - (action_cost + gen_cost)
+        previous_batch = self._batch_size_residual_ema_ms_per_query.get(batch_size)
         if previous_batch is None:
-            self._batch_size_residual_ema_ms_per_query[batch_key] = batch_residual
+            self._batch_size_residual_ema_ms_per_query[batch_size] = batch_residual
         else:
-            self._batch_size_residual_ema_ms_per_query[batch_key] = (
+            self._batch_size_residual_ema_ms_per_query[batch_size] = (
                 self.ema_alpha * batch_residual + (1.0 - self.ema_alpha) * previous_batch
             )
 
-        target_batch_size = self._bucket_batch_size_ema[bucket]
-        if total_ms_per_query > 0:
-            if batch_size <= target_batch_size:
-                proposed = min(float(batch_size + 4), target_batch_size + 8.0)
+        # --- Compute observed timings (needed by both adaptive bs and wall-time calibration) ---
+        key = (x_e, x_r)
+        observed_gen_time = generation_sec * 1000.0
+        observed_er_time = (embedding_sec + retrieval_sec) * 1000.0
+        observed_wall = max(observed_gen_time, observed_er_time)
+
+        # --- Adaptive max_batch_size: EMA toward the best-performing batch size ---
+        # Larger batches are generally better because gen scales with sqrt(bs) while er scales
+        # with bs, so once gen dominates the wall time, larger bs = better gen-per-query.
+        if batch_size > 0:
+            if key not in self._best_batch_size_by_action:
+                self._best_batch_size_by_action[key] = batch_size
             else:
-                proposed = max(4.0, float(batch_size - 4))
-            self._bucket_batch_size_ema[bucket] = (
-                self.ema_alpha * proposed + (1.0 - self.ema_alpha) * target_batch_size
+                model_wall = max(observed_gen_time, observed_er_time)
+                ratio = observed_wall / model_wall if model_wall > 0 else 1.0
+                if ratio < 1.5 and batch_size > self._best_batch_size_by_action[key]:
+                    alpha = self.ema_alpha
+                    self._best_batch_size_by_action[key] = int(
+                        alpha * batch_size + (1.0 - alpha) * self._best_batch_size_by_action[key]
+                    )
+
+        # --- Wall-time model calibration (per-(xE,xR)) ---
+        # Model: wall_single = combine(gen_time, emb_ret_time)
+        #   xE=0: wall = max(gen, er)    (full parallel, CPU embed)
+        #   xE=1: wall = gen + er * overlap_factor  (GPU contention)
+        # gen_time = gen_base[(xE,xR)] + gen_per_query[(xE,xR)] * bs
+
+        # Overlap factor: wall = gen + er * factor  =>  factor = (wall - gen) / er
+        # For xE=0: CPU embed + CPU retrieval, both off GPU → gen fully parallel with E+R → max(gen, er)
+        # For xE=1: GPU embed + GPU retrieval compete with gen → gen + er * overlap_factor
+        if x_e == 0:
+            observed_overlap = 0.0
+        else:
+            if observed_er_time > 0:
+                observed_overlap = (observed_wall - observed_gen_time) / observed_er_time
+                observed_overlap = max(0.0, min(1.0, observed_overlap))
+            else:
+                observed_overlap = 1.0
+
+        # Initialize or update gen parameters keyed by (xE, xR)
+        if key not in self._gen_base_overhead_ema:
+            # Linear fit: gen_time = gen_base + gen_per_query × batch_size
+            # First observation: use gen_base=0, back-solve gen_per_query
+            gen_per_q_est = observed_gen_time / batch_size
+            self._gen_base_overhead_ema[key] = 0.0
+            self._gen_per_query_ema[key] = max(0.0, gen_per_q_est)
+            self._overlap_factor_ema[key] = observed_overlap
+            self._wall_time_measurements[key] = [(batch_size, observed_gen_time)]
+        else:
+            self._wall_time_measurements[key].append((batch_size, observed_gen_time))
+            if len(self._wall_time_measurements[key]) > 8:
+                self._wall_time_measurements[key] = self._wall_time_measurements[key][-8:]
+
+            if len(self._wall_time_measurements[key]) >= 3:
+                # Linear regression: gen = a + b * batch_size
+                ms_data = self._wall_time_measurements[key]
+                xs = [s[0] for s in ms_data]          # batch sizes
+                ys = [s[1] for s in ms_data]          # gen times
+                n = len(ms_data)
+                sx = sum(xs); sy = sum(ys)
+                sxy = sum(x*y for x, y in zip(xs, ys))
+                sxx = sum(x*x for x in xs)
+                denom = n * sxx - sx * sx
+                if abs(denom) > 1e-9:
+                    b = (n * sxy - sx * sy) / denom      # gen_per_query
+                    a = (sy - b * sx) / n                 # gen_base
+                    alpha = self.ema_alpha
+                    self._gen_base_overhead_ema[key] = alpha * max(0.0, a) + (1 - alpha) * self._gen_base_overhead_ema[key]
+                    self._gen_per_query_ema[key] = alpha * max(0.0, b) + (1 - alpha) * self._gen_per_query_ema[key]
+
+            alpha = self.ema_alpha
+            prev_overlap = self._overlap_factor_ema.get(key, observed_overlap)
+            self._overlap_factor_ema[key] = alpha * observed_overlap + (1 - alpha) * prev_overlap
+
+        # er_base_overhead: EMA smoothing
+        emb_ret_per_q = embedding_ms_per_query + retrieval_ms_per_query
+        er_total_ms = observed_er_time
+        er_base_est = er_total_ms - emb_ret_per_q * batch_size
+        if self._er_base_overhead_ema > 0:
+            self._er_base_overhead_ema = (
+                self.ema_alpha * max(0.0, er_base_est)
+                + (1 - self.ema_alpha) * self._er_base_overhead_ema
             )
+        else:
+            self._er_base_overhead_ema = max(0.0, er_base_est)
 
         self.feedback_trace.append(
             FeedbackTraceEntry(
                 batch_index=len(self.feedback_trace) + 1,
-                bucket=bucket,
                 batch_size=batch_size,
                 xE=x_e,
                 xR=x_r,
@@ -1259,26 +1415,24 @@ class GreedyBucketScheduler:
                 retrieval_ms_per_query=retrieval_ms_per_query,
                 generation_ms_per_query=generation_ms_per_query,
                 transfer_ms_per_query_est=self._transfer_latency_ema_ms_per_query.get(transfer_key, 0.0),
-                batch_size_residual_ms_per_query=self._batch_size_residual_ema_ms_per_query.get(batch_key, 0.0),
+                batch_size_residual_ms_per_query=self._batch_size_residual_ema_ms_per_query.get(batch_size, 0.0),
                 ema_after_update={
                     "embedding": self._embedding_latency_ema_ms_per_query.get(emb_key, 0.0),
                     "retrieval": self._retrieval_latency_ema_ms_per_query.get(ret_key, 0.0),
-                    "generation": self._generation_latency_ema_ms_per_query.get(bucket, 0.0),
+                    "generation": self._generation_latency_ema_ms_per_query,
                     "transfer": self._transfer_latency_ema_ms_per_query.get(transfer_key, 0.0),
-                    "batch_size_residual": self._batch_size_residual_ema_ms_per_query.get(batch_key, 0.0),
-                    "bucket_batch_size_ema": self._bucket_batch_size_ema.get(bucket, 0.0),
+                    "batch_size_residual": self._batch_size_residual_ema_ms_per_query.get(batch_size, 0.0),
+                    "max_batch_size_ema": self._max_batch_size_ema,
+                    f"gen_base_({x_e},{x_r})": self._gen_base_overhead_ema.get((x_e, x_r), 0.0),
+                    f"gen_per_query_({x_e},{x_r})": self._gen_per_query_ema.get((x_e, x_r), 0.0),
+                    "er_base_overhead_ema": self._er_base_overhead_ema,
+                    f"overlap_factor_({x_e},{x_r})": self._overlap_factor_ema.get((x_e, x_r), None),
                 },
             )
         )
 
-    def _pop_batch_queries(self, bucket: str, batch_size: int) -> List[PendingQuery]:
-        pending = self._pending_by_bucket[bucket]
-        if not pending:
-            return []
-        take = min(batch_size, len(pending))
-        batch = pending[:take]
-        del pending[:take]
-        return batch
+    def _pop_batch_queries(self, batch_size: int) -> List[PendingQuery]:
+        return self._pack_batch(batch_size)
 
     def _action_feasible(
         self,
@@ -1302,7 +1456,8 @@ class GreedyBucketScheduler:
             # Fallback to old static threshold behavior
             if x_r == 1 and gpu_mem_gb < 20.0:
                 return False, 0.0
-            if x_r == 1 and batch_size < self.retrieve_gpu_batch_threshold:
+            retrieve_gpu_batch_threshold = int(getattr(self.args, "retrieve_gpu_batch_threshold", 64))
+            if x_r == 1 and batch_size < retrieve_gpu_batch_threshold:
                 return False, 0.0
             return True, 0.0
 
@@ -1332,7 +1487,6 @@ class GreedyBucketScheduler:
 
     def _choose_action_for_batch(
         self,
-        bucket: str,
         lengths: Sequence[int],
         batch_size: int,
         gpu_available: bool,
@@ -1343,11 +1497,19 @@ class GreedyBucketScheduler:
         if getattr(self.args, "ablate_online_action", False):
             return {"xE": int(self.args.xE), "xR": int(self.args.xR)}
         l_max = max(lengths) if lengths else 1
+        embed_long_gpu_threshold = int(getattr(self.args, "embed_long_gpu_threshold", 128))
+        long_threshold = int(getattr(self.args, "length_long_threshold", 128))
 
         candidates = []
         for action in self.available_actions:
             x_e = int(action["xE"])
             x_r = int(action["xR"])
+
+            # Filter out actions marked infeasible in the EMA params.
+            # If the key is absent from _feasible_actions_ema, treat as feasible (backward-compat).
+            ema_feasible = self._feasible_actions_ema.get((x_e, x_r), True)
+            if not ema_feasible:
+                continue
 
             feasible, memory_penalty = self._action_feasible(
                 x_e, x_r, batch_size, gpu_available, gpu_mem_gb
@@ -1355,14 +1517,14 @@ class GreedyBucketScheduler:
             if not feasible:
                 continue
 
-            score = self._estimate_action_cost(bucket, lengths, batch_size, x_e, x_r)
+            score = self._estimate_action_cost(lengths, batch_size, x_e, x_r)
             if x_e == 0:
                 score += q_er_len * 0.03
             if x_r == 0:
                 score += q_rg_len * 0.05
-            if l_max >= self.embed_long_gpu_threshold and x_e == 0:
+            if l_max >= embed_long_gpu_threshold and x_e == 0:
                 score += 20.0
-            if l_max >= self.long_threshold and x_e == 1:
+            if l_max >= long_threshold and x_e == 1:
                 score -= 0.5
             score += memory_penalty
             candidates.append((score, {"xE": x_e, "xR": x_r}))
@@ -1385,61 +1547,159 @@ class GreedyBucketScheduler:
         self.batch_shaping_trace = []
         self._query_token_lengths = {idx: token_length for idx, token_length in enumerate(token_lengths)}
 
-        if self.scheduler_mode_choice == "generation_target_v1":
-            pending = [
-                PendingQuery(
-                    query_index=idx,
-                    query=query,
-                    token_length=token_length,
-                    estimated_cost=self._estimate_embedding_cost(token_length),
-                )
-                for idx, (query, token_length) in enumerate(zip(queries, token_lengths))
-            ]
-            pending.sort(key=lambda item: item.query_index)
-            self._pending_queries = pending
-            self._pending_by_bucket = {"short": [], "mid": [], "long": []}
-            long_count = sum(1 for token_length in token_lengths if token_length > self.long_threshold)
-            return long_count / max(1, len(queries))
-
-        if getattr(self.args, "ablate_bucketing", False):
-            self._pending_by_bucket = {"short": [], "mid": [], "long": []}
-            pending = [
-                PendingQuery(
-                    query_index=idx,
-                    query=query,
-                    token_length=token_length,
-                    estimated_cost=self._estimate_embedding_cost(token_length),
-                )
-                for idx, (query, token_length) in enumerate(zip(queries, token_lengths))
-            ]
-            pending.sort(key=lambda item: item.estimated_cost, reverse=True)
-            self._pending_by_bucket["mid"] = pending
-            self._pending_queries = []
-            return 0.0
-        self._pending_by_bucket = {"short": [], "mid": [], "long": []}
-        self._pending_queries = []
-        total_queries = max(1, len(queries))
-        long_count = 0
-        for idx, (query, token_length) in enumerate(zip(queries, token_lengths)):
-            bucket = self._bucket_name(token_length)
-            if bucket == "long":
-                long_count += 1
-            self._pending_by_bucket[bucket].append(
-                PendingQuery(
-                    query_index=idx,
-                    query=query,
-                    token_length=token_length,
-                    estimated_cost=self._estimate_embedding_cost(token_length),
-                )
+        pending = [
+            PendingQuery(
+                query_index=idx,
+                query=query,
+                token_length=token_length,
+                estimated_cost=self._estimate_embedding_cost(token_length),
             )
-        for bucket in ("short", "mid", "long"):
-            self._pending_by_bucket[bucket].sort(key=lambda item: item.estimated_cost, reverse=True)
-        return long_count / total_queries
+            for idx, (query, token_length) in enumerate(zip(queries, token_lengths))
+        ]
+        pending.sort(key=lambda item: item.token_length)
+        self._pending_queries = pending
+        return 0.0
 
     def has_pending(self) -> bool:
-        if self.scheduler_mode_choice == "generation_target_v1":
-            return bool(self._pending_queries)
-        return any(self._pending_by_bucket[bucket] for bucket in ("short", "mid", "long"))
+        return bool(self._pending_queries)
+
+    def _batch_size_candidates(
+        self,
+        max_feasible: int,
+        pending_count: int,
+    ) -> List[int]:
+        """Generate power-of-2 batch size candidates up to max feasible, capped by pending."""
+        cap = min(max_feasible, pending_count)
+        if cap < 1:
+            return []
+        max_pow = int(math.log2(cap))
+        return [2 ** k for k in range(max_pow + 1)]
+
+    def get_ema_params(self) -> Dict[str, Any]:
+        """Return all current EMA parameters as a dict for inspection."""
+        return {
+            "gen_base_overhead_ema": {f"({xe},{xr})": v for (xe, xr), v in self._gen_base_overhead_ema.items()},
+            "gen_per_query_ema": {f"({xe},{xr})": v for (xe, xr), v in self._gen_per_query_ema.items()},
+            "er_base_overhead_ema": self._er_base_overhead_ema,
+            "embedding_latency_ema": {f"{xe}": v for xe, v in self._embedding_latency_ema_ms_per_query.items()},
+            "retrieval_latency_ema": {f"{xr}": v for xr, v in self._retrieval_latency_ema_ms_per_query.items()},
+            "overlap_factor_ema": {f"({xe},{xr})": v for (xe, xr), v in self._overlap_factor_ema.items()},
+            "batch_size_residual_ema": {str(bs): v for bs, v in self._batch_size_residual_ema_ms_per_query.items()},
+            "max_batch_size_ema": self._max_batch_size_ema,
+            "best_batch_size_by_action": {f"({xe},{xr})": v for (xe, xr), v in self._best_batch_size_by_action.items()},
+            "wall_time_measurements": {
+                f"({xe},{xr})": ms for (xe, xr), ms in self._wall_time_measurements.items()
+            },
+        }
+
+    def save_ema_params(self, path: str) -> None:
+        """Persist all EMA parameters to a JSON file for warm-start on next run."""
+        data = {
+            "version": 1,
+            "gen_base_overhead_ema": {
+                f"({xe},{xr})": v
+                for (xe, xr), v in self._gen_base_overhead_ema.items()
+            },
+            "gen_per_query_ema": {
+                f"({xe},{xr})": v
+                for (xe, xr), v in self._gen_per_query_ema.items()
+            },
+            "er_base_overhead_ema": self._er_base_overhead_ema,
+            "embedding_latency_ema": {
+                f"{xe}": v
+                for xe, v in self._embedding_latency_ema_ms_per_query.items()
+            },
+            "retrieval_latency_ema": {
+                f"{xr}": v
+                for xr, v in self._retrieval_latency_ema_ms_per_query.items()
+            },
+            "overlap_factor_ema": {
+                f"({xe},{xr})": v
+                for (xe, xr), v in self._overlap_factor_ema.items()
+            },
+            "batch_size_residual_ema": {
+                str(bs): v
+                for bs, v in self._batch_size_residual_ema_ms_per_query.items()
+            },
+            "max_batch_size_ema": self._max_batch_size_ema,
+            "best_batch_size_by_action": {
+                f"({xe},{xr})": v
+                for (xe, xr), v in self._best_batch_size_by_action.items()
+            },
+            "wall_time_measurements": {
+                f"({xe},{xr})": ms
+                for (xe, xr), ms in self._wall_time_measurements.items()
+            },
+            "feasible_actions": {
+                f"({xe},{xr})": v
+                for (xe, xr), v in self._feasible_actions_ema.items()
+            },
+        }
+        out_path = Path(path).expanduser().resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load_ema_params(self, path: str) -> None:
+        """Restore EMA parameters from a JSON file for warm-start."""
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            return
+        raw = json.loads(p.read_text(encoding="utf-8"))
+
+        def parse_tuple_key(d: Dict[str, Any], src_key: str) -> Dict[Tuple[int, int], float]:
+            result = {}
+            for k_str, v in d.get(src_key, {}).items():
+                k_str = k_str.strip()
+                if k_str.startswith("(") and k_str.endswith(")"):
+                    parts = k_str[1:-1].split(",")
+                    if len(parts) == 2:
+                        result[(int(parts[0].strip()), int(parts[1].strip()))] = float(v)
+            return result
+
+        def parse_int_key(d: Dict[str, Any], src_key: str) -> Dict[int, float]:
+            return {int(k): float(v) for k, v in d.get(src_key, {}).items()}
+
+        self._gen_base_overhead_ema = parse_tuple_key(raw, "gen_base_overhead_ema")
+        raw_gpq = parse_tuple_key(raw, "gen_per_query_ema")
+        if not raw_gpq:
+            raw_gps = parse_tuple_key(raw, "gen_per_sqrt_ema")
+            if raw_gps:
+                raw_gpq = raw_gps
+        self._gen_per_query_ema = raw_gpq
+        self._er_base_overhead_ema = float(raw.get("er_base_overhead_ema", 0.0))
+        self._embedding_latency_ema_ms_per_query = parse_int_key(raw, "embedding_latency_ema")
+        self._retrieval_latency_ema_ms_per_query = parse_int_key(raw, "retrieval_latency_ema")
+        self._overlap_factor_ema = parse_tuple_key(raw, "overlap_factor_ema")
+        self._batch_size_residual_ema_ms_per_query = {
+            int(k): float(v) for k, v in raw.get("batch_size_residual_ema", {}).items()
+        }
+        self._max_batch_size_ema = float(raw.get("max_batch_size_ema", self._max_batch_size_ema))
+        self._best_batch_size_by_action = {}
+        for k_str, v in raw.get("best_batch_size_by_action", {}).items():
+            k_str = k_str.strip()
+            if k_str.startswith("(") and k_str.endswith(")"):
+                parts = k_str[1:-1].split(",")
+                if len(parts) == 2:
+                    self._best_batch_size_by_action[(int(parts[0].strip()), int(parts[1].strip()))] = int(v)
+        # wall_time_measurements: restore as list of (batch_size, gen_time)
+        raw_ms = raw.get("wall_time_measurements", {})
+        self._wall_time_measurements = {}
+        for k_str, ms_list in raw_ms.items():
+            k_str = k_str.strip()
+            if k_str.startswith("(") and k_str.endswith(")"):
+                parts = k_str[1:-1].split(",")
+                if len(parts) == 2:
+                    key = (int(parts[0].strip()), int(parts[1].strip()))
+                    self._wall_time_measurements[key] = [
+                        (int(item[0]), float(item[1])) for item in ms_list
+                    ]
+        self._feasible_actions_ema = {}
+        for k_str, v in raw.get("feasible_actions", {}).items():
+            k_str = k_str.strip()
+            if k_str.startswith("(") and k_str.endswith(")"):
+                parts = k_str[1:-1].split(",")
+                if len(parts) == 2:
+                    self._feasible_actions_ema[(int(parts[0].strip()), int(parts[1].strip()))] = bool(v)
 
     def next_dispatch(
         self,
@@ -1449,216 +1709,162 @@ class GreedyBucketScheduler:
         q_rg_len: int,
         long_ratio: float,
     ) -> Optional[ScheduledMicrobatch]:
-        if self.scheduler_mode_choice == "generation_target_v1":
-            pending_count = len(self._pending_queries)
-            if pending_count == 0:
-                return None
-
-            target_min, target_ideal, target_max = self._generation_target_bounds(
-                pending_count=pending_count,
-                gpu_free_mem_gb=gpu_mem_gb,
-                q_er_len=q_er_len,
-                q_rg_len=q_rg_len,
-            )
-            self.generation_target_trace.append(
-                GenerationTargetTraceEntry(
-                    dispatch_index=len(self.generation_target_trace) + 1,
-                    target_batch_min=target_min,
-                    target_batch_ideal=target_ideal,
-                    target_batch_max=target_max,
-                    pending_count=pending_count,
-                    q_er_len=q_er_len,
-                    q_rg_len=q_rg_len,
-                    gpu_free_mem_gb=gpu_mem_gb,
-                )
-            )
-
-            best_batch: Optional[ScheduledMicrobatch] = None
-            best_score = float("inf")
-            best_device_plan: Optional[Dict[str, Any]] = None
-            best_pre_lengths: List[int] = []
-            best_post_lengths: List[int] = []
-            candidate_batch_sizes = self._candidate_generation_batch_sizes(
-                pending_count=pending_count,
-                target_min=target_min,
-                target_ideal=target_ideal,
-                target_max=target_max,
-            )
-            for batch_size in candidate_batch_sizes:
-                candidate_items = self._pending_queries[:batch_size]
-                pre_lengths = [item.token_length for item in candidate_items]
-                shaped_items = self._shape_batch(candidate_items, batch_size)
-                post_lengths = [item.token_length for item in shaped_items]
-                device_plan = self._plan_device_for_batch(
-                    token_lengths=post_lengths,
-                    batch_size=len(shaped_items),
-                    gpu_available=gpu_available,
-                    gpu_free_mem_gb=gpu_mem_gb,
-                    q_er_len=q_er_len,
-                    q_rg_len=q_rg_len,
-                )
-                dispatch_cost = self._estimate_dispatch_cost(
-                    bucket=self._bucket_name(max(post_lengths) if post_lengths else 1),
-                    lengths=post_lengths,
-                    batch_size=len(shaped_items),
-                    x_e=int(device_plan["xE"]),
-                    x_r=int(device_plan["xR"]),
-                )
-                if dispatch_cost < best_score:
-                    best_score = dispatch_cost
-                    best_device_plan = device_plan
-                    best_pre_lengths = pre_lengths
-                    best_post_lengths = post_lengths
-                    best_batch = ScheduledMicrobatch(
-                        bucket=self._bucket_name(max(post_lengths) if post_lengths else 1),
-                        query_indices=[item.query_index for item in shaped_items],
-                        queries=[item.query for item in shaped_items],
-                        token_lengths=post_lengths,
-                        action={
-                            "xE": int(device_plan["xE"]),
-                            "xR": int(device_plan["xR"]),
-                            "keep_gpu_resident_er": bool(device_plan["keep_gpu_resident_er"]),
-                        },
-                    )
-            if best_batch is None or best_device_plan is None:
-                return None
-
-            selected = set(best_batch.query_indices)
-            self._pending_queries = [item for item in self._pending_queries if item.query_index not in selected]
-            self.device_plan_trace.append(
-                DevicePlanTraceEntry(
-                    dispatch_index=len(self.device_plan_trace) + 1,
-                    chosen_action={
-                        "xE": int(best_device_plan["xE"]),
-                        "xR": int(best_device_plan["xR"]),
-                        "keep_gpu_resident_er": bool(best_device_plan["keep_gpu_resident_er"]),
-                    },
-                    keep_gpu_resident_er=bool(best_device_plan["keep_gpu_resident_er"]),
-                    expected_supportable_batch_size=len(best_batch.queries),
-                    predicted_action_cost_ms_per_query=self._estimate_action_cost(
-                        bucket=best_batch.bucket,
-                        lengths=best_batch.token_lengths,
-                        batch_size=len(best_batch.queries),
-                        x_e=int(best_device_plan["xE"]),
-                        x_r=int(best_device_plan["xR"]),
-                    ),
-                    gpu_free_mem_gb=gpu_mem_gb,
-                )
-            )
-            self.batch_shaping_trace.append(
-                BatchShapingTraceEntry(
-                    dispatch_index=len(self.batch_shaping_trace) + 1,
-                    pre_shape_token_min=min(best_pre_lengths) if best_pre_lengths else 0,
-                    pre_shape_token_max=max(best_pre_lengths) if best_pre_lengths else 0,
-                    pre_shape_token_avg=(sum(best_pre_lengths) / len(best_pre_lengths)) if best_pre_lengths else 0.0,
-                    post_shape_token_min=min(best_post_lengths) if best_post_lengths else 0,
-                    post_shape_token_max=max(best_post_lengths) if best_post_lengths else 0,
-                    post_shape_token_avg=(sum(best_post_lengths) / len(best_post_lengths)) if best_post_lengths else 0.0,
-                    chosen_batch_size=len(best_batch.queries),
-                    shaping_applied=bool(getattr(self.args, "enable_batch_shaping", False)),
-                )
-            )
-            return best_batch
-
-        total_pending = sum(len(self._pending_by_bucket[b]) for b in ("short", "mid", "long"))
-        long_ratio = len(self._pending_by_bucket["long"]) / max(1, total_pending)
-        best_bucket = None
-        best_score = -float("inf")
-        best_action: Dict[str, int] = {"xE": 0, "xR": 0}
-        best_batch_size = 0
-        best_predicted_action_cost = 0.0
-        best_predicted_dispatch_cost = 0.0
-        best_candidate_batch_sizes: List[int] = []
-        best_candidate_actions: List[Dict[str, Any]] = []
-        for bucket in ("short", "mid", "long"):
-            waiting_queries = len(self._pending_by_bucket[bucket])
-            if waiting_queries == 0:
-                continue
-            waiting_batches = max(1, math.ceil(waiting_queries / max(1, self._bucket_batch_size(bucket))))
-            candidate_batch_sizes = self._candidate_batch_sizes(bucket, waiting_queries)
-            for batch_size in candidate_batch_sizes:
-                candidate_items = self._pending_by_bucket[bucket][:batch_size]
-                lengths = [item.token_length for item in candidate_items]
-                action = self._choose_action_for_batch(
-                    bucket=bucket,
-                    lengths=lengths,
-                    batch_size=batch_size,
-                    gpu_available=gpu_available,
-                    gpu_mem_gb=gpu_mem_gb,
-                    q_er_len=q_er_len,
-                    q_rg_len=q_rg_len,
-                )
-                candidate_action_rows: List[Dict[str, Any]] = []
-                for candidate_action in self.available_actions:
-                    cx_e = int(candidate_action["xE"])
-                    cx_r = int(candidate_action["xR"])
-                    feasible, _ = self._action_feasible(cx_e, cx_r, batch_size, gpu_available, gpu_mem_gb)
-                    if not feasible:
-                        continue
-                    candidate_action_rows.append(
-                        {
-                            "xE": cx_e,
-                            "xR": cx_r,
-                            "predicted_action_cost_ms_per_query": self._estimate_action_cost(
-                                bucket, lengths, batch_size, cx_e, cx_r
-                            ),
-                            "predicted_dispatch_cost_ms_per_query": self._estimate_dispatch_cost(
-                                bucket, lengths, batch_size, cx_e, cx_r
-                            ),
-                        }
-                    )
-                predicted_action_cost = self._estimate_action_cost(
-                    bucket=bucket,
-                    lengths=lengths,
-                    batch_size=batch_size,
-                    x_e=int(action["xE"]),
-                    x_r=int(action["xR"]),
-                )
-                dispatch_ms = self._estimate_dispatch_cost(
-                    bucket=bucket,
-                    lengths=lengths,
-                    batch_size=batch_size,
-                    x_e=int(action["xE"]),
-                    x_r=int(action["xR"]),
-                )
-                score = self._bucket_priority(bucket, waiting_batches, q_er_len, q_rg_len, long_ratio, gpu_mem_gb)
-                score -= dispatch_ms / 50.0
-                if score > best_score:
-                    best_score = score
-                    best_bucket = bucket
-                    best_action = {"xE": int(action["xE"]), "xR": int(action["xR"])}
-                    best_batch_size = batch_size
-                    best_predicted_action_cost = predicted_action_cost
-                    best_predicted_dispatch_cost = dispatch_ms
-                    best_candidate_batch_sizes = candidate_batch_sizes
-                    best_candidate_actions = candidate_action_rows
-        if best_bucket is None or best_batch_size <= 0:
+        pending_count = len(self._pending_queries)
+        if pending_count == 0:
             return None
-        batch_items = self._pop_batch_queries(best_bucket, best_batch_size)
+
+        max_feasible = 128
+        if self.resource_tracker is not None:
+            feasible_actions = [
+                a for a in self.available_actions
+                if self._feasible_actions_ema.get((int(a["xE"]), int(a["xR"])), True)
+            ]
+            if feasible_actions:
+                max_feasible = max(
+                    self.resource_tracker.max_batch_size_for_action(
+                        int(a["xE"]), int(a["xR"])
+                    )
+                    for a in feasible_actions
+                )
+        # Build per-action batch size candidates: bias toward the best-performing bs per action
+        raw_candidates: List[int] = []
+        for action in self.available_actions:
+            x_e = int(action["xE"])
+            x_r = int(action["xR"])
+            if not self._feasible_actions_ema.get((x_e, x_r), True):
+                continue
+            key = (x_e, x_r)
+            best_bs = self._best_batch_size_by_action.get(key, self._max_batch_size_ema)
+            if best_bs > 1:
+                best_pow = 2 ** round(math.log2(best_bs))
+                raw_candidates += [1, 2, 4, 8, 16, 32, 64, 128, 256]
+                if best_pow not in raw_candidates:
+                    raw_candidates.append(best_pow)
+        raw_candidates = sorted(set(c for c in raw_candidates if 1 <= c <= min(max_feasible, pending_count)))
+        if not raw_candidates:
+            raw_candidates = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+
+        candidate_batch_sizes = raw_candidates
+
+        best_score = float("inf")
+        best_batch_size = raw_candidates[-1]
+        best_action = {"xE": 0, "xR": 0}
+        best_lengths: List[int] = []
+
+        for bs in raw_candidates:
+            sim_items = self._pending_queries[:bs]
+            sim_lengths = [item.token_length for item in sim_items]
+
+            for action in self.available_actions:
+                x_e = int(action["xE"])
+                x_r = int(action["xR"])
+
+                if not self._feasible_actions_ema.get((x_e, x_r), True):
+                    continue
+
+                if self.fixed_action:
+                    if x_e != int(getattr(self.args, "xE", 0)) or x_r != int(getattr(self.args, "xR", 0)):
+                        continue
+
+                feasible, _ = self._action_feasible(x_e, x_r, bs, gpu_available, gpu_mem_gb)
+                if not feasible:
+                    continue
+
+                score = self._estimate_wall_time(bs, x_e, x_r, pending_count)
+
+                if score < best_score:
+                    best_score = score
+                    best_batch_size = bs
+                    best_action = {"xE": x_e, "xR": x_r}
+                    best_lengths = sim_lengths
+
+        batch_size = min(best_batch_size, pending_count)
+        if batch_size < 1:
+            return None
+
+        if self.fixed_action:
+            req_xe = int(getattr(self.args, "xE", 0))
+            req_xr = int(getattr(self.args, "xR", 0))
+            chosen_xe = int(best_action["xE"])
+            chosen_xr = int(best_action["xR"])
+            if chosen_xe != req_xe or chosen_xr != req_xr:
+                print(
+                    f"[sched WARNING] requested (xE={req_xe},xR={req_xr}) but GPU memory "
+                    f"only allows (xE={chosen_xe},xR={chosen_xr}). "
+                    f"Consider reducing --gpu-memory-utilization or switching to CPU embedding.",
+                    flush=True,
+                )
+        else:
+            # Non-fixed mode: warn if user specified xE/xR args but scheduler chose differently
+            req_xe = int(getattr(self.args, "xE", -1))
+            req_xr = int(getattr(self.args, "xR", -1))
+            chosen_xe = int(best_action["xE"])
+            chosen_xr = int(best_action["xR"])
+            if req_xe != -1 and req_xr != -1 and (chosen_xe != req_xe or chosen_xr != req_xr):
+                print(
+                    f"[sched WARNING] requested (xE={req_xe},xR={req_xr}) but scheduler "
+                    f"chose (xE={chosen_xe},xR={chosen_xr}) due to memory constraints.",
+                    flush=True,
+                )
+
+        items = self._pack_batch(batch_size)
+        if not items:
+            return None
+
+        lengths = [item.token_length for item in items]
+        x_e = int(best_action["xE"])
+        x_r = int(best_action["xR"])
+        keep_gpu_resident_er = x_e == 1 and x_r == 1 and gpu_available
+
+        trace_lengths = lengths
+        candidate_action_rows: List[Dict[str, Any]] = []
+        for action in self.available_actions:
+            cx_e = int(action["xE"])
+            cx_r = int(action["xR"])
+            if not self._feasible_actions_ema.get((cx_e, cx_r), True):
+                continue
+            feasible, _ = self._action_feasible(cx_e, cx_r, batch_size, gpu_available, gpu_mem_gb)
+            if not feasible:
+                continue
+            candidate_action_rows.append({
+                "xE": cx_e,
+                "xR": cx_r,
+                "predicted_action_cost_ms_per_query": self._estimate_action_cost(
+                    trace_lengths, batch_size, cx_e, cx_r
+                ),
+                "predicted_dispatch_cost_ms_per_query": self._estimate_dispatch_cost(
+                    trace_lengths, batch_size, cx_e, cx_r
+                ),
+            })
+
+        dispatch_ms = self._estimate_dispatch_cost(lengths, batch_size, x_e, x_r)
+        action_ms = self._estimate_action_cost(lengths, batch_size, x_e, x_r)
+        wall_time_ms = self._estimate_wall_time(batch_size, x_e, x_r, pending_count)
+
         self.dispatch_trace.append(
             DispatchTraceEntry(
                 dispatch_index=len(self.dispatch_trace) + 1,
-                bucket=best_bucket,
-                chosen_batch_size=best_batch_size,
-                candidate_batch_sizes=best_candidate_batch_sizes,
-                chosen_action=best_action,
-                candidate_actions=best_candidate_actions,
+                chosen_batch_size=batch_size,
+                candidate_batch_sizes=candidate_batch_sizes,
+                chosen_action={"xE": x_e, "xR": x_r},
+                candidate_actions=candidate_action_rows,
                 q_er_len=q_er_len,
                 q_rg_len=q_rg_len,
-                predicted_action_cost_ms_per_query=best_predicted_action_cost,
-                predicted_dispatch_cost_ms_per_query=best_predicted_dispatch_cost,
-                pending_queries_by_bucket={
-                    bucket_name: len(self._pending_by_bucket[bucket_name])
-                    for bucket_name in ("short", "mid", "long")
-                },
+                predicted_action_cost_ms_per_query=action_ms,
+                predicted_dispatch_cost_ms_per_query=dispatch_ms,
+                pending_queries_remaining=pending_count - batch_size,
             )
         )
+
         return ScheduledMicrobatch(
-            bucket=best_bucket,
-            query_indices=[item.query_index for item in batch_items],
-            queries=[item.query for item in batch_items],
-            token_lengths=[item.token_length for item in batch_items],
-            action=best_action,
+            query_indices=[item.query_index for item in items],
+            queries=[item.query for item in items],
+            token_lengths=lengths,
+            action={
+                "xE": x_e,
+                "xR": x_r,
+                "keep_gpu_resident_er": keep_gpu_resident_er,
+            },
         )
 
 
@@ -1672,20 +1878,45 @@ class StandaloneRAGPipeline:
 
         # ResourceTracker monitors GPU memory in real time and estimates per-stage costs.
         # In resource-constrained scenarios, this is the foundation for memory-aware scheduling.
+        auto_layers, auto_hidden = self._detect_model_architecture(args.generator_model)
+        explicit_layers = getattr(args, "generator_model_layers", None)
+        explicit_hidden = getattr(args, "generator_model_hidden", None)
+        model_layers = explicit_layers if explicit_layers is not None else auto_layers
+        model_hidden = explicit_hidden if explicit_hidden is not None else auto_hidden
+        self.logger.info(
+            "Generator model memory params: layers=%d, hidden=%d (detected from '%s')",
+            model_layers, model_hidden, args.generator_model,
+        )
         self.resource_tracker = ResourceTracker(
             gpu_id=self.gpu_id,
             vllm_gpu_memory_utilization=args.gpu_memory_utilization,
             faiss_index_gb=float(getattr(args, "faiss_index_gb", 2.0)),
+            model_layers=model_layers,
+            model_hidden=model_hidden,
         )
 
         final_enable = getattr(args, "enable_memory_aware_scheduling", True)
-        self.scheduler = GreedyBucketScheduler(args, resource_tracker=self.resource_tracker)
+        self.scheduler = GreedyScheduler(args, resource_tracker=self.resource_tracker)
         # propagate the value to the scheduler (avoids getattr at every dispatch call)
         self.scheduler.enable_memory_aware_scheduling = final_enable
+
+        # Warm-start: load pre-calibrated EMA parameters from file
+        ema_path = getattr(args, "ema_params_path", None)
+        if ema_path:
+            self.scheduler.load_ema_params(ema_path)
+            self.logger.info("Loaded EMA parameters from: %s", ema_path)
+            self.logger.info(
+                "  gen keys: %s, embed keys: %s, ret keys: %s",
+                list(self.scheduler._gen_base_overhead_ema.keys()),
+                list(self.scheduler._embedding_latency_ema_ms_per_query.keys()),
+                list(self.scheduler._retrieval_latency_ema_ms_per_query.keys()),
+            )
         self.logger.info(
             "Memory-aware scheduling: %s",
             "ENABLED" if final_enable else "DISABLED",
         )
+
+        self._save_ema_params_path = getattr(args, "ema_params_path", None) if getattr(args, "save_ema_params", False) else None
 
         self.embedding_backend = self._map_binary_backend(args.xE, "xE")
         self.retrieval_backend = self._map_binary_backend(args.xR, "xR")
@@ -1699,7 +1930,7 @@ class StandaloneRAGPipeline:
             backend=self.embedding_backend,
             use_fp16=args.embedding_use_fp16,
             gpu_id=self.gpu_id,
-            chunked_embedding=(args.pipeline_mode == "async_bucket" and not getattr(args, "ablate_chunking", False)),
+            chunked_embedding=(args.pipeline_mode == "async_v2" and not getattr(args, "ablate_chunking", False)),
         )
         self.logger.info("Embedding stage ready.")
         self.logger.info("Initializing retrieval stage: index=%s, backend=%s ...",
@@ -1758,6 +1989,22 @@ class StandaloneRAGPipeline:
         except Exception:
             return 0.0
 
+    KNOWN_MODEL_ARCHS = {
+        "qwen": {"layers": 28, "hidden": 2048},
+        "llama": {"layers": 32, "hidden": 4096},
+        "gemma": {"layers": 28, "hidden": 2048},
+        "mistral": {"layers": 32, "hidden": 4096},
+        "phi": {"layers": 24, "hidden": 2560},
+    }
+
+    def _detect_model_architecture(self, model_path: str) -> Tuple[int, int]:
+        """Auto-detect model layers and hidden dim from model name or config."""
+        model_lower = model_path.lower()
+        for name, arch in self.KNOWN_MODEL_ARCHS.items():
+            if name in model_lower:
+                return arch["layers"], arch["hidden"]
+        return 32, 4096  # safe fallback
+
     def _compute_query_token_lengths(self, queries: Sequence[str]) -> List[int]:
         tokenizer = self.embedding_stage.tokenizer
         lengths: List[int] = []
@@ -1801,7 +2048,7 @@ class StandaloneRAGPipeline:
                 use_fp16=self.args.embedding_use_fp16,
                 gpu_id=self.gpu_id,
                 chunked_embedding=(
-                    self.args.pipeline_mode == "async_bucket" and not getattr(self.args, "ablate_chunking", False)
+                self.args.pipeline_mode == "async_v2" and not getattr(self.args, "ablate_chunking", False)
                 ),
             )
         if target_retrieval != self.retrieval_backend:
@@ -1824,7 +2071,7 @@ class StandaloneRAGPipeline:
             use_fp16=self.args.embedding_use_fp16,
             gpu_id=self.gpu_id,
             chunked_embedding=(
-                self.args.pipeline_mode == "async_bucket" and not getattr(self.args, "ablate_chunking", False)
+                self.args.pipeline_mode == "async_v2" and not getattr(self.args, "ablate_chunking", False)
             ),
         )
 
@@ -1852,6 +2099,7 @@ class StandaloneRAGPipeline:
         batch_size = int(self.args.b)
         if batch_size <= 0:
             raise ValueError("b must be positive.")
+
         x_e = int(self.args.xE)
         x_r = int(self.args.xR)
 
@@ -1859,10 +2107,8 @@ class StandaloneRAGPipeline:
         for start in range(0, len(self.queries), batch_size):
             batch_queries = self.queries[start : start + batch_size]
             batch_lengths = self.query_token_lengths[start : start + batch_size]
-            bucket = self.scheduler._bucket_name(max(batch_lengths) if batch_lengths else 1)
             microbatches.append(
                 ScheduledMicrobatch(
-                    bucket=bucket,
                     query_indices=list(range(start, start + len(batch_queries))),
                     queries=batch_queries,
                     token_lengths=batch_lengths,
@@ -1881,7 +2127,6 @@ class StandaloneRAGPipeline:
         total_generated_tokens: int,
         records: List[BatchStats],
         samples: List[Dict[str, str]],
-        bucket_counts: Dict[str, int],
         action_counts: Dict[str, int],
         max_q_er: int,
         max_q_rg: int,
@@ -1910,22 +2155,14 @@ class StandaloneRAGPipeline:
             },
             "scheduler": {
                 "mode": mode,
-                "bucket_thresholds": {
-                    "short": self.args.length_short_threshold,
-                    "long": self.args.length_long_threshold,
-                },
-                "bucket_batch_sizes": {
-                    "short": self.args.bucket_batch_short,
-                    "mid": self.args.bucket_batch_mid,
-                    "long": self.args.bucket_batch_long,
-                },
-                "bucket_counts": bucket_counts,
+                "initial_batch_size": getattr(self.args, "initial_batch_size", 32),
                 "action_counts": action_counts,
                 "max_q_er": max_q_er,
                 "max_q_rg": max_q_rg,
                 "fixed_nprobe": self.args.nprobe,
                 "execution": execution,
             },
+            "ema_params": self.scheduler.get_ema_params(),
             "timing_breakdown": {
                 "token_length_prep_ms": self.token_length_prep_sec * 1000.0,
                 "scheduler_dispatch_ms_total": scheduler_dispatch_sec_total * 1000.0,
@@ -1989,7 +2226,6 @@ class StandaloneRAGPipeline:
         total_generated_tokens = 0
         records: List[BatchStats] = []
         samples: List[Dict[str, str]] = []
-        bucket_counts: Dict[str, int] = {"short": 0, "mid": 0, "long": 0}
         action_counts: Dict[str, int] = {}
         max_q_er = 0
         max_q_rg = 0
@@ -1998,10 +2234,9 @@ class StandaloneRAGPipeline:
         scheduler_feedback_sec_total = 0.0
 
         pipeline_mode = self.args.pipeline_mode
-        use_bucket_dispatch = pipeline_mode == "async_bucket"
-        bucket_long_ratio = 0.0
-        if use_bucket_dispatch:
-            bucket_long_ratio = self.scheduler.prepare_queries(
+        use_v2_scheduler = pipeline_mode in ("async_v2",)
+        if use_v2_scheduler:
+            self.scheduler.prepare_queries(
                 queries=self.queries,
                 token_lengths=self.query_token_lengths,
             )
@@ -2013,17 +2248,18 @@ class StandaloneRAGPipeline:
             scheduled_batches = self._build_plain_microbatches()
             if not scheduled_batches:
                 raise ValueError("Scheduler returned no microbatches.")
-            # async_plain needs _pending_by_bucket populated so has_pending() works.
-            # Mirror the structure that prepare_queries() builds for async_bucket.
-            self.scheduler._pending_by_bucket = {"short": [], "mid": [], "long": []}
+            # Init tracing arrays via prepare_queries, then re-populate.
+            self.scheduler.prepare_queries(
+                queries=self.queries,
+                token_lengths=self.query_token_lengths,
+            )
             self.scheduler._pending_queries = []
             self.scheduler._query_token_lengths = {}
             for microbatch in scheduled_batches:
                 for idx, query, token_length in zip(
                     microbatch.query_indices, microbatch.queries, microbatch.token_lengths
                 ):
-                    bucket = self.scheduler._bucket_name(token_length)
-                    self.scheduler._pending_by_bucket[bucket].append(
+                    self.scheduler._pending_queries.append(
                         PendingQuery(
                             query_index=idx,
                             query=query,
@@ -2032,6 +2268,7 @@ class StandaloneRAGPipeline:
                         )
                     )
                     self.scheduler._query_token_lengths[idx] = token_length
+            self.scheduler._pending_queries.sort(key=lambda item: item.token_length)
             scheduler_mode = "plain_fixed_batch"
 
         self._warmup()
@@ -2064,12 +2301,10 @@ class StandaloneRAGPipeline:
                 total_generation_sec += generation_sec
                 batch_tokens = int(sum(token_counts))
                 total_generated_tokens += batch_tokens
-                bucket_counts[microbatch.bucket] = bucket_counts.get(microbatch.bucket, 0) + 1
                 records.append(
                     BatchStats(
                         batch_index=batch_index,
                         batch_size=len(microbatch.queries),
-                        bucket=microbatch.bucket,
                         embedding_sec=embedding_sec,
                         retrieval_sec=retrieval_sec,
                         generation_sec=generation_sec,
@@ -2092,7 +2327,6 @@ class StandaloneRAGPipeline:
                                 "query": query,
                                 "top_doc_snippet": (docs[0][:300] if docs else ""),
                                 "answer": answer,
-                                "bucket": microbatch.bucket,
                                 "action": microbatch.action,
                             }
                         )
@@ -2124,7 +2358,6 @@ class StandaloneRAGPipeline:
                 total_generated_tokens=total_generated_tokens,
                 records=records,
                 samples=samples,
-                bucket_counts=bucket_counts,
                 action_counts=action_counts,
                 max_q_er=0,
                 max_q_rg=0,
@@ -2151,17 +2384,42 @@ class StandaloneRAGPipeline:
         q_er_max_seen = 0
         q_rg_max_seen = 0
 
+        # Online dispatch coordination: embed_worker signals when it needs more work.
+        dispatch_cv = threading.Condition()
+        need_dispatch = True  # start with True so we dispatch initial batch
+        dispatch_active = True  # False when no more pending queries
+
         embed_batch_counter = [0]
 
         def embed_worker() -> None:
-            nonlocal q_er_size, q_er_max_seen, q_rg_size, q_rg_max_seen, scheduler_dispatch_sec_total, scheduler_feedback_sec_total
+            nonlocal q_er_size, q_er_max_seen, q_rg_size, q_rg_max_seen
+            nonlocal scheduler_dispatch_sec_total, scheduler_feedback_sec_total
+            nonlocal need_dispatch, dispatch_active
             try:
                 stage_cache: Dict[str, QueryEmbeddingStage] = {self.embedding_backend: self.embedding_stage}
                 while True:
-                    microbatch = q_er.get()
-                    if microbatch is None:
-                        q_rg.put(None)
-                        break
+                    # --- Online dispatch: signal main thread, wait for work ---
+                    with dispatch_cv:
+                        if not dispatch_active:
+                            q_rg.put(None)
+                            break
+                        need_dispatch = True
+                        dispatch_cv.notify()
+
+                    with dispatch_cv:
+                        while need_dispatch and dispatch_active:
+                            dispatch_cv.wait(timeout=1.0)
+                        if not dispatch_active:
+                            q_rg.put(None)
+                            break
+
+                    try:
+                        microbatch = q_er.get(timeout=0.5)
+                    except queue.Empty:
+                        if not dispatch_active:
+                            q_rg.put(None)
+                            break
+                        continue
 
                     with stats_lock:
                         q_er_size = max(0, q_er_size - 1)
@@ -2184,7 +2442,6 @@ class StandaloneRAGPipeline:
                     chunk_trace.append(
                         ChunkTraceEntry(
                             batch_index=embed_batch_counter[0],
-                            bucket=microbatch.bucket,
                             num_queries=int(chunk_stats.get("num_queries", len(microbatch.queries))),
                             num_chunked_queries=int(chunk_stats.get("num_chunked_queries", 0)),
                             total_chunks=int(chunk_stats.get("total_chunks", len(microbatch.queries))),
@@ -2193,9 +2450,9 @@ class StandaloneRAGPipeline:
                         )
                     )
                     self.logger.info(
-                        "[embed ] batch %d | size=%d bucket=%s xE=%s | emb=%.1fms | q_rg=%d",
+                        "[embed ] batch %d | size=%d xE=%s | emb=%.1fms | q_rg=%d",
                         embed_batch_counter[0], len(microbatch.queries),
-                        microbatch.bucket, target_backend,
+                        target_backend,
                         embedding_sec * 1000, q_rg_size,
                     )
                     payload = EmbeddingPayload(
@@ -2209,13 +2466,17 @@ class StandaloneRAGPipeline:
                         q_rg_size += 1
                         q_rg_max_seen = max(q_rg_max_seen, q_rg_size)
             except Exception as exc:  # pragma: no cover - runtime guard
-                error_queue.put(exc)
+                import traceback as _tb
+                _err = f"[embed ERROR] {type(exc).__name__}: {exc}\n{_tb.format_exc()}"
+                print(_err, flush=True)
+                error_queue.put(_err)
                 q_rg.put(None)
 
         retrieval_batch_counter = [0]
 
         def retrieval_worker() -> None:
             nonlocal q_rg_size
+            cpu_retrieval_stage = None  # lazy fallback when GPU retrieval OOMs
             try:
                 stage_cache: Dict[str, RetrievalStage] = {self.retrieval_backend: self.retrieval_stage}
                 while True:
@@ -2241,9 +2502,9 @@ class StandaloneRAGPipeline:
                     )
                     retrieval_batch_counter[0] += 1
                     self.logger.info(
-                        "[retriev] batch %d | size=%d bucket=%s xR=%s | ret=%.1fms",
+                        "[retriev] batch %d | size=%d xR=%s | ret=%.1fms",
                         retrieval_batch_counter[0], len(payload.microbatch.queries),
-                        payload.microbatch.bucket, target_backend,
+                        target_backend,
                         retrieval_sec * 1000,
                     )
                     q_out.put(
@@ -2255,7 +2516,10 @@ class StandaloneRAGPipeline:
                         )
                     )
             except Exception as exc:  # pragma: no cover - runtime guard
-                error_queue.put(exc)
+                import traceback as _tb
+                _err = f"[retrieval ERROR] {type(exc).__name__}: {exc}\n{_tb.format_exc()}"
+                print(_err, flush=True)
+                error_queue.put(_err)
                 q_out.put(None)
 
         def generation_worker() -> None:
@@ -2279,12 +2543,10 @@ class StandaloneRAGPipeline:
                         total_retrieval_sec += payload.retrieval_sec
                         total_generation_sec += generation_sec
                         total_generated_tokens += batch_tokens
-                        bucket_counts[payload.microbatch.bucket] = bucket_counts.get(payload.microbatch.bucket, 0) + 1
                         records.append(
                             BatchStats(
                                 batch_index=seen_batches,
                                 batch_size=len(payload.microbatch.queries),
-                                bucket=payload.microbatch.bucket,
                                 embedding_sec=payload.embedding_sec,
                                 retrieval_sec=payload.retrieval_sec,
                                 generation_sec=generation_sec,
@@ -2295,14 +2557,13 @@ class StandaloneRAGPipeline:
                         )
                         feedback_start = time.perf_counter()
                         self.scheduler._record_batch_feedback(
-                            bucket=payload.microbatch.bucket,
-                            x_e=int(payload.microbatch.action.get("xE", 0)),
-                            x_r=int(payload.microbatch.action.get("xR", 0)),
                             batch_size=len(payload.microbatch.queries),
                             token_lengths=payload.microbatch.token_lengths,
                             embedding_sec=payload.embedding_sec,
                             retrieval_sec=payload.retrieval_sec,
                             generation_sec=generation_sec,
+                            x_e=int(payload.microbatch.action.get("xE", 0)),
+                            x_r=int(payload.microbatch.action.get("xR", 0)),
                         )
                         scheduler_feedback_sec_total += time.perf_counter() - feedback_start
 
@@ -2316,7 +2577,6 @@ class StandaloneRAGPipeline:
                                         "query": query,
                                         "top_doc_snippet": (docs[0][:300] if docs else ""),
                                         "answer": answer,
-                                        "bucket": payload.microbatch.bucket,
                                         "action": payload.microbatch.action,
                                     }
                                 )
@@ -2337,11 +2597,10 @@ class StandaloneRAGPipeline:
                                 QPS=f"{qps:.2f}",
                             )
                             self.logger.info(
-                                "[gen   ] batch %d | size=%d bucket=%s | "
+                                "[gen   ] batch %d | size=%d | "
                                 "emb=%.1fms ret=%.1fms gen=%.1fms | "
                                 "queries=%d/%d QPS=%.2f ms/tok=%.2f | elapsed=%.1fs",
                                 seen_batches, len(payload.microbatch.queries),
-                                payload.microbatch.bucket,
                                 payload.embedding_sec * 1000,
                                 payload.retrieval_sec * 1000,
                                 generation_sec * 1000,
@@ -2350,7 +2609,10 @@ class StandaloneRAGPipeline:
                             )
                         pbar.update(len(payload.microbatch.queries))
             except Exception as exc:  # pragma: no cover - runtime guard
-                error_queue.put(exc)
+                import traceback as _tb
+                _err = f"[gen ERROR] {type(exc).__name__}: {exc}\n{_tb.format_exc()}"
+                print(_err, flush=True)
+                error_queue.put(_err)
 
         t_embed = threading.Thread(target=embed_worker, name="embed-worker", daemon=True)
         t_retrieval = threading.Thread(target=retrieval_worker, name="retrieval-worker", daemon=True)
@@ -2359,31 +2621,48 @@ class StandaloneRAGPipeline:
         t_retrieval.start()
         t_generation.start()
 
-        # Prime & dispatch all batches: for both async_plain and async_bucket, the scheduler's
-        # pending queue holds all remaining microbatches. We drain them all into q_er first,
-        # then send None. Embed_worker processes each batch sequentially without self-dispatch.
-        while self.scheduler.has_pending():
-            dispatch = self.scheduler.next_dispatch(
-                gpu_available=self.gpu_available,
-                gpu_mem_gb=self._detect_gpu_free_memory_gb(),
-                q_er_len=0,
-                q_rg_len=0,
-                long_ratio=bucket_long_ratio,
-            )
-            if dispatch is None:
-                break
-            action_key = (
-                f"xE{int(dispatch.action.get('xE', 0))}_"
-                f"xR{int(dispatch.action.get('xR', 0))}"
-            )
-            action_counts[action_key] = action_counts.get(action_key, 0) + 1
-            q_er.put(dispatch)
-            with stats_lock:
-                q_er_size += 1
-                q_er_max_seen = max(q_er_max_seen, q_er_size)
+        # Online dispatch loop: embed_worker signals when it needs the next batch.
+        with dispatch_cv:
+            while dispatch_active:
+                while not need_dispatch and dispatch_active:
+                    dispatch_cv.wait()
+                if not dispatch_active:
+                    break
 
-        # Sentinel: signals end of q_er stream.
-        q_er.put(None)
+                # async_plain: use pre-built batches directly (fixed xE, xR, b)
+                if pipeline_mode == "async_plain":
+                    if not scheduled_batches:
+                        dispatch_active = False
+                        need_dispatch = False
+                        q_er.put(None)
+                        break
+                    dispatch = scheduled_batches.pop(0)
+                else:
+                    dispatch = self.scheduler.next_dispatch(
+                        gpu_available=self.gpu_available,
+                        gpu_mem_gb=self._detect_gpu_free_memory_gb(),
+                        q_er_len=q_er_size,
+                        q_rg_len=q_rg_size,
+                        long_ratio=0.0,
+                    )
+                    if dispatch is None:
+                        dispatch_active = False
+                        need_dispatch = False
+                        q_er.put(None)
+                        break
+
+                action_key = (
+                    f"xE{int(dispatch.action.get('xE', 0))}_"
+                    f"xR{int(dispatch.action.get('xR', 0))}"
+                )
+                action_counts[action_key] = action_counts.get(action_key, 0) + 1
+                q_er.put(dispatch)
+                with stats_lock:
+                    q_er_size += 1
+                    q_er_max_seen = max(q_er_max_seen, q_er_size)
+                need_dispatch = False
+                dispatch_cv.notify()
+
         t_embed.join()
 
         t_retrieval.join()
@@ -2392,13 +2671,17 @@ class StandaloneRAGPipeline:
 
         if not error_queue.empty():
             first_error = error_queue.get()
-            raise RuntimeError(f"Async pipeline worker failed: {first_error}") from first_error
+            raise RuntimeError(f"Async pipeline worker failed: {first_error}") from None
 
         max_q_er = q_er_max_seen
         max_q_rg = q_rg_max_seen
 
         wall_time_sec = max(1e-9, time.perf_counter() - phase_start)
-        execution_mode = "async_threaded_pipeline_plain" if pipeline_mode == "async_plain" else "async_threaded_pipeline_bucket"
+        execution_mode = {
+            "serial": "serial_pipeline",
+            "async_plain": "async_threaded_pipeline_plain",
+            "async_v2": "async_threaded_pipeline_v2",
+        }.get(pipeline_mode, "unknown")
         return self._build_summary(
             mode=scheduler_mode,
             execution=execution_mode,
@@ -2408,7 +2691,6 @@ class StandaloneRAGPipeline:
             total_generated_tokens=total_generated_tokens,
             records=records,
             samples=samples,
-            bucket_counts=bucket_counts,
             action_counts=action_counts,
             max_q_er=max_q_er,
             max_q_rg=max_q_rg,
@@ -2461,6 +2743,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument(
+        "--fixed-action", action="store_true",
+        help="Fix (xE, xR) to the command-line specified values. "
+             "Disables online action selection so that each (xE, xR) can be "
+             "independently calibrated and compared."
+    )
     parser.add_argument("--vllm-enforce-eager", action="store_true")
     parser.add_argument(
         "--gpu-id",
@@ -2482,16 +2770,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pipeline-mode",
         type=str,
-        choices=["serial", "async_plain", "async_bucket"],
-        default="async_bucket",
+        choices=["serial", "async_plain", "async_v2"],
+        default="async_v2",
         help="Execution mode for comparison experiments.",
     )
-
-    parser.add_argument("--length-short-threshold", type=int, default=48)
-    parser.add_argument("--length-long-threshold", type=int, default=128)
-    parser.add_argument("--bucket-batch-short", type=int, default=64)
-    parser.add_argument("--bucket-batch-mid", type=int, default=32)
-    parser.add_argument("--bucket-batch-long", type=int, default=16)
 
     parser.add_argument("--embed-long-gpu-threshold", type=int, default=128)
     parser.add_argument("--retrieve-gpu-batch-threshold", type=int, default=64)
@@ -2536,29 +2818,69 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="Estimated FAISS index GPU memory footprint for scheduling decisions (default: 2.0 GiB).",
     )
+    parser.add_argument(
+        "--generator-model-layers",
+        type=int,
+        default=None,
+        help="Number of layers in the generator model for memory estimation. "
+             "Qwen2.5-3B: 28, Llama-3.1-8B: 32. Auto-detected if omitted.",
+    )
+    parser.add_argument(
+        "--generator-model-hidden",
+        type=int,
+        default=None,
+        help="Hidden dimension of the generator model for memory estimation. "
+             "Qwen2.5-3B: 2048, Llama-3.1-8B: 4096. Auto-detected if omitted.",
+    )
 
     parser.add_argument("--backpressure-high", type=int, default=8)
     parser.add_argument("--scheduler-ema-alpha", type=float, default=0.25)
     parser.add_argument(
-        "--scheduler-mode-choice",
-        type=str,
-        choices=["legacy_bucket", "generation_target_v1"],
-        default="legacy_bucket",
+        "--initial-batch-size",
+        type=int,
+        default=32,
+        help="Initial batch size for V2 scheduler. EMA will adapt from this starting point. (default: 32)",
     )
-    parser.add_argument("--enable-batch-shaping", action="store_true")
-    parser.add_argument("--ablate-bucketing", action="store_true")
     parser.add_argument("--ablate-online-batch", action="store_true")
     parser.add_argument("--ablate-online-action", action="store_true")
     parser.add_argument("--ablate-chunking", action="store_true")
+    parser.add_argument(
+        "--ema-params-path", type=str, default=None,
+        help="Path to JSON file for loading/saving EMA parameters. "
+             "When provided alone: load on startup (warm start). "
+             "Use with --save-ema-params to save after the run. "
+             "Example: --ema-params-path params/ema_gpu80.json --save-ema-params"
+    )
+    parser.add_argument(
+        "--save-ema-params", action="store_true",
+        help="Save all EMA parameters to --ema-params-path after the run completes. "
+             "Ignored if --ema-params-path is not set."
+    )
     return parser
 
 
 def main() -> None:
+    # Prevent broken MKL from loading in ALL processes (including spawned workers).
+    # Empty LD_PRELOAD means "load nothing extra", which avoids libmkl_avx2.so.
+    os.environ.setdefault("LD_PRELOAD", "")
+    os.environ.setdefault("MKL_THREADING_LAYER", "GNU")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+
     parser = build_parser()
     args = parser.parse_args()
 
     if args.gpu_id is not None and str(args.gpu_id).strip() != "":
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+
+    # Fix: force PyTorch to use OpenBLAS instead of broken MKL.
+    # Must be set BEFORE torch is imported in worker subprocesses.
+    os.environ["MKL_THREADING_LAYER"] = "GNU"
+    os.environ["OPENBLAS_NUM_THREADS"] = "4"
+    os.environ["OMP_NUM_THREADS"] = "4"
+    # Pre-initialize torch on the main thread with the correct BLAS backend.
+    import torch
+    torch.set_num_threads(4)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -2574,6 +2896,10 @@ def main() -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         logging.info("Saved summary to %s", output_path)
+
+    if getattr(args, "save_ema_params", False) and getattr(args, "ema_params_path", None):
+        pipeline.scheduler.save_ema_params(args.ema_params_path)
+        logging.info("Saved EMA parameters to %s", args.ema_params_path)
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
