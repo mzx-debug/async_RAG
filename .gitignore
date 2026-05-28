@@ -15,3 +15,5 @@ output/
 wandb/
 *.log
 .DS_Store
+indexes/beir_fiqa/
+indexes/beir_arguana/
