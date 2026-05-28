@@ -26,34 +26,59 @@ The core idea: embedding, retrieval, and generation are scheduled in a three-sta
 
 | Component | Version / Note |
 |-----------|---------------|
-| Python | >= 3.10 |
+| Python | >= 3.10 (Python 3.13 supported with CPU-only FAISS; see FAQ below) |
 | CUDA | 12.x (required by vLLM and PyTorch) |
-| GPU | 4–16 GB VRAM (tested on A10G 24 GB, RTX 3090 24 GB, T4 16 GB) |
+| GPU | 4–16 GB VRAM (tested on RTX 4090 Laptop 16 GB, RTX 3090 24 GB, T4 16 GB) |
 | Disk | ~5 GB for models + ~500 MB for BEIR datasets |
 | OS | Linux (tested on Ubuntu 22.04) |
 
-**Python environment must be activated with `source`** (not `conda activate`) to ensure `LD_LIBRARY_PATH` points to the correct CUDA version:
+### Setting up your Python environment
+
+This project requires **vLLM**, **PyTorch (CUDA)**, and **FAISS**. The recommended way is conda/venv.
 
 ```bash
-source ~/miniconda3/etc/profile.d/conda.sh && conda activate pytorch310
-# or: conda activate pytorch310
-# or if using system Python: pip install -r requirements.txt
+# 1. Create and activate a conda environment
+conda create -n async_rag python=3.10 -y
+conda activate async_rag
+
+# 2. Install PyTorch with CUDA (adjust version for your CUDA toolkit)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# 3. Install vLLM
+pip install vllm>=0.6.0
+
+# 4. Install remaining dependencies
+pip install -r requirements.txt
 ```
 
-> If you use a different conda environment, make sure `LD_LIBRARY_PATH` includes your CUDA `lib64` directory, e.g. `export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH`.
+If you already have a conda environment with vLLM installed, just activate it:
+
+```bash
+conda activate <your-env-name>
+# Verify CUDA is available:
+python -c "import torch; print(torch.cuda.is_available())"  # should print True
+```
+
+> **Conda activation:** Always use `conda activate` (or `source /path/to/conda/bin/activate` on some systems). The `LD_LIBRARY_PATH` must point to your CUDA `lib64` directory for vLLM to find CUDA libraries.
 
 ---
 
 ## Setup
 
 ```bash
-git clone https://github.com/mzx-debug/async_RAG.git
 cd async_RAG
 pip install -U pip
 pip install -r requirements.txt
 ```
 
-> **China mainland note:** HuggingFace downloads are slow. Set `HF_ENDPOINT=https://hf-mirror.com` before running any script that downloads models. The `async_rag_pipeline.py` sets this automatically at startup.
+> **China mainland note:** HuggingFace downloads are slow. Set `HF_ENDPOINT=https://hf-mirror.com` before running any script that downloads models:
+>
+> ```bash
+> export HF_ENDPOINT=https://hf-mirror.com
+> python async_rag_pipeline.py ...
+> ```
+>
+> The `async_rag_pipeline.py` and all Python wrapper scripts set this automatically at startup.
 
 ---
 
@@ -137,9 +162,7 @@ bash build_and_run.sh
 For single-mode runs (debugging or targeted experiments):
 
 ```bash
-source ~/miniconda3/etc/profile.d/conda.sh && conda activate pytorch310
-# or: conda activate pytorch310
-# or if using system Python: pip install -r requirements.txt
+source /home/cloudteam/Software/conda/bin/activate p702
 
 HF_ENDPOINT=https://hf-mirror.com python async_rag_pipeline.py \
   --xE 0 --xR 0 \
@@ -514,6 +537,8 @@ All datasets have real expert-written queries, real relevance judgments, and rea
 | 8–12 GB | `Qwen/Qwen2.5-3B-Instruct` | 0.80–0.90 |
 | 12–16 GB | `Qwen/Qwen2.5-7B-Instruct` | 0.50–0.70 |
 | 16–24 GB | `Qwen/Qwen2.5-7B-Instruct` | 0.80–0.90 |
+| RTX 4090 Laptop 16 GB | `Qwen/Qwen2.5-1.5B-Instruct` | 0.80 |
+| RTX 4090 Laptop 16 GB | `Qwen/Qwen2.5-3B-Instruct` | 0.60 (CPU retrieval `--xR 0`); use 0.45 for GPU retrieval `--xR 1` |
 
 ### Memory-aware scheduling
 
@@ -569,6 +594,64 @@ If `--xE 0` is too slow and you have free GPU memory, try `--xE 1`. Note that th
 ### "WARNING: destroy_process_group() was not called"
 
 This is a vLLM internal warning about process group cleanup. It is harmless and does not affect results. You can suppress it with `torch.distributed.destroy_process_group()` at the end of your script.
+
+### FlashInfer JIT build failure ("ninja build failed")
+
+When vLLM starts for the first time on a new host, it may try to JIT-compile FlashInfer kernels. This can fail if the build tools or include paths are missing. Symptoms:
+
+```
+RuntimeError: Ninja build failed... missing and no known rule to make it
+```
+
+**Fix:**
+
+```bash
+# Option 1: Clear the FlashInfer cache (forces re-JIT on next run)
+rm -rf ~/.cache/flashinfer/
+
+# Option 2: Install ninja build system
+pip install ninja
+# or: conda install -c conda-forge ninja
+
+# Option 3: Disable FlashInfer (vLLM will fall back to FlashAttention)
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+```
+
+### FAISS GPU retrieval fails with cublas error (xR=1)
+
+When using GPU retrieval (`--xR 1`) alongside a large generator model, you may see:
+
+```
+Faiss assertion 'err == CUBLAS_STATUS_SUCCESS' failed in runMatrixMult
+... cublas failed (13): (32, 384) x (N, 384)' = (32, N) gemm params
+RuntimeError: Faiss GPU error: failed to run GPU product
+```
+
+This means **vLLM has consumed too much GPU memory**, leaving insufficient VRAM for FAISS GPU matrix multiplication. This is NOT a FAISS bug — it's a resource contention issue.
+
+**Fix: give vLLM less GPU memory:**
+
+```bash
+# For Qwen2.5-3B-Instruct on 16 GB VRAM, use 0.4–0.5
+python async_rag_pipeline.py --gpu-memory-utilization 0.45 --xR 1 ...
+
+# Or use a smaller model
+python async_rag_pipeline.py --generator-model Qwen/Qwen2.5-1.5B-Instruct --gpu-memory-utilization 0.6 --xR 1 ...
+```
+
+**Note on async_v2 vs serial:** The `async_v2` scheduler's `ResourceTracker` detects OOM risk and skips infeasible (xE, xR) actions automatically. Serial and async_plain modes have **no such fallback** — they will crash if GPU memory is insufficient for the requested action. This is why `run_comparison.py` defaults to `--xE 0 --xR 0`.
+
+### "No module named 'faiss.swigfaiss_avx2'" (AVX2 warning)
+
+This warning is harmless. The code falls back to the non-AVX2 FAISS build automatically. No action needed.
+
+### NCCL process group warning on exit
+
+```
+[rank0]:[W...] Warning: destroy_process_group() was not called before program exit
+```
+
+This is a vLLM internal warning. It does not affect correctness. See the fix above under "WARNING: destroy_process_group()".
 
 ### Serial is faster than async_plain
 

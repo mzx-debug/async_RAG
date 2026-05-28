@@ -33,7 +33,7 @@ OUTPUT_DIR = SCRIPT_DIR / "output" / "auto_tune"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Conda environment path (used to inject CUDA environment variables)
-CONDA_PREFIX = os.environ.get("CONDA_PREFIX", sys.prefix)
+CONDA_PREFIX = "/home/cloudteam/Software/conda/envs/p702"
 
 
 def _get_python() -> str:

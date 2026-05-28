@@ -18,15 +18,42 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Activate conda environment (must use source activate, not conda activate)
-# Adapt the path to your conda installation
-if [ -n "${CONDA_PREFIX:-}" ] || ! python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-    if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-        source "$HOME/miniconda3/etc/profile.d/conda.sh" && conda activate pytorch310
-    elif [ -f "$HOME/miniconda/bin/activate" ]; then
-        source "$HOME/miniconda/bin/activate" pytorch310
-    elif [ -f "/usr/local/conda/etc/profile.d/conda.sh" ]; then
-        source /usr/local/conda/etc/profile.d/conda.sh && conda activate pytorch310
+# Auto-activate conda env that has vllm installed.
+# Tries in order: env from CONDA_DEFAULT_ENV, env from CONDA_ENV_PATH,
+# named envs that have vllm, or the first env with torch+cuda.
+if [ -z "${VLLM_ENV_SKIP_ACTIVATE:-}" ] && [ -z "${CONDA_PREFIX:-}" ]; then
+    if command -v conda &>/dev/null; then
+        _found_env=""
+        # 1. Look for an env that has vllm
+        for _env_path in $(conda env list --json 2>/dev/null | python3 -c "import sys,json; [print(e) for e in json.load(sys.stdin)['envs']]" 2>/dev/null); do
+            if [ -f "$_env_path/bin/python" ] && "$_env_path/bin/python" -c "import vllm" 2>/dev/null; then
+                _found_env="$_env_path"
+                break
+            fi
+        done
+        # 2. Fallback: try common env names
+        if [ -z "$_found_env" ]; then
+            for _name in p702 rag async_rag vllm pytorch; do
+                _env_path="$(conda env list --json 2>/dev/null | python3 -c "import sys,json; envs=json.load(sys.stdin)['envs']; print(next((e for e in envs if e.endswith('/$_name') or e == '$_name'), ''))" 2>/dev/null)"
+                if [ -n "$_env_path" ] && [ -f "$_env_path/bin/python" ]; then
+                    _found_env="$_env_path"
+                    break
+                fi
+            done
+        fi
+        if [ -n "$_found_env" ]; then
+            echo "[ENV] Auto-activating conda env: $_found_env"
+            source activate "$_found_env"
+        else
+            echo "[ENV] WARNING: Could not auto-detect a conda env with vllm."
+            echo "        Please activate your vllm environment manually, e.g.:"
+            echo "        conda env list"
+            echo "        conda activate <your-env-name>"
+            echo "        Then re-run this script."
+            exit 1
+        fi
+    else
+        echo "[ENV] WARNING: conda not found. Ensure vllm, torch (cuda), and faiss-cpu are installed in your current Python environment."
     fi
 fi
 
@@ -114,7 +141,7 @@ python run_comparison.py \
     --queries-file "$QUERIES_OUT" \
     --sample-queries "$SAMPLE_QUERIES" \
     --b "$BATCH" \
-    --xE 1 --xR 0 \
+    --xE 0 --xR 0 \
     --nprobe 1 --topk 1 \
     --gpu-id "$GPU_ID" \
     --gpu-memory-utilization "$GPU_UTIL" \

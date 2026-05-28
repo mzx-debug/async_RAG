@@ -16,7 +16,8 @@ def run_one(mode: str, script: Path, base_args: List[str], out_dir: Path, prefix
     import os
     env = os.environ.copy()
     env["HF_ENDPOINT"] = "https://hf-mirror.com"
-    proc = subprocess.run(cmd, text=True, env=env)
+    conda_python = "/home/cloudteam/Software/conda/envs/p702/bin/python"
+    proc = subprocess.run([conda_python] + cmd[1:], text=True, env=env)
     if proc.returncode != 0:
         raise RuntimeError(f"Mode {mode} failed with code {proc.returncode}")
     if not out_path.exists():
@@ -84,7 +85,7 @@ def main() -> None:
                              "Example: ./data/beir_nfcorpus/queries.jsonl")
     parser.add_argument("--sample-queries", type=int, default=256)
     parser.add_argument("--b", type=int, default=32)
-    parser.add_argument("--xE", type=int, default=1)
+    parser.add_argument("--xE", type=int, default=0)
     parser.add_argument("--xR", type=int, default=0)
     parser.add_argument("--nprobe", type=int, default=1,
                         help="FAISS nprobe for IVF index, or 1 for Flat index (default: 1)")
@@ -128,17 +129,30 @@ def main() -> None:
     if args.ema_params_path:
         base_args += ["--ema-params-path", str(args.ema_params_path)]
 
-    # Run with CPU retrieval (xR=0) and GPU retrieval (xR=1).
-    # Each retrieval config runs serial, async_plain, async_v2.
-    modes_by_retrieval = {
-        "cpu_retrieval": {"xR": 0, "modes": ["serial", "async_plain", "async_v2"]},
-        "gpu_retrieval": {"xR": 1, "modes": ["serial", "async_plain", "async_v2"]},
-    }
+    # GPU retrieval (xR=1) only runs if explicitly requested AND --gpu-memory-utilization
+    # is low enough to leave room for FAISS GPU operations alongside vLLM.
+    # On < 10 GB VRAM with Qwen2.5-3B-Instruct, this WILL OOM (cublas error).
+    # async_v2 avoids this because GreedyScheduler skips infeasible actions, but
+    # serial/async_plain have no such fallback.
+    gpu_retrieval_modes = ["serial", "async_plain", "async_v2"]
+    if args.xR == 1:
+        gpu_retrieval_modes = ["serial", "async_plain", "async_v2"]
+        print("  [NOTE] GPU retrieval (xR=1) enabled. If you see OOM errors, "
+              "reduce --gpu-memory-utilization or use --xR 0")
+    else:
+        gpu_retrieval_modes = []
+    modes_by_retrieval = [
+        ("cpu_retrieval", 0, ["serial", "async_plain", "async_v2"]),
+        ("gpu_retrieval", 1, gpu_retrieval_modes),
+    ]
 
     rows = []
-    for group_name, group_cfg in modes_by_retrieval.items():
-        xR_val = group_cfg["xR"]
-        modes = group_cfg["modes"]
+    for group_name, xR_val, modes in modes_by_retrieval:
+        if not modes:
+            print(f"\n{'='*60}")
+            print(f"  {group_name.upper()} (xR={xR_val}) — SKIPPED (use --xR 1 to enable)")
+            print(f"{'='*60}")
+            continue
         print(f"\n{'='*60}")
         print(f"  {group_name.upper()} (xR={xR_val})")
         print(f"{'='*60}")
