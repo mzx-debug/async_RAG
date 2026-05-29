@@ -894,8 +894,10 @@ class GreedyScheduler:
         self._startup_base_ema: Dict[Tuple[int, int], float] = {}
         self._startup_k_ema: Dict[Tuple[int, int], float] = {}
         self._er_base_overhead_ema: float = 0.0       # ms (E+R combined base overhead)
-        self._wall_time_measurements: Dict[Tuple[int, int], List[Tuple[int, float]]] = {}
+        self._wall_time_measurements: Dict[Tuple[int, int], List[Tuple[int, float, float]]] = {}
         self._overlap_factor_ema: Dict[Tuple[int, int], float] = {}  # 0.0 = full parallel, 1.0 = sequential
+        self._contention_ema: Dict[Tuple[int, int], float] = {}     # obs/pred ratio per (xE, xR)
+        self._gen_prefill_per_token_ema: Dict[Tuple[int, int], float] = {}  # ms/token per (xE, xR)
         # Per-action best batch size (EMA-adapted)
         self._best_batch_size_by_action: Dict[Tuple[int, int], int] = {}
         # V2: single unified pending pool sorted by token_length (ascending)
@@ -907,10 +909,12 @@ class GreedyScheduler:
         self.device_plan_trace: List[DevicePlanTraceEntry] = []
         self.batch_shaping_trace: List[BatchShapingTraceEntry] = []
 
-        # gen_per_query warm-start: from benchmark, gen_time = 1170 + 28.2 × bs (ms)
-        self._gen_base_overhead_ema[(0, 0)] = 1170.0   # ms, fixed overhead (prefill + kernel launch)
-        self._gen_per_query_ema[(0, 0)] = 28.2          # ms/q, marginal generation cost per query
-        self._wall_time_measurements[(0, 0)] = []  # must match: if key not in gen_base → init; else → append
+        # gen_per_query warm-start: from benchmark, gen_q = 2072/B + 57.1 (ms/q)
+        self._gen_base_overhead_ema[(0, 0)] = 2072.0   # ms, fixed prefill overhead
+        self._gen_per_query_ema[(0, 0)] = 57.1          # ms/q, marginal cost
+        self._wall_time_measurements[(0, 0)] = []
+        self._contention_ema[(0, 0)] = 1.0            # seeded at 1.0, updated online
+        self._gen_prefill_per_token_ema[(0, 0)] = 0.0  # only non-zero if L_in variance was high
 
     @staticmethod
     def _estimate_query_length(query: str) -> int:
@@ -1070,77 +1074,37 @@ class GreedyScheduler:
         """
         Wall-time cost model: score = estimated wall time per query in ms.
 
-        Score = wall_single / batch_size = throughput (lower = better QPS).
-        Does NOT depend on pending_queries, so score is stable across dispatches.
+        gen_q = P_fixed / B + D_fixed + C_tok * L̄_in
 
-        Pipeline model:
-          wall_single = wall time of a single dispatch = combine(gen_time, emb_ret_time)
-          gen_time[(xE,xR)] = gen_base[(xE,xR)] + gen_per_query[(xE,xR)] * batch_size
-            (LLM inference: prefill + decode both scale linearly with batch_size under continuous batching)
-          emb_ret_time = er_base + (emb_per_q[xE] + ret_per_q[xR]) * batch_size
-
-        Pipeline overlap (how gen and E+R combine into wall_single):
-          xE=0: CPU embed runs on CPU while GPU does ret+gen → full parallel → max(gen, er)
-          xE=1: GPU embed competes with gen → partial overlap → gen + er * overlap_factor
-          overlap_factor is EMA-calibrated per (xE, xR).
+        Pipeline overlap (E+R vs gen on different devices):
+          xE=0: CPU E+R is fully parallel to GPU gen → wall_single = max(gen_time, er_time)
+          xE=1: GPU E+R contends with gen → wall_single = gen_time + er_time * overlap
         """
         key = (x_e, x_r)
-        gen_base = self._gen_base_overhead_ema.get(key, 0.0)
-        gen_per_q = self._gen_per_query_ema.get(key, None)
-        er_base = self._er_base_overhead_ema
+        B = max(1, batch_size)
+        L_in_avg = 30.0  # default; overridden if lengths available
 
-        emb_per_q = self._embedding_latency_ema_ms_per_query.get(x_e, None)
-        ret_per_q = self._retrieval_latency_ema_ms_per_query.get(x_r, None)
+        P = self._gen_base_overhead_ema.get(key, 2072.0)   # ms (fixed prefill/launch)
+        D = self._gen_per_query_ema.get(key, 57.1)          # ms/q
+        C_tok = getattr(self, '_gen_prefill_per_token_ema', 0.0)  # ms/token (only if fitted)
+        cont = self._contention_ema.get(key, 1.0)
 
-        if gen_base <= 0 or gen_per_q is None or gen_per_q <= 0 or emb_per_q is None or ret_per_q is None:
-            # Bootstrap from any available (xE, xR) key — gen_per_query is roughly
-            # action-agnostic (vLLM overhead), only the base varies.
-            bootstrap_key = next(
-                (k for k in self._gen_per_query_ema if self._gen_per_query_ema[k] > 0), None
-            )
-            if bootstrap_key is not None:
-                gen_base = self._gen_base_overhead_ema.get(bootstrap_key, 1170.0)
-                gen_per_q = self._gen_per_query_ema.get(bootstrap_key, 28.2)
-                emb_per_q = self._embedding_latency_ema_ms_per_query.get(x_e, 2.0)
-                ret_per_q = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.15)
-            else:
-                return self._estimate_dispatch_cost_legacy(batch_size, x_e, x_r)
+        # Per-query generation time (ms/q)
+        gen_q = (P / B + D + C_tok * L_in_avg) * cont
 
-        # Linear gen_time model: gen = gen_base + gen_per_q × batch_size
-        gen_time = gen_base + gen_per_q * batch_size
+        # Embedding + retrieval per-query time (ms/q)
+        emb_q = self._embedding_latency_ema_ms_per_query.get(x_e, 1.5)
+        ret_q = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.15)
+        er_q = emb_q + ret_q
 
-        emb_ret_time = er_base + (emb_per_q + ret_per_q) * batch_size
+        # Pipeline overlap
+        if x_e == 0:
+            wall_single = max(gen_q, er_q)   # parallel on different devices
+        else:
+            overlap = self._overlap_factor_ema.get(key, 0.5)
+            wall_single = gen_q + er_q * overlap   # contended
 
-        # Pipeline overlap: EMA-calibrated overlap factor
-        overlap_key = (x_e, x_r)
-        overlap_factor = self._overlap_factor_ema.get(overlap_key, None)
-        if overlap_factor is None:
-            # Default: xE=0 = full parallel, xE=1 = sequential
-            overlap_factor = 0.0 if x_e == 0 else 1.0
-
-        wall_single = gen_time + emb_ret_time * overlap_factor
-
-        # GPU contention penalty: when embedding runs on GPU (xE=1), it competes with
-        # generation for compute resources. This slows gen_time slightly.
-        # Empirical: (1,0) is ~0.98x of (0,0), (0,1) is ~1.03x (GPU ret overhead),
-        # (1,1) is worst (~1.15x) because both E+R and retrieval contend on GPU.
-        contention_multiplier = 1.0
-        if x_e == 1 and x_r == 0:
-            contention_multiplier = 8381.0 / 8391.0  # ~0.999x (GPU embed barely affects gen)
-        elif x_e == 0 and x_r == 1:
-            contention_multiplier = 8645.0 / 8391.0  # ~1.030x (GPU retrieval adds ~3%)
-        elif x_e == 1 and x_r == 1:
-            contention_multiplier = 1.20  # estimated: embed + retrieval contention
-        wall_single *= contention_multiplier
-
-        # If overlap_factor is 0 (full parallel), max(gen, er) is more accurate
-        if overlap_factor == 0.0:
-            wall_single = max(gen_time, emb_ret_time) * contention_multiplier
-
-        # Score = wall time per query = wall_single / batch_size
-        # This is throughput: lower score = higher QPS = better.
-        # Note: does NOT depend on pending_queries, so the score is stable across dispatches.
-        return wall_single / max(1, batch_size)
+        return wall_single
 
     def _estimate_dispatch_cost_legacy(
         self,
@@ -1165,31 +1129,32 @@ class GreedyScheduler:
         x_r: int,
     ) -> float:
         """
-        Per-query wall time estimate using the calibrated wall-time model.
+        Per-query wall time estimate: gen_q = P/B + D + C_tok * L̄_in, then pipeline overlap.
 
-        wall_single = max(gen_time, er_time)    for xE=0 (E+R parallel to G on different devices)
-                      gen_time + er_time * overlap_factor  for xE=1 (GPU contention)
-
-        gen_time  = gen_base + gen_per_query * batch_size
-        er_time   = er_base  + (emb_per_q + ret_per_q) * batch_size
+        gen_q = (P_fixed / B + D_fixed + C_tok * L̄_in) * contention
+        er_q  = emb_q + ret_q
+        xE=0: wall = max(gen_q, er_q)
+        xE=1: wall = gen_q + er_q * overlap
         """
         key = (x_e, x_r)
-        gen_base = self._gen_base_overhead_ema.get(key, 1170.0)
-        gen_per_q = self._gen_per_query_ema.get(key, 28.2)
-        gen_time = gen_base + gen_per_q * max(1, batch_size)
+        B = max(1, batch_size)
+        L_avg = float(sum(lengths) / len(lengths)) if lengths else 30.0
 
-        emb_lat = self._embedding_latency_ema_ms_per_query.get(x_e, 2.0)
-        ret_lat = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.15)
-        er_base = self._er_base_overhead_ema
-        er_time = er_base + (emb_lat + ret_lat) * max(1, batch_size)
+        P = self._gen_base_overhead_ema.get(key, 2072.0)
+        D = self._gen_per_query_ema.get(key, 57.1)
+        C_tok = getattr(self, '_gen_prefill_per_token_ema', 0.0)
+        cont = self._contention_ema.get(key, 1.0)
+
+        gen_q = (P / B + D + C_tok * L_avg) * cont
+        emb_q = self._embedding_latency_ema_ms_per_query.get(x_e, 1.5)
+        ret_q = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.15)
+        er_q = emb_q + ret_q
 
         if x_e == 0:
-            wall_single = max(gen_time, er_time)
+            return max(gen_q, er_q)
         else:
             overlap = self._overlap_factor_ema.get(key, 0.5)
-            wall_single = gen_time + er_time * overlap
-
-        return wall_single / max(1, batch_size)
+            return gen_q + er_q * overlap
 
     def _estimate_dispatch_cost(
         self,
@@ -1327,35 +1292,48 @@ class GreedyScheduler:
         # --- Compute observed timings (all per-query for consistent comparison) ---
         key = (x_e, x_r)
         B = max(1, batch_size)
-        P_fixed = self._gen_base_overhead_ema.get(key, 2072.0)
-        D_fixed = self._gen_per_query_ema.get(key, 57.1)
+        L_avg = sum(token_lengths) / len(token_lengths) if token_lengths else 0.0
         observed_gen_per_q = generation_sec * 1000.0 / B  # ms per query
-        L_sum = sum(token_lengths) if token_lengths else 0
 
-        # --- Adaptive max_batch_size: update toward larger B if gen dominates ---
-        model_gen_per_q = P_fixed / B + D_fixed
-        if model_gen_per_q > 0:
-            ratio = observed_gen_per_q / model_gen_per_q
-            if ratio < 2.0:
-                if key not in self._best_batch_size_by_action:
-                    self._best_batch_size_by_action[key] = B
-                else:
-                    alpha = self.ema_alpha
-                    self._best_batch_size_by_action[key] = int(
-                        alpha * B + (1.0 - alpha) * self._best_batch_size_by_action[key]
-                    )
+        # --- Update P and D via two-point fitting when we have >= 2 observations ---
+        if key not in self._wall_time_measurements:
+            self._wall_time_measurements[key] = []
+        self._wall_time_measurements[key].append((B, observed_gen_per_q, L_avg))
 
-        # --- Model calibration: observed vs predicted gen per-query ---
-        # ratio = observed / predicted
-        # This single factor absorbs both model-size mismatch and genuine GPU contention.
-        # The first update seeds contention to the raw ratio (no prior bias).
-        gen_predicted_per_q = P_fixed / B + D_fixed
-        if gen_predicted_per_q > 0 and observed_gen_per_q > 0:
-            ratio = observed_gen_per_q / gen_predicted_per_q
+        # Keep only last 20 observations
+        if len(self._wall_time_measurements[key]) > 20:
+            self._wall_time_measurements[key] = self._wall_time_measurements[key][-20:]
+
+        obs = self._wall_time_measurements[key]
+        if len(obs) >= 2:
+            # Two-point fit: obs_q = P/B + D + C_tok * L_avg
+            # With fixed C_tok=0 (no per-token fit unless variance is high)
+            b1, g1, _ = obs[0]
+            b2, g2, _ = obs[-1]
+            denom = (1.0/b2 - 1.0/b1)
+            if abs(denom) > 1e-9:
+                P_new = (g2 - g1) / denom
+                D_new = g1 - P_new / b1
+                P_new = max(0.0, P_new)
+                D_new = max(0.0, D_new)
+                alpha = self.ema_alpha
+                old_P = self._gen_base_overhead_ema.get(key, P_new)
+                old_D = self._gen_per_query_ema.get(key, D_new)
+                self._gen_base_overhead_ema[key] = alpha * P_new + (1 - alpha) * old_P
+                self._gen_per_query_ema[key] = alpha * D_new + (1 - alpha) * old_D
+
+        # Current model parameters (may have just been updated above)
+        P_cur = self._gen_base_overhead_ema.get(key, 2072.0)
+        D_cur = self._gen_per_query_ema.get(key, 57.1)
+        pred_gen_per_q = P_cur / B + D_cur
+
+        # --- Contention ratio: observed / predicted ---
+        # Absorbs genuine GPU contention + any residual model mismatch
+        if pred_gen_per_q > 0 and observed_gen_per_q > 0:
+            ratio = observed_gen_per_q / pred_gen_per_q
             alpha = self.ema_alpha
             prev = self._contention_ema.get(key, None)
             if prev is None:
-                # First observation — seed directly with the observed ratio
                 self._contention_ema[key] = ratio
             else:
                 self._contention_ema[key] = alpha * ratio + (1.0 - alpha) * prev
@@ -1387,6 +1365,7 @@ class GreedyScheduler:
                     "max_batch_size_ema": self._max_batch_size_ema,
                     f"gen_base_({x_e},{x_r})": self._gen_base_overhead_ema.get((x_e, x_r), 0.0),
                     f"gen_per_query_({x_e},{x_r})": self._gen_per_query_ema.get((x_e, x_r), 0.0),
+                    f"contention_({x_e},{x_r})": self._contention_ema.get((x_e, x_r), 1.0),
                     "er_base_overhead_ema": self._er_base_overhead_ema,
                     f"overlap_factor_({x_e},{x_r})": self._overlap_factor_ema.get((x_e, x_r), None),
                 },
@@ -1542,6 +1521,8 @@ class GreedyScheduler:
         return {
             "gen_base_overhead_ema": {f"({xe},{xr})": v for (xe, xr), v in self._gen_base_overhead_ema.items()},
             "gen_per_query_ema": {f"({xe},{xr})": v for (xe, xr), v in self._gen_per_query_ema.items()},
+            "gen_prefill_per_token_ema": {f"({xe},{xr})": v for (xe, xr), v in getattr(self, '_gen_prefill_per_token_ema', {}).items()},
+            "contention_ema": {f"({xe},{xr})": v for (xe, xr), v in self._contention_ema.items()},
             "er_base_overhead_ema": self._er_base_overhead_ema,
             "embedding_latency_ema": {f"{xe}": v for xe, v in self._embedding_latency_ema_ms_per_query.items()},
             "retrieval_latency_ema": {f"{xr}": v for xr, v in self._retrieval_latency_ema_ms_per_query.items()},
@@ -1587,6 +1568,18 @@ class GreedyScheduler:
             "best_batch_size_by_action": {
                 f"({xe},{xr})": v
                 for (xe, xr), v in self._best_batch_size_by_action.items()
+            },
+            "best_batch_size_by_action": {
+                f"({xe},{xr})": v
+                for (xe, xr), v in self._best_batch_size_by_action.items()
+            },
+            "gen_prefill_per_token_ema": {
+                f"({xe},{xr})": v
+                for (xe, xr), v in getattr(self, '_gen_prefill_per_token_ema', {}).items()
+            },
+            "contention_ema": {
+                f"({xe},{xr})": v
+                for (xe, xr), v in self._contention_ema.items()
             },
             "wall_time_measurements": {
                 f"({xe},{xr})": ms
@@ -1643,7 +1636,14 @@ class GreedyScheduler:
                 parts = k_str[1:-1].split(",")
                 if len(parts) == 2:
                     self._best_batch_size_by_action[(int(parts[0].strip()), int(parts[1].strip()))] = int(v)
-        # wall_time_measurements: restore as list of (batch_size, gen_time)
+        # contention_ema: per (xE, xR) ratio
+        self._contention_ema = parse_tuple_key(raw, "contention_ema")
+        # gen_prefill_per_token_ema: per (xE, xR) ms/token
+        raw_tok = parse_tuple_key(raw, "gen_prefill_per_token_ema")
+        if not hasattr(self, '_gen_prefill_per_token_ema'):
+            self._gen_prefill_per_token_ema: Dict[Tuple[int, int], float] = {}
+        self._gen_prefill_per_token_ema = raw_tok
+        # wall_time_measurements: restore as list of (batch_size, gen_q_ms, L_avg)
         raw_ms = raw.get("wall_time_measurements", {})
         self._wall_time_measurements = {}
         for k_str, ms_list in raw_ms.items():
@@ -1653,7 +1653,8 @@ class GreedyScheduler:
                 if len(parts) == 2:
                     key = (int(parts[0].strip()), int(parts[1].strip()))
                     self._wall_time_measurements[key] = [
-                        (int(item[0]), float(item[1])) for item in ms_list
+                        (int(item[0]), float(item[1]), float(item[2]) if len(item) > 2 else 0.0)
+                        for item in ms_list
                     ]
         self._feasible_actions_ema = {}
         for k_str, v in raw.get("feasible_actions", {}).items():

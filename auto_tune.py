@@ -6,9 +6,10 @@ Run this FIRST on any new device. It:
   1. Auto-detects GPU model and VRAM
   2. Selects an appropriate generator model and GPU memory utilization
   3. Feasibility-tests each (xE, xR) combination
-  4. Runs a calibration sweep (multiple batch sizes) for each feasible action
-  5. Fits gen = gen_base + gen_per_q × batch_size
-  6. Saves a ready-to-use EMA parameters file and a tuning report
+  4. Feasibility-tests each (xE, xR) combination
+  5. Runs a calibration sweep (multiple batch sizes) for each feasible action
+  6. Fits gen_q = P_fixed/B + D_fixed (+ C_tok * L_in when variance is high)
+  7. Saves a ready-to-use EMA parameters file and a tuning report
 
 Usage:
     python auto_tune.py                                   # auto-detect device, sweep all actions
@@ -274,14 +275,22 @@ def extract_calibration_data(json_path: Path) -> Optional[Dict]:
         return None
 
 
-# ── Linear fitting ─────────────────────────────────────────────────────────────
+# ── Hyperbolic (two-segment) fitting ──────────────────────────────────────────
 
-def fit_linear(points: List[Tuple[float, float]]) -> Tuple[float, float, float]:
-    """Fit y = a + b*x. Returns (a, b, r_squared)."""
+def fit_hyperbolic(points: List[Tuple[float, float]]) -> Tuple[float, float, float]:
+    """
+    Fit gen_q = P/B + D  (gen per query, ms/q).
+
+    Input points: [(B, gen_total_ms), ...]
+    Returns (P, D, r_squared).
+    - P (ms): fixed prefill/launch overhead
+    - D (ms/q): marginal per-query decode cost
+    """
     if len(points) < 2:
         return 0.0, 0.0, 0.0
 
     n = len(points)
+    # We need to solve for P, D in: gen_total = P + D * B
     sx = sum(p[0] for p in points)
     sy = sum(p[1] for p in points)
     sxy = sum(p[0] * p[1] for p in points)
@@ -291,15 +300,61 @@ def fit_linear(points: List[Tuple[float, float]]) -> Tuple[float, float, float]:
     if abs(denom) < 1e-9:
         return 0.0, 0.0, 0.0
 
-    b_coef = (n * sxy - sx * sy) / denom
-    a_coef = (sy - b_coef * sx) / n
+    D = (n * sxy - sx * sy) / denom   # slope = D
+    P = (sy - D * sx) / n             # intercept = P
+
+    P = max(0.0, P)
+    D = max(0.0, D)
 
     y_mean = sy / n
     ss_tot = sum((p[1] - y_mean) ** 2 for p in points)
-    ss_res = sum((p[1] - (a_coef + b_coef * p[0])) ** 2 for p in points)
+    ss_res = sum((p[1] - (P + D * p[0])) ** 2 for p in points)
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
-    return max(0.0, a_coef), max(0.0, b_coef), r2
+    return P, D, r2
+
+
+def calibrate_action(
+    data: Dict,
+    L_in_variance_threshold: float = 10.0,
+) -> Dict:
+    """
+    Calibrate gen_q = P/B + D  (two-segment model).
+
+    Returns dict with P_fixed, D_fixed, best_batch_size, best_score,
+    and optionally P_per_token if input-length variance is high enough.
+    """
+    points_raw = [(pt["batch_size"], pt["gen_total_ms"]) for pt in data["points"]]
+    if not points_raw:
+        return {"P_fixed": 0.0, "D_fixed": 0.0, "P_per_token": 0.0,
+                "best_batch_size": 4, "best_score": 0.0}
+
+    P, D, r2 = fit_hyperbolic(points_raw)
+
+    # P_per_token: fit only if L_in variance is high (nfcorpus is too uniform ~3-38)
+    L_in_avg = 30.0  # default; from data["points"][0].get("L_in_avg", 30.0)
+    P_tok = 0.0
+    if len(points_raw) >= 2:
+        b1, g1 = points_raw[0]
+        b2, g2 = points_raw[1]
+        gq1, gq2 = g1 / b1, g2 / b2
+        denom = (1.0 / b2 - 1.0 / b1)
+        if abs(denom) > 1e-9:
+            P_tok = max(0.0, (gq2 - gq1) / denom)
+
+    # Best batch size: minimize gen_q = P/B + D
+    batch_sizes = [pt["batch_size"] for pt in data["points"]]
+    best_bs = min(batch_sizes, key=lambda b: P / b + D) if P > 0 or D > 0 else 4
+    best_score = P / best_bs + D if best_bs > 0 else 0.0
+
+    return {
+        "P_fixed": P,
+        "D_fixed": D,
+        "P_per_token": P_tok,
+        "r2": r2,
+        "best_batch_size": best_bs,
+        "best_score": best_score,
+    }
 
 
 # ── Reporting ─────────────────────────────────────────────────────────────────
@@ -309,10 +364,16 @@ def build_ema_params(
     gpu_util: float,
     model: str,
 ) -> Dict:
-    """Build a ready-to-use EMA params JSON from calibration results."""
+    """Build a ready-to-use EMA params JSON from calibration results.
+
+    gen_q = (P/B + D) * contention_ema
+    contention_ema is seeded at 1.0 per (xE, xR) and updated online.
+    """
     ema = {
-        "gen_base_overhead_ema": {},
-        "gen_per_query_ema": {},
+        "gen_base_overhead_ema": {},   # P_fixed per (xE, xR)
+        "gen_per_query_ema": {},        # D_fixed per (xE, xR)
+        "gen_prefill_per_token_ema": {},  # C_tok per (xE, xR), 0 if not fitted
+        "contention_ema": {},          # contention ratio per (xE, xR)
         "er_base_overhead_ema": 0.0,
         "embedding_latency_ema": {},
         "retrieval_latency_ema": {},
@@ -331,13 +392,16 @@ def build_ema_params(
         if not data.get("feasible"):
             continue
 
-        gen_base = data["gen_base"]
-        gen_per_q = data["gen_per_q"]
+        P_fixed = data.get("P_fixed", data.get("gen_base", 0.0))
+        D_fixed = data.get("D_fixed", data.get("gen_per_q", 0.0))
+        P_tok = data.get("P_per_token", 0.0)
         emb_per_q = data["emb_per_q"]
         ret_per_q = data["ret_per_q"]
 
-        ema["gen_base_overhead_ema"][key] = gen_base
-        ema["gen_per_query_ema"][key] = gen_per_q
+        ema["gen_base_overhead_ema"][key] = P_fixed   # P (ms)
+        ema["gen_per_query_ema"][key] = D_fixed        # D (ms/q)
+        ema["gen_prefill_per_token_ema"][key] = P_tok  # C_tok (ms/token), may be 0
+        ema["contention_ema"][key] = 1.0              # seeded, updated online
         ema["embedding_latency_ema"][str(xE)] = emb_per_q
         ema["retrieval_latency_ema"][str(xR)] = ret_per_q
         ema["overlap_factor_ema"][key] = 0.0
@@ -413,8 +477,10 @@ def print_report(
             continue
 
         row("Status", "OK")
-        row("gen_base", f"{data['gen_base']:.0f} ms")
-        row("gen_per_q", f"{data['gen_per_q']:.1f} ms/q")
+        row("P_fixed (ms)", f"{data['P_fixed']:.0f}")
+        row("D_fixed (ms/q)", f"{data['D_fixed']:.1f}")
+        if data.get("P_per_token", 0) > 0:
+            row("P_per_token (ms/tok)", f"{data['P_per_token']:.4f}")
         row("emb_per_q", f"{data['emb_per_q']:.2f} ms/q")
         row("ret_per_q", f"{data['ret_per_q']:.3f} ms/q")
         row("R²", f"{data['r2']:.6f}")
@@ -436,12 +502,14 @@ def print_report(
         row("Best bs:", f"{data['best_batch_size']} (score={data['best_score']:.1f} ms/q)")
 
         lines.append("")
-        lines.append("  Predicted score at different batch sizes:")
+        lines.append("  Predicted gen_q at different batch sizes (gen_q = P/B + D):")
+        P = data["P_fixed"]
+        D = data["D_fixed"]
         for bs_t in [1, 4, 16, 32, 64, 128, 256]:
-            pred = data["gen_base"] + data["gen_per_q"] * bs_t
-            score = pred / bs_t
+            pred = P / bs_t + D
+            score = pred
             marker = " ← best" if bs_t == data["best_batch_size"] else ""
-            row(f"  b={bs_t:>3}: gen={pred:>7.0f}ms, score={score:>6.1f}ms/q{marker}")
+            lines.append(f"    b={bs_t:>3}: gen_q={pred:>7.1f}ms/q{marker}")
 
         lines.append("")
 
@@ -502,7 +570,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="One-shot calibration for the Async RAG pipeline. "
                     "Detects your GPU, selects an appropriate model, runs calibration "
-                    "sweeps for each feasible (xE, xR) action, fits the linear cost model, "
+                    "sweeps for each feasible (xE, xR) action, fits gen_q = P/B + D, "
                     "and saves ready-to-use EMA parameters."
     )
     parser.add_argument(
@@ -678,33 +746,30 @@ def main():
 
             time.sleep(1)
 
-        # Fit linear model
-        if len(all_points) >= 2:
-            gen_base, gen_per_q, r2 = fit_linear(all_points)
-        elif len(all_points) == 1:
-            bs, gen = all_points[0]
-            gen_base = 0.0
-            gen_per_q = gen / bs
-            r2 = 1.0
-        else:
-            gen_base, gen_per_q, r2 = 0.0, 0.0, 0.0
+        # Fit hyperbolic model: gen_q = P/B + D  →  gen_total = P + D*B
+        calib = calibrate_action({"points": [
+            {"batch_size": bs, "gen_total_ms": gt}
+            for bs, gt in all_points
+        ]})
+
+        P_fixed = calib["P_fixed"]
+        D_fixed = calib["D_fixed"]
+        P_tok = calib["P_per_token"]
+        r2 = calib["r2"]
+        best_bs = calib["best_batch_size"]
+        best_score = calib["best_score"]
 
         # Average emb/ret per query
         emb_per_q = sum(emb_per_q_samples) / len(emb_per_q_samples) if emb_per_q_samples else 2.0
         ret_per_q = sum(ret_per_q_samples) / len(ret_per_q_samples) if ret_per_q_samples else 0.15
 
-        # Find best batch size
-        if gen_per_q > 0 and gen_base >= 0:
-            best_bs = min(args.batch_sizes, key=lambda bs_t: (gen_base + gen_per_q * bs_t) / bs_t)
-            best_score = (gen_base + gen_per_q * best_bs) / best_bs
-        else:
-            best_bs = args.batch_sizes[-1]
-            best_score = 0.0
-
         results[(xE, xR)] = {
             "feasible": True,
-            "gen_base": gen_base,
-            "gen_per_q": gen_per_q,
+            "P_fixed": P_fixed,
+            "D_fixed": D_fixed,
+            "P_per_token": P_tok,
+            "gen_base": P_fixed,     # backward compat
+            "gen_per_q": D_fixed,    # backward compat
             "emb_per_q": emb_per_q,
             "ret_per_q": ret_per_q,
             "r2": r2,
@@ -719,7 +784,9 @@ def main():
             "wall_points": wall_points,
         }
 
-        print(f"    → gen = {gen_base:.0f} + {gen_per_q:.1f} × bs   R²={r2:.6f}")
+        print(f"    → gen_q = {P_fixed:.0f}/B + {D_fixed:.1f}   R²={r2:.6f}")
+        if P_tok > 0:
+            print(f"    → P_per_token = {P_tok:.4f} ms/token (input-length sensitivity)")
         print(f"    → best bs={best_bs} (score={best_score:.1f} ms/q)")
         print()
 
