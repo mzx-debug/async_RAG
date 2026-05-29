@@ -1072,39 +1072,18 @@ class GreedyScheduler:
         pending_queries: int = 0,
     ) -> float:
         """
-        Wall-time cost model: score = estimated wall time per query in ms.
+        Wall-time cost model: per-query wall time in ms.
+        Delegates to _estimate_action_cost for the full T_cycle model.
 
-        gen_q = P_fixed / B + D_fixed + C_tok * L̄_in
+        gen_q = (P/B + D + C_tok * L̄_in) * contention
 
-        Pipeline overlap (E+R vs gen on different devices):
-          xE=0: CPU E+R is fully parallel to GPU gen → wall_single = max(gen_time, er_time)
-          xE=1: GPU E+R contends with gen → wall_single = gen_time + er_time * overlap
+        T_cycle by (xE, xR):
+          (0,0): max(gen, emb*B + ret + er_base)
+          (1,0): er_base + emb*B + max(ret, gen)
+          (0,1): er_base + ret + max(emb*B, gen)
+          (1,1): er_base + emb*B + ret + gen
         """
-        key = (x_e, x_r)
-        B = max(1, batch_size)
-        L_in_avg = 30.0  # default; overridden if lengths available
-
-        P = self._gen_base_overhead_ema.get(key, 2072.0)   # ms (fixed prefill/launch)
-        D = self._gen_per_query_ema.get(key, 57.1)          # ms/q
-        C_tok = getattr(self, '_gen_prefill_per_token_ema', 0.0)  # ms/token (only if fitted)
-        cont = self._contention_ema.get(key, 1.0)
-
-        # Per-query generation time (ms/q)
-        gen_q = (P / B + D + C_tok * L_in_avg) * cont
-
-        # Embedding + retrieval per-query time (ms/q)
-        emb_q = self._embedding_latency_ema_ms_per_query.get(x_e, 1.5)
-        ret_q = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.15)
-        er_q = emb_q + ret_q
-
-        # Pipeline overlap
-        if x_e == 0:
-            wall_single = max(gen_q, er_q)   # parallel on different devices
-        else:
-            overlap = self._overlap_factor_ema.get(key, 0.5)
-            wall_single = gen_q + er_q * overlap   # contended
-
-        return wall_single
+        return self._estimate_action_cost(lengths=[], batch_size=batch_size, x_e=x_e, x_r=x_r)
 
     def _estimate_dispatch_cost_legacy(
         self,
@@ -1129,12 +1108,16 @@ class GreedyScheduler:
         x_r: int,
     ) -> float:
         """
-        Per-query wall time estimate: gen_q = P/B + D + C_tok * L̄_in, then pipeline overlap.
+        Total wall time for one dispatch (ms), not per-query.
 
-        gen_q = (P_fixed / B + D_fixed + C_tok * L̄_in) * contention
-        er_q  = emb_q + ret_q
-        xE=0: wall = max(gen_q, er_q)
-        xE=1: wall = gen_q + er_q * overlap
+        Pipeline T_cycle by (xE, xR) — per-query times:
+          (0,0): max(gen_q,  emb_q*B + ret_q)
+          (1,0): emb_q*B + max(ret_q, gen_q)
+          (0,1): ret_q  + max(emb_q*B, gen_q)
+          (1,1): emb_q*B + ret_q + gen_q
+        where gen_q = (P/B + D + C_tok * L̄_in) * contention.
+
+        er_base is added to the E+R portion (serial base overhead for batch launch).
         """
         key = (x_e, x_r)
         B = max(1, batch_size)
@@ -1142,19 +1125,32 @@ class GreedyScheduler:
 
         P = self._gen_base_overhead_ema.get(key, 2072.0)
         D = self._gen_per_query_ema.get(key, 57.1)
-        C_tok = getattr(self, '_gen_prefill_per_token_ema', 0.0)
+        C_tok = getattr(self, '_gen_prefill_per_token_ema', {}).get(key, 0.0)
         cont = self._contention_ema.get(key, 1.0)
 
-        gen_q = (P / B + D + C_tok * L_avg) * cont
+        gen_q = (P / B + D + C_tok * L_avg) * cont   # ms/q
+
         emb_q = self._embedding_latency_ema_ms_per_query.get(x_e, 1.5)
         ret_q = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.15)
-        er_q = emb_q + ret_q
+        er_base = self._er_base_overhead_ema
 
-        if x_e == 0:
-            return max(gen_q, er_q)
-        else:
-            overlap = self._overlap_factor_ema.get(key, 0.5)
-            return gen_q + er_q * overlap
+        # FAISS batch retrieval: ret_q is ONE call total, not per-query
+        # emb_q*B is the total embedding time for the batch
+        emb_total = emb_q * B
+        ret_total = ret_q        # single call
+        gen_total = gen_q * B   # per-query scaled
+
+        if x_e == 0 and x_r == 0:
+            er_total = er_base + emb_total + ret_total
+            wall = max(gen_total, er_total)
+        elif x_e == 1 and x_r == 0:
+            wall = er_base + emb_total + max(ret_total, gen_total)
+        elif x_e == 0 and x_r == 1:
+            wall = er_base + ret_total + max(emb_total, gen_total)
+        else:  # (1,1): GPU emb + GPU ret + GPU gen all serial
+            wall = er_base + emb_total + ret_total + gen_total
+
+        return wall / B   # per-query wall time
 
     def _estimate_dispatch_cost(
         self,
@@ -1163,11 +1159,8 @@ class GreedyScheduler:
         x_e: int,
         x_r: int,
     ) -> float:
-        return (
-            self._estimate_action_cost(lengths, batch_size, x_e, x_r)
-            + self._estimate_generation_cost_for_batch(lengths)
-            + self._estimate_batch_size_residual(batch_size)
-        )
+        """Full per-query wall time — already includes gen, E+R, and pipeline overlap."""
+        return self._estimate_action_cost(lengths, batch_size, x_e, x_r)
 
     def _compute_overlap_potential(
         self,
@@ -1274,13 +1267,11 @@ class GreedyScheduler:
         total_ms_per_query = (embedding_sec + retrieval_sec + generation_sec) * 1000.0 / max(1, batch_size)
         try:
             action_cost = self._estimate_action_cost(token_lengths, batch_size, x_e, x_r)
-            gen_cost = self._estimate_generation_cost_for_batch(token_lengths)
         except Exception as exc:
             import traceback as _tb2
             print(f"[_record_batch_feedback ERROR] x_e={x_e} x_r={x_r} batch={batch_size}: {exc}\n{_tb2.format_exc()}", flush=True)
             action_cost = 0.0
-            gen_cost = 0.0
-        batch_residual = total_ms_per_query - (action_cost + gen_cost)
+        batch_residual = total_ms_per_query - action_cost
         previous_batch = self._batch_size_residual_ema_ms_per_query.get(batch_size)
         if previous_batch is None:
             self._batch_size_residual_ema_ms_per_query[batch_size] = batch_residual
