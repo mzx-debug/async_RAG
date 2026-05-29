@@ -574,6 +574,7 @@ class ScheduledMicrobatch:
     queries: List[str]
     token_lengths: List[int]
     action: Dict[str, Any]
+    dispatch_start_sec: float = 0.0  # set at embed dispatch; used for wall-time measurement
 
 
 @dataclass
@@ -589,6 +590,8 @@ class RetrievalPayload:
     microbatch: ScheduledMicrobatch
     embedding_sec: float
     retrieval_sec: float
+    emb_ret_wall_sec: float   # wall clock for Emb→Ret phase only (for embedding/ret calibration)
+    gen_start_sec: float      # wall clock at Ret→Gen handover (for generation contention)
     retrieved_docs: List[List[str]]
 
 
@@ -887,6 +890,9 @@ class GreedyScheduler:
         # emb_ret_time = er_base_overhead + (emb_per_query + ret_per_query) * batch_size
         self._gen_base_overhead_ema: Dict[Tuple[int, int], float] = {}   # ms (fixed overhead)
         self._gen_per_query_ema: Dict[Tuple[int, int], float] = {}       # ms per query
+        self._contention_ema: Dict[Tuple[int, int], float] = {}            # scaling factor: obs/pred
+        self._startup_base_ema: Dict[Tuple[int, int], float] = {}
+        self._startup_k_ema: Dict[Tuple[int, int], float] = {}
         self._er_base_overhead_ema: float = 0.0       # ms (E+R combined base overhead)
         self._wall_time_measurements: Dict[Tuple[int, int], List[Tuple[int, float]]] = {}
         self._overlap_factor_ema: Dict[Tuple[int, int], float] = {}  # 0.0 = full parallel, 1.0 = sequential
@@ -1252,8 +1258,10 @@ class GreedyScheduler:
         embedding_sec: float,
         retrieval_sec: float,
         generation_sec: float,
+        gen_wall_sec: float,
         x_e: int,
         x_r: int,
+        emb_ret_wall_sec: float = 0.0,
     ) -> None:
         embedding_ms_per_query = embedding_sec * 1000.0 / max(1, batch_size)
         emb_key = x_e
@@ -1316,91 +1324,45 @@ class GreedyScheduler:
                 self.ema_alpha * batch_residual + (1.0 - self.ema_alpha) * previous_batch
             )
 
-        # --- Compute observed timings (needed by both adaptive bs and wall-time calibration) ---
+        # --- Compute observed timings (all per-query for consistent comparison) ---
         key = (x_e, x_r)
-        observed_gen_time = generation_sec * 1000.0
-        observed_er_time = (embedding_sec + retrieval_sec) * 1000.0
-        observed_wall = max(observed_gen_time, observed_er_time)
+        B = max(1, batch_size)
+        P_fixed = self._gen_base_overhead_ema.get(key, 2072.0)
+        D_fixed = self._gen_per_query_ema.get(key, 57.1)
+        observed_gen_per_q = generation_sec * 1000.0 / B  # ms per query
+        L_sum = sum(token_lengths) if token_lengths else 0
 
-        # --- Adaptive max_batch_size: EMA toward the best-performing batch size ---
-        # Larger batches are generally better because gen scales with sqrt(bs) while er scales
-        # with bs, so once gen dominates the wall time, larger bs = better gen-per-query.
-        if batch_size > 0:
-            if key not in self._best_batch_size_by_action:
-                self._best_batch_size_by_action[key] = batch_size
-            else:
-                model_wall = max(observed_gen_time, observed_er_time)
-                ratio = observed_wall / model_wall if model_wall > 0 else 1.0
-                if ratio < 1.5 and batch_size > self._best_batch_size_by_action[key]:
+        # --- Adaptive max_batch_size: update toward larger B if gen dominates ---
+        model_gen_per_q = P_fixed / B + D_fixed
+        if model_gen_per_q > 0:
+            ratio = observed_gen_per_q / model_gen_per_q
+            if ratio < 2.0:
+                if key not in self._best_batch_size_by_action:
+                    self._best_batch_size_by_action[key] = B
+                else:
                     alpha = self.ema_alpha
                     self._best_batch_size_by_action[key] = int(
-                        alpha * batch_size + (1.0 - alpha) * self._best_batch_size_by_action[key]
+                        alpha * B + (1.0 - alpha) * self._best_batch_size_by_action[key]
                     )
 
-        # --- Wall-time model calibration (per-(xE,xR)) ---
-        # Model: wall_single = combine(gen_time, emb_ret_time)
-        #   xE=0: wall = max(gen, er)    (full parallel, CPU embed)
-        #   xE=1: wall = gen + er * overlap_factor  (GPU contention)
-        # gen_time = gen_base[(xE,xR)] + gen_per_query[(xE,xR)] * bs
-
-        # Overlap factor: wall = gen + er * factor  =>  factor = (wall - gen) / er
-        # For xE=0: CPU embed + CPU retrieval, both off GPU → gen fully parallel with E+R → max(gen, er)
-        # For xE=1: GPU embed + GPU retrieval compete with gen → gen + er * overlap_factor
-        if x_e == 0:
-            observed_overlap = 0.0
-        else:
-            if observed_er_time > 0:
-                observed_overlap = (observed_wall - observed_gen_time) / observed_er_time
-                observed_overlap = max(0.0, min(1.0, observed_overlap))
-            else:
-                observed_overlap = 1.0
-
-        # Initialize or update gen parameters keyed by (xE, xR)
-        if key not in self._gen_base_overhead_ema:
-            # Linear fit: gen_time = gen_base + gen_per_query × batch_size
-            # First observation: use gen_base=0, back-solve gen_per_query
-            gen_per_q_est = observed_gen_time / batch_size
-            self._gen_base_overhead_ema[key] = 0.0
-            self._gen_per_query_ema[key] = max(0.0, gen_per_q_est)
-            self._overlap_factor_ema[key] = observed_overlap
-            self._wall_time_measurements[key] = [(batch_size, observed_gen_time)]
-        else:
-            self._wall_time_measurements[key].append((batch_size, observed_gen_time))
-            if len(self._wall_time_measurements[key]) > 8:
-                self._wall_time_measurements[key] = self._wall_time_measurements[key][-8:]
-
-            if len(self._wall_time_measurements[key]) >= 3:
-                # Linear regression: gen = a + b * batch_size
-                ms_data = self._wall_time_measurements[key]
-                xs = [s[0] for s in ms_data]          # batch sizes
-                ys = [s[1] for s in ms_data]          # gen times
-                n = len(ms_data)
-                sx = sum(xs); sy = sum(ys)
-                sxy = sum(x*y for x, y in zip(xs, ys))
-                sxx = sum(x*x for x in xs)
-                denom = n * sxx - sx * sx
-                if abs(denom) > 1e-9:
-                    b = (n * sxy - sx * sy) / denom      # gen_per_query
-                    a = (sy - b * sx) / n                 # gen_base
-                    alpha = self.ema_alpha
-                    self._gen_base_overhead_ema[key] = alpha * max(0.0, a) + (1 - alpha) * self._gen_base_overhead_ema[key]
-                    self._gen_per_query_ema[key] = alpha * max(0.0, b) + (1 - alpha) * self._gen_per_query_ema[key]
-
+        # --- Model calibration: observed vs predicted gen per-query ---
+        # ratio = observed / predicted
+        # This single factor absorbs both model-size mismatch and genuine GPU contention.
+        # The first update seeds contention to the raw ratio (no prior bias).
+        gen_predicted_per_q = P_fixed / B + D_fixed
+        if gen_predicted_per_q > 0 and observed_gen_per_q > 0:
+            ratio = observed_gen_per_q / gen_predicted_per_q
             alpha = self.ema_alpha
-            prev_overlap = self._overlap_factor_ema.get(key, observed_overlap)
-            self._overlap_factor_ema[key] = alpha * observed_overlap + (1 - alpha) * prev_overlap
+            prev = self._contention_ema.get(key, None)
+            if prev is None:
+                # First observation — seed directly with the observed ratio
+                self._contention_ema[key] = ratio
+            else:
+                self._contention_ema[key] = alpha * ratio + (1.0 - alpha) * prev
 
-        # er_base_overhead: EMA smoothing
-        emb_ret_per_q = embedding_ms_per_query + retrieval_ms_per_query
-        er_total_ms = observed_er_time
-        er_base_est = er_total_ms - emb_ret_per_q * batch_size
-        if self._er_base_overhead_ema > 0:
-            self._er_base_overhead_ema = (
-                self.ema_alpha * max(0.0, er_base_est)
-                + (1 - self.ema_alpha) * self._er_base_overhead_ema
-            )
-        else:
-            self._er_base_overhead_ema = max(0.0, er_base_est)
+        if key not in self._startup_base_ema:
+            self._startup_base_ema[key] = 0.0
+            self._startup_k_ema[key] = 10.0
 
         self.feedback_trace.append(
             FeedbackTraceEntry(
@@ -2507,11 +2469,14 @@ class StandaloneRAGPipeline:
                         target_backend,
                         retrieval_sec * 1000,
                     )
+                    wall_time_sec = time.perf_counter() - payload.microbatch.dispatch_start_sec
                     q_out.put(
                         RetrievalPayload(
                             microbatch=payload.microbatch,
                             embedding_sec=payload.embedding_sec,
                             retrieval_sec=retrieval_sec,
+                            emb_ret_wall_sec=wall_time_sec,
+                            gen_start_sec=time.perf_counter(),
                             retrieved_docs=retrieved_docs,
                         )
                     )
@@ -2556,14 +2521,17 @@ class StandaloneRAGPipeline:
                             )
                         )
                         feedback_start = time.perf_counter()
+                        gen_wall_sec = time.perf_counter() - payload.gen_start_sec
                         self.scheduler._record_batch_feedback(
                             batch_size=len(payload.microbatch.queries),
                             token_lengths=payload.microbatch.token_lengths,
                             embedding_sec=payload.embedding_sec,
                             retrieval_sec=payload.retrieval_sec,
                             generation_sec=generation_sec,
+                            gen_wall_sec=gen_wall_sec,
                             x_e=int(payload.microbatch.action.get("xE", 0)),
                             x_r=int(payload.microbatch.action.get("xR", 0)),
+                            emb_ret_wall_sec=payload.emb_ret_wall_sec,
                         )
                         scheduler_feedback_sec_total += time.perf_counter() - feedback_start
 
@@ -2656,6 +2624,7 @@ class StandaloneRAGPipeline:
                     f"xR{int(dispatch.action.get('xR', 0))}"
                 )
                 action_counts[action_key] = action_counts.get(action_key, 0) + 1
+                dispatch.dispatch_start_sec = time.perf_counter()
                 q_er.put(dispatch)
                 with stats_lock:
                     q_er_size += 1
