@@ -44,7 +44,7 @@ def run_experiment(
         "--xE", str(xE), "--xR", str(xR),
         "--b", str(batch_size),
         "--sample-queries", str(sample_queries),
-        "--pipeline-mode", "async_v2",
+        "--pipeline-mode", "async_plain",
         "--index-path", str(workdir / "indexes/beir_nfcorpus/faiss.index"),
         "--corpus-path", str(workdir / "data/beir_nfcorpus/corpus.jsonl"),
         "--queries-file", str(workdir / "data/beir_nfcorpus/queries.jsonl"),
@@ -58,12 +58,12 @@ def run_experiment(
 
     env = os.environ.copy()
     env["HF_ENDPOINT"] = "https://hf-mirror.com"
-    activate = "source /home/cloudteam/Software/conda/bin/activate p702 && "
-    full_cmd = activate + " ".join(cmd)
+    activate = "/home/cloudteam/Software/conda/envs/p702/bin/python"
+    full_cmd = " ".join(cmd)
 
     print(f"  Running: xE={xE}, xR={xR}, b={batch_size}...")
     result = subprocess.run(
-        full_cmd, shell=True, env=env, cwd=str(workdir),
+        [activate] + cmd[1:], env=env, cwd=str(workdir),
         capture_output=True, text=True, timeout=600,
     )
     if result.returncode != 0:

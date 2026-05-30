@@ -898,8 +898,12 @@ class GreedyScheduler:
         self._gen_P0_ema: float = 2072.0                            # ms, prefill fixed
         self._gen_p_lin_ema: float = 0.0                            # ms/token, prefill per-token
         self._gen_g_ema: float = 57.1                               # ms/q, decode marginal
+        self._gen_per_token_ema: float = 0.378                       # ms/token, constant gen rate
+        self._avg_output_tokens_ema: float = 120.0                     # avg output tokens per query
+        self._gpu_contention_ema: float = 38.5                        # ms/q, GPU emb+gen contention penalty
         self._transfer_K_ema: Dict[Tuple[int, int], float] = {}      # K[xE,xR], ms/token
-        self._contention_ema: Dict[Tuple[int, int], float] = {}      # obs/pred ratio
+        self._queue_penalty_ema: float = 2.5                        # ms/q, per-query queueing overhead
+        self._contention_ema: Dict[Tuple[int, int], float] = {}      # obs/pred ratio (legacy, unused)
         self._er_base_overhead_ema: float = 0.0                     # ms, not currently used
         # ── Old fields kept for backward compat (read-only in cost model) ─────────
         self._gen_base_overhead_ema: Dict[Tuple[int, int], float] = {}  # alias for _gen_P0_ema
@@ -928,15 +932,18 @@ class GreedyScheduler:
         self.batch_shaping_trace: List[BatchShapingTraceEntry] = []
 
         # Warm-start defaults
-        self._emb_rate_ema[0] = 0.05     # ms/token, CPU embedding rate
-        self._emb_rate_ema[1] = 0.05     # ms/token, GPU embedding rate
-        self._ret_r_ema[0] = 0.15        # ms, CPU retrieval coefficient
-        self._ret_r_ema[1] = 0.15        # ms, GPU retrieval coefficient
-        self._ret_alpha_ema[0] = 0.5     # sublinear exponent
-        self._ret_alpha_ema[1] = 0.5
-        self._transfer_K_ema[(0, 1)] = 0.0
-        self._transfer_K_ema[(1, 0)] = 0.0
-        self._contention_ema[(0, 0)] = 1.0
+        self._emb_rate_ema[0] = 0.084    # ms/token, CPU Embedding rate
+        self._emb_rate_ema[1] = 0.016    # ms/token, GPU Embedding rate
+        self._ret_r_ema[0] = 0.68        # ms, CPU Retrieval coefficient
+        self._ret_r_ema[1] = 0.50        # ms, GPU Retrieval coefficient
+        self._ret_alpha_ema[0] = 0.55     # sublinear exponent (CPU)
+        self._ret_alpha_ema[1] = 0.30     # sublinear exponent (GPU)
+        self._gen_per_token_ema = 0.378   # ms/token, constant gen rate
+        self._avg_output_tokens_ema = 120.0
+        self._gpu_contention_ema = 38.5    # ms/q, GPU contention penalty
+        self._transfer_K_ema[(0, 1)] = 0.55   # ms/token, CPU→GPU
+        self._transfer_K_ema[(1, 0)] = 0.16   # ms/token, GPU→CPU
+        self._queue_penalty_ema = 2.5       # ms/q, per-query queueing
 
     @staticmethod
     def _estimate_query_length(query: str) -> int:
@@ -1130,64 +1137,56 @@ class GreedyScheduler:
         x_r: int,
     ) -> float:
         """
-        Complete wall_q cost model (ms/q):
+        Wall time model (ms/q) for async_v2 continuous batching:
 
-        wall_q = L_in*e[xE] + r[xR]*B^{alpha-1} + P0/B + p_lin*L_in + g + I(xE≠xR)*K[xE,xR]*L_in
+        wall_q = gen_per_token * avg_output_tokens
+                 + queue_penalty
+                 + I(xE=1) * gpu_contention
+                 + I(xE=0) * 0.05 * (emb_q + ret_q)
+                 + xfer_q
 
-        Component breakdown:
-          emb:  L_in * e[xE]        (constant in B)
-          ret:  r[xR] * B^{alpha-1} (sublinear in B)
-          gen:  P0/B + p_lin*L_in + g  (P0/B term: hyperbolic, p_lin*L_in: constant, g: constant)
-          xfer: I(xE≠xR) * K[xE,xR] * L_in  (constant in B, only when cross-device)
+        Components:
+          gen:          constant per-token rate (cross-action stable)
+          queue:        per-query scheduling overhead
+          gpu_cont:     GPU emb+gen contention when xE=1 (emb serializes with gen)
+          er_overlap:   emb+ret fully overlap Gen when xE=0 (negligible overhead)
+          xfer:         cross-device transfer overhead when xE≠xR
 
-        Pipeline T_cycle by (xE, xR) on total times:
-          (0,0): max(gen, emb + ret)           // CPU E+R || GPU gen
-          (1,0): emb + max(ret, gen)            // GPU emb → ret (CPU) || gen
-          (0,1): emb + max(ret, gen)            // CPU emb → ret (GPU) || gen
-          (1,1): emb + ret + gen               // all GPU serial
-        where transfer is embedded in emb for (0,1)/(1,0) and gen does NOT
-        depend on xE/xR (always on GPU).
-
-        Returns wall_q = wall_total / B (ms per query).
+        Returns wall_q (ms per query).
         """
-        key = (x_e, x_r)
         B = max(1, batch_size)
-        L = float(sum(lengths) / len(lengths)) if lengths else 30.0
+        L = float(sum(lengths) / len(lengths)) if lengths else 5.0
+        avg_out_tokens = getattr(self, '_avg_output_tokens_ema', None) or 120.0
 
-        # --- Gen (always on GPU, xE/xR only affect contention) ---
-        P0 = self._gen_P0_ema
-        p_lin = self._gen_p_lin_ema
-        g = self._gen_g_ema
-        cont = self._contention_ema.get(key, 1.0)
-        gen_total = (P0 + p_lin * L * B + g * B) * cont   # ms/batch
+        # ── Gen: constant per-token rate ────────────────────────────────────
+        gen_per_token = self._gen_per_token_ema   # ms/token
 
-        # --- Emb (compute only, does not move data) ---
-        e = self._emb_rate_ema.get(x_e, 0.05)              # ms/token
-        emb_total = e * L * B                                # ms/batch
+        # ── Emb + Ret (CPU: fully overlap with Gen; GPU: separate) ────────
+        e = self._emb_rate_ema.get(x_e, 0.05)
+        r = self._ret_r_ema.get(x_r, 0.15)
+        alpha = self._ret_alpha_ema.get(x_r, 0.5)
+        emb_q = e * L
+        ret_q = r * (B ** (alpha - 1))
 
-        # --- Ret (sublinear in B) ---
-        r = self._ret_r_ema.get(x_r, 0.15)                 # ms
-        alpha = self._ret_alpha_ema.get(x_r, 0.5)          # exponent
-        ret_total = r * (B ** alpha)                         # ms/batch
+        # ── Transfer (cross-device only) ───────────────────────────────────
+        K = self._transfer_K_ema.get((x_e, x_r), 0.0)
+        xfer_q = K * L if x_e != x_r else 0.0
 
-        # --- Transfer (only when xE != xR) ---
-        K = self._transfer_K_ema.get((x_e, x_r), 0.0)     # ms/token
-        xfer_total = K * L * B if x_e != x_r else 0.0       # ms/batch
+        # ── Pipeline overheads ────────────────────────────────────────────
+        queue_penalty = self._queue_penalty_ema
+        gpu_contention = self._gpu_contention_ema if x_e == 1 else 0.0
 
-        # --- T_cycle by (xE, xR) ---
-        if x_e == 0 and x_r == 0:
-            # CPU emb+ret || GPU gen
-            wall = max(emb_total + ret_total, gen_total)
-        elif x_e == 1 and x_r == 0:
-            # GPU emb → transfer → CPU ret, || GPU gen
-            wall = emb_total + xfer_total + max(ret_total, gen_total)
-        elif x_e == 0 and x_r == 1:
-            # CPU emb → transfer → GPU ret, || GPU gen
-            wall = emb_total + xfer_total + max(ret_total, gen_total)
-        else:  # (1,1): all GPU serial
-            wall = emb_total + ret_total + gen_total
+        # xE=0: emb+ret run on CPU, Gen on GPU — fully parallel (5% fudge)
+        # xE=1: emb competes for GPU with Gen — adds full gpu_contention penalty
+        er_wall_q = (emb_q + ret_q) * 0.05 if x_e == 0 else 0.0
 
-        return wall / B   # per-query wall time
+        wall_q = (gen_per_token * avg_out_tokens
+                  + queue_penalty
+                  + gpu_contention
+                  + er_wall_q
+                  + xfer_q)
+
+        return wall_q
 
     def _estimate_dispatch_cost(
         self,
@@ -1256,6 +1255,8 @@ class GreedyScheduler:
         gen_wall_sec: float,
         x_e: int,
         x_r: int,
+        total_output_tokens: int,
+        wall_time_ms: float,
         emb_ret_wall_sec: float = 0.0,
     ) -> None:
         """
@@ -1292,78 +1293,46 @@ class GreedyScheduler:
 
         obs_ret = self._ret_measurements[ret_key]
         if len(obs_ret) >= 2:
-            # Two-point fit for (r, alpha) from: ret = r * B^alpha
             b1, t1 = obs_ret[0]
             b2, t2 = obs_ret[-1]
             if b1 != b2 and t1 > 0 and t2 > 0:
-                # t1 = r * b1^alpha  →  log(t1/r) = alpha * log(b1)
-                # t2 = r * b2^alpha  →  log(t2/r) = alpha * log(b2)
                 alpha_obs = math.log(t2 / t1) / math.log(b2 / b1) if b2 != b1 else 0.5
-                alpha_obs = max(0.1, min(1.0, alpha_obs))   # clamp to [0.1, 1.0]
+                alpha_obs = max(0.3, min(1.0, alpha_obs))
                 r_obs = t1 / (b1 ** alpha_obs)
                 prev_alpha = self._ret_alpha_ema.get(ret_key, 0.5)
                 prev_r = self._ret_r_ema.get(ret_key, 0.15)
                 self._ret_alpha_ema[ret_key] = a * alpha_obs + (1 - a) * prev_alpha
                 self._ret_r_ema[ret_key] = a * r_obs + (1 - a) * prev_r
 
-        # ── 3. Gen: P0, p_lin, g — fit from gen_wall_sec across B values ─────────
-        gen_ms_total = gen_wall_sec * 1000.0     # wall time of generation stage
-        gen_key = (x_e, x_r)
-        if gen_key not in self._wall_time_measurements:
-            self._wall_time_measurements[gen_key] = []
-        if L > 0:
-            self._wall_time_measurements[gen_key].append((B, gen_ms_total, L))
-        if len(self._wall_time_measurements[gen_key]) > 20:
-            self._wall_time_measurements[gen_key] = self._wall_time_measurements[gen_key][-20:]
+        # ── 3. Gen per-token: gen_per_token = gen_total / total_output_tokens ─────────
+        gen_ms_total = generation_sec * 1000.0
+        if total_output_tokens > 0:
+            gpt_obs = gen_ms_total / total_output_tokens  # ms/token
+            prev_gpt = getattr(self, '_gen_per_token_ema', None) or 0.378
+            self._gen_per_token_ema = a * gpt_obs + (1 - a) * prev_gpt
 
-        obs_g = self._wall_time_measurements[gen_key]
-        if len(obs_g) >= 2:
-            # Two-point fit for (P0, p_lin) from: gen_total/B = P0/B + p_lin*L
-            b1, t1, L1 = obs_g[0]
-            b2, t2, L2 = obs_g[-1]
-            if b1 > 0 and b2 > 0:
-                gq1 = t1 / b1
-                gq2 = t2 / b2
-                # p_lin = (gq2 - gq1) / (L2 - L1)
-                # P0    = gq1 - p_lin*L1  (or using b2)
-                denom_L = L2 - L1
-                if abs(denom_L) > 1e-6:
-                    p_lin_new = (gq2 - gq1) / denom_L
-                    P0_new = gq1 - p_lin_new * L1
-                else:
-                    p_lin_new = self._gen_p_lin_ema
-                    P0_new = (gq1 + gq2) / 2.0 - p_lin_new * (L1 + L2) / 2.0
-                P0_new = max(0.0, P0_new)
-                p_lin_new = max(0.0, p_lin_new)
-                self._gen_P0_ema = a * P0_new + (1 - a) * self._gen_P0_ema
-                self._gen_p_lin_ema = a * p_lin_new + (1 - a) * self._gen_p_lin_ema
+        # ── 4. GPU contention: only for xE=1 ────────────────────────────────────
+        if x_e == 1 and B > 0 and L > 0:
+            wall_obs_ms = wall_time_ms
+            # Compute predicted wall without GPU contention
+            avg_out = getattr(self, '_avg_output_tokens_ema', 120.0)
+            pred_no_cont = (self._gen_per_token_ema * avg_out
+                            + self._queue_penalty_ema
+                            + (self._emb_rate_ema.get(x_e, 0.05) * L
+                               + self._ret_r_ema.get(x_r, 0.15) * (B ** (self._ret_alpha_ema.get(x_r, 0.5) - 1))) * 0.05)
+            cont_obs = (wall_obs_ms / B - pred_no_cont) if pred_no_cont > 0 else 0.0
+            cont_obs = max(0.0, min(200.0, cont_obs))
+            self._gpu_contention_ema = a * cont_obs + (1 - a) * self._gpu_contention_ema
 
-            # g: use smallest B observation to minimize P0/B contribution
-            b_min, t_min, L_min = min(obs_g, key=lambda x: x[0])
-            g_obs = t_min / b_min - self._gen_P0_ema / b_min - self._gen_p_lin_ema * L_min
-            g_obs = max(0.0, g_obs)
-            self._gen_g_ema = a * g_obs + (1 - a) * self._gen_g_ema
-
-        # ── 4. Transfer K[xE, xR] — only when xE != xR ────────────────────────────
-        if x_e != x_r:
-            K_obs = emb_ms_total / (L * B) if L > 0 and B > 0 else 0.0   # approximate
-            prev_K = self._transfer_K_ema.get((x_e, x_r), 0.0)
-            if prev_K == 0.0:
-                self._transfer_K_ema[(x_e, x_r)] = K_obs
-            else:
-                self._transfer_K_ema[(x_e, x_r)] = a * K_obs + (1 - a) * prev_K
-
-        # ── 5. Contention: obs_wall / pred_wall ratio ───────────────────────────
-        total_obs = (embedding_sec + retrieval_sec + generation_sec) * 1000.0 / B
-        try:
-            pred_wall = self._estimate_action_cost(token_lengths, B, x_e, x_r)
-        except Exception:
-            pred_wall = total_obs
-        if pred_wall > 0:
-            ratio = total_obs / pred_wall
-            ratio = max(0.1, min(10.0, ratio))
-            prev_c = self._contention_ema.get(gen_key)
-            self._contention_ema[gen_key] = ratio if prev_c is None else a * ratio + (1 - a) * prev_c
+        # ── 5. Queue penalty: residual wall overhead after gen + gpu_cont ──────────
+        # Only update queue_penalty for xE=0 (xE=1 has GPU contention mixed in)
+        if B > 0 and x_e == 0:
+            avg_out = getattr(self, '_avg_output_tokens_ema', 120.0)
+            gen_base = self._gen_per_token_ema * avg_out
+            pred_base = gen_base
+            obs_q = (wall_time_ms / B) - pred_base
+            obs_q = max(0.0, min(50.0, obs_q))
+            self._queue_penalty_ema = a * obs_q + (1 - a) * self._queue_penalty_ema
 
         self.feedback_trace.append(
             FeedbackTraceEntry(
@@ -1383,11 +1352,11 @@ class GreedyScheduler:
                     f"e[{x_e}]": self._emb_rate_ema.get(x_e, 0.0),
                     f"r[{x_r}]": self._ret_r_ema.get(x_r, 0.0),
                     f"alpha[{x_r}]": self._ret_alpha_ema.get(x_r, 0.0),
-                    "P0": self._gen_P0_ema,
-                    "p_lin": self._gen_p_lin_ema,
-                    "g": self._gen_g_ema,
+                    "gen_per_token": self._gen_per_token_ema,
+                    "gpu_contention": self._gpu_contention_ema,
+                    "queue_penalty": self._queue_penalty_ema,
                     f"K[{x_e},{x_r}]": self._transfer_K_ema.get((x_e, x_r), 0.0),
-                    f"contention[{x_e},{x_r}]": self._contention_ema.get(gen_key, 1.0),
+                    "avg_out_tokens": getattr(self, '_avg_output_tokens_ema', 120.0),
                 },
             )
         )
@@ -1512,11 +1481,11 @@ class GreedyScheduler:
             "emb_rate_ema": {f"{xe}": v for xe, v in self._emb_rate_ema.items()},
             "ret_r_ema": {f"{xr}": v for xr, v in self._ret_r_ema.items()},
             "ret_alpha_ema": {f"{xr}": v for xr, v in self._ret_alpha_ema.items()},
-            "gen_P0_ema": self._gen_P0_ema,
-            "gen_p_lin_ema": self._gen_p_lin_ema,
-            "gen_g_ema": self._gen_g_ema,
+            "gen_per_token_ema": self._gen_per_token_ema,
+            "avg_output_tokens_ema": self._avg_output_tokens_ema,
+            "gpu_contention_ema": self._gpu_contention_ema,
+            "queue_penalty_ema": self._queue_penalty_ema,
             "transfer_K_ema": {f"({xe},{xr})": v for (xe, xr), v in self._transfer_K_ema.items()},
-            "contention_ema": {f"({xe},{xr})": v for (xe, xr), v in self._contention_ema.items()},
             "er_base_overhead_ema": self._er_base_overhead_ema,
             "ret_measurements": {f"{xr}": ms for xr, ms in self._ret_measurements.items()},
             "wall_time_measurements": {
@@ -1533,11 +1502,11 @@ class GreedyScheduler:
             "emb_rate_ema": {f"{xe}": v for xe, v in self._emb_rate_ema.items()},
             "ret_r_ema": {f"{xr}": v for xr, v in self._ret_r_ema.items()},
             "ret_alpha_ema": {f"{xr}": v for xr, v in self._ret_alpha_ema.items()},
-            "gen_P0_ema": self._gen_P0_ema,
-            "gen_p_lin_ema": self._gen_p_lin_ema,
-            "gen_g_ema": self._gen_g_ema,
+            "gen_per_token_ema": self._gen_per_token_ema,
+            "avg_output_tokens_ema": self._avg_output_tokens_ema,
+            "gpu_contention_ema": self._gpu_contention_ema,
+            "queue_penalty_ema": self._queue_penalty_ema,
             "transfer_K_ema": {f"({xe},{xr})": v for (xe, xr), v in self._transfer_K_ema.items()},
-            "contention_ema": {f"({xe},{xr})": v for (xe, xr), v in self._contention_ema.items()},
             "er_base_overhead_ema": self._er_base_overhead_ema,
             "ret_measurements": {f"{xr}": ms for xr, ms in self._ret_measurements.items()},
             "wall_time_measurements": {
@@ -1584,11 +1553,11 @@ class GreedyScheduler:
         self._emb_rate_ema = parse_int_key(raw, "emb_rate_ema")
         self._ret_r_ema = parse_int_key(raw, "ret_r_ema")
         self._ret_alpha_ema = parse_int_key(raw, "ret_alpha_ema")
-        self._gen_P0_ema = float(raw.get("gen_P0_ema", 2072.0))
-        self._gen_p_lin_ema = float(raw.get("gen_p_lin_ema", 0.0))
-        self._gen_g_ema = float(raw.get("gen_g_ema", 57.1))
+        self._gen_per_token_ema = float(raw.get("gen_per_token_ema", 0.378))
+        self._avg_output_tokens_ema = float(raw.get("avg_output_tokens_ema", 120.0))
+        self._gpu_contention_ema = float(raw.get("gpu_contention_ema", 38.5))
+        self._queue_penalty_ema = float(raw.get("queue_penalty_ema", 2.5))
         self._transfer_K_ema = parse_tuple_key(raw, "transfer_K_ema")
-        self._contention_ema = parse_tuple_key(raw, "contention_ema")
         self._er_base_overhead_ema = float(raw.get("er_base_overhead_ema", 0.0))
 
         # ret_measurements
@@ -1625,7 +1594,6 @@ class GreedyScheduler:
                 parts = k_str[1:-1].split(",")
                 if len(parts) == 2:
                     self._feasible_actions_ema[(int(parts[0].strip()), int(parts[1].strip()))] = bool(v)
-            return {int(k): float(v) for k, v in d.get(src_key, {}).items()}
 
         self._gen_base_overhead_ema = parse_tuple_key(raw, "gen_base_overhead_ema")
         raw_gpq = parse_tuple_key(raw, "gen_per_query_ema")
@@ -2536,6 +2504,7 @@ class StandaloneRAGPipeline:
                                 xR=int(payload.microbatch.action.get("xR", 0)),
                             )
                         )
+                        batch_wall_sec = time.perf_counter() - payload.microbatch.dispatch_start_sec
                         feedback_start = time.perf_counter()
                         gen_wall_sec = time.perf_counter() - payload.gen_start_sec
                         self.scheduler._record_batch_feedback(
@@ -2547,6 +2516,8 @@ class StandaloneRAGPipeline:
                             gen_wall_sec=gen_wall_sec,
                             x_e=int(payload.microbatch.action.get("xE", 0)),
                             x_r=int(payload.microbatch.action.get("xR", 0)),
+                            total_output_tokens=batch_tokens,
+                            wall_time_ms=batch_wall_sec * 1000.0,
                             emb_ret_wall_sec=payload.emb_ret_wall_sec,
                         )
                         scheduler_feedback_sec_total += time.perf_counter() - feedback_start
