@@ -878,8 +878,10 @@ class GreedyScheduler:
             {"xE": 1, "xR": 1},
         ]
         self._feasible_actions_ema: Dict[Tuple[int, int], bool] = {}  # loaded from EMA JSON; absent = treat as feasible
-        self._embedding_latency_ema_ms_per_query: Dict[Tuple[int, int], float] = {}
-        self._retrieval_latency_ema_ms_per_query: Dict[Tuple[int, int], float] = {}
+        self._embedding_latency_ema_ms_per_query: Dict[int, float] = {}     # ms/q at calibration length
+        self._emb_per_token_ema: Dict[int, float] = {}                      # ms/token (used in cost model)
+        self._emb_L_calibration_ema: Dict[int, float] = {}                   # token length at calibration time
+        self._retrieval_latency_ema_ms_per_query: Dict[int, float] = {}
         self._generation_latency_ema_ms_per_query: float = 0.0
         self._transfer_latency_ema_ms_per_query: Dict[Tuple[int, int, int], float] = {}
         self._batch_size_residual_ema_ms_per_query: Dict[int, float] = {}
@@ -1130,15 +1132,15 @@ class GreedyScheduler:
 
         gen_q = (P / B + D + C_tok * L_avg) * cont   # ms/q
 
-        emb_q = self._embedding_latency_ema_ms_per_query.get(x_e, 1.5)
+        emb_per_token = self._emb_per_token_ema.get(x_e, 0.05)    # ms/token
+        # emb_total = emb_per_token * L_avg * B  (rate × length × batch)
+        emb_total = emb_per_token * L_avg * B
+
         ret_q = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.15)
         er_base = self._er_base_overhead_ema
 
-        # FAISS batch retrieval: ret_q is ONE call total, not per-query
-        # emb_q*B is the total embedding time for the batch
-        emb_total = emb_q * B
-        ret_total = ret_q        # single call
-        gen_total = gen_q * B   # per-query scaled
+        ret_total = ret_q        # single FAISS batch call
+        gen_total = gen_q * B
 
         if x_e == 0 and x_r == 0:
             er_total = er_base + emb_total + ret_total
@@ -1221,14 +1223,29 @@ class GreedyScheduler:
         x_r: int,
         emb_ret_wall_sec: float = 0.0,
     ) -> None:
+        L_avg = sum(token_lengths) / len(token_lengths) if token_lengths else 0.0
         embedding_ms_per_query = embedding_sec * 1000.0 / max(1, batch_size)
+        # emb_per_token: embedding time per token, averaged across queries in batch
+        emb_per_token = (embedding_sec * 1000.0 / max(1e-9, L_avg)) if L_avg > 0 else 0.0
+
         emb_key = x_e
         previous_emb = self._embedding_latency_ema_ms_per_query.get(emb_key)
         if previous_emb is None:
             self._embedding_latency_ema_ms_per_query[emb_key] = embedding_ms_per_query
+            self._emb_per_token_ema[emb_key] = emb_per_token
+            self._emb_L_calibration_ema[emb_key] = L_avg
         else:
             self._embedding_latency_ema_ms_per_query[emb_key] = (
                 self.ema_alpha * embedding_ms_per_query + (1.0 - self.ema_alpha) * previous_emb
+            )
+            prev_tok = self._emb_per_token_ema.get(emb_key, emb_per_token)
+            prev_L = self._emb_L_calibration_ema.get(emb_key, L_avg)
+            self._emb_per_token_ema[emb_key] = (
+                self.ema_alpha * emb_per_token + (1.0 - self.ema_alpha) * prev_tok
+            )
+            # Calibrated length: exponential average of batch L_avg
+            self._emb_L_calibration_ema[emb_key] = (
+                self.ema_alpha * L_avg + (1.0 - self.ema_alpha) * prev_L
             )
 
         retrieval_ms_per_query = retrieval_sec * 1000.0 / max(1, batch_size)
@@ -1283,7 +1300,6 @@ class GreedyScheduler:
         # --- Compute observed timings (all per-query for consistent comparison) ---
         key = (x_e, x_r)
         B = max(1, batch_size)
-        L_avg = sum(token_lengths) / len(token_lengths) if token_lengths else 0.0
         observed_gen_per_q = generation_sec * 1000.0 / B  # ms per query
 
         # --- Update P and D via two-point fitting when we have >= 2 observations ---
@@ -1373,49 +1389,29 @@ class GreedyScheduler:
         batch_size: int,
         gpu_available: bool,
         gpu_mem_gb: float,
-    ) -> Tuple[bool, float]:
-        """
-        Checks if an (xE, xR, batch_size) combination is feasible under current GPU memory.
+    ) -> bool:
+        """Check if an (xE, xR, batch_size) combination is feasible under GPU memory.
 
-        Returns (feasible, memory_penalty).
-        The memory_penalty is a rough estimate of the additional cost if this action
-        would push the GPU into a tighter memory regime.
+        Only returns feasibility — memory pressure is absorbed by contention_ema
+        via the obs/pred ratio, preserving the physical ms/q meaning of the score.
         """
         if (x_e == 1 or x_r == 1) and not gpu_available:
-            return False, 0.0
+            return False
 
         if not self.enable_memory_aware_scheduling:
-            # Fallback to old static threshold behavior
             if x_r == 1 and gpu_mem_gb < 20.0:
-                return False, 0.0
+                return False
             retrieve_gpu_batch_threshold = int(getattr(self.args, "retrieve_gpu_batch_threshold", 64))
             if x_r == 1 and batch_size < retrieve_gpu_batch_threshold:
-                return False, 0.0
-            return True, 0.0
+                return False
+            return True
 
-        # --- Memory-aware feasibility check ---
         if self.resource_tracker is not None:
             max_feasible = self.resource_tracker.max_batch_size_for_action(x_e, x_r)
             if batch_size > max_feasible:
-                return False, 0.0
+                return False
 
-        pressure = self.resource_tracker.pressure_level(gpu_mem_gb) if self.resource_tracker else "low"
-
-        # Memory pressure penalties: the tighter the memory, the more we penalize
-        # actions that consume GPU resources heavily.
-        memory_penalty = 0.0
-        if pressure == "high":
-            if x_r == 1:
-                memory_penalty += self.gpu_mem_high_batch_penalty
-            elif x_e == 1:
-                memory_penalty += self.gpu_mem_high_batch_penalty * 0.5
-        elif pressure == "medium":
-            if x_r == 1 and gpu_mem_gb < self.gpu_mem_medium_threshold_gb:
-                memory_penalty += 10.0
-            if x_e == 1 and gpu_mem_gb < self.gpu_mem_low_threshold_gb:
-                memory_penalty += 5.0
-
-        return True, memory_penalty
+        return True
 
     def _choose_action_for_batch(
         self,
@@ -1443,22 +1439,12 @@ class GreedyScheduler:
             if not ema_feasible:
                 continue
 
-            feasible, memory_penalty = self._action_feasible(
+            if not self._action_feasible(
                 x_e, x_r, batch_size, gpu_available, gpu_mem_gb
-            )
-            if not feasible:
+            ):
                 continue
 
             score = self._estimate_action_cost(lengths, batch_size, x_e, x_r)
-            if x_e == 0:
-                score += q_er_len * 0.03
-            if x_r == 0:
-                score += q_rg_len * 0.05
-            if l_max >= embed_long_gpu_threshold and x_e == 0:
-                score += 20.0
-            if l_max >= long_threshold and x_e == 1:
-                score -= 0.5
-            score += memory_penalty
             candidates.append((score, {"xE": x_e, "xR": x_r}))
 
         if not candidates:
@@ -1516,6 +1502,8 @@ class GreedyScheduler:
             "contention_ema": {f"({xe},{xr})": v for (xe, xr), v in self._contention_ema.items()},
             "er_base_overhead_ema": self._er_base_overhead_ema,
             "embedding_latency_ema": {f"{xe}": v for xe, v in self._embedding_latency_ema_ms_per_query.items()},
+            "emb_per_token_ema": {f"{xe}": v for xe, v in self._emb_per_token_ema.items()},
+            "emb_L_calibration_ema": {f"{xe}": v for xe, v in self._emb_L_calibration_ema.items()},
             "retrieval_latency_ema": {f"{xr}": v for xr, v in self._retrieval_latency_ema_ms_per_query.items()},
             "overlap_factor_ema": {f"({xe},{xr})": v for (xe, xr), v in self._overlap_factor_ema.items()},
             "batch_size_residual_ema": {str(bs): v for bs, v in self._batch_size_residual_ema_ms_per_query.items()},
@@ -1543,6 +1531,14 @@ class GreedyScheduler:
                 f"{xe}": v
                 for xe, v in self._embedding_latency_ema_ms_per_query.items()
             },
+            "emb_per_token_ema": {
+                f"{xe}": v
+                for xe, v in self._emb_per_token_ema.items()
+            },
+            "emb_L_calibration_ema": {
+                f"{xe}": v
+                for xe, v in self._emb_L_calibration_ema.items()
+            },
             "retrieval_latency_ema": {
                 f"{xr}": v
                 for xr, v in self._retrieval_latency_ema_ms_per_query.items()
@@ -1556,10 +1552,6 @@ class GreedyScheduler:
                 for bs, v in self._batch_size_residual_ema_ms_per_query.items()
             },
             "max_batch_size_ema": self._max_batch_size_ema,
-            "best_batch_size_by_action": {
-                f"({xe},{xr})": v
-                for (xe, xr), v in self._best_batch_size_by_action.items()
-            },
             "best_batch_size_by_action": {
                 f"({xe},{xr})": v
                 for (xe, xr), v in self._best_batch_size_by_action.items()
@@ -1614,6 +1606,8 @@ class GreedyScheduler:
         self._gen_per_query_ema = raw_gpq
         self._er_base_overhead_ema = float(raw.get("er_base_overhead_ema", 0.0))
         self._embedding_latency_ema_ms_per_query = parse_int_key(raw, "embedding_latency_ema")
+        self._emb_per_token_ema = parse_int_key(raw, "emb_per_token_ema")
+        self._emb_L_calibration_ema = parse_int_key(raw, "emb_L_calibration_ema")
         self._retrieval_latency_ema_ms_per_query = parse_int_key(raw, "retrieval_latency_ema")
         self._overlap_factor_ema = parse_tuple_key(raw, "overlap_factor_ema")
         self._batch_size_residual_ema_ms_per_query = {
@@ -1720,11 +1714,11 @@ class GreedyScheduler:
                     if x_e != int(getattr(self.args, "xE", 0)) or x_r != int(getattr(self.args, "xR", 0)):
                         continue
 
-                feasible, mem_penalty = self._action_feasible(x_e, x_r, bs, gpu_available, gpu_mem_gb)
+                feasible = self._action_feasible(x_e, x_r, bs, gpu_available, gpu_mem_gb)
                 if not feasible:
                     continue
 
-                score = self._estimate_wall_time(bs, x_e, x_r, pending_count) + mem_penalty
+                score = self._estimate_wall_time(bs, x_e, x_r, pending_count)
 
                 if score < best_score:
                     best_score = score
@@ -1777,7 +1771,7 @@ class GreedyScheduler:
             cx_r = int(action["xR"])
             if not self._feasible_actions_ema.get((cx_e, cx_r), True):
                 continue
-            feasible, _ = self._action_feasible(cx_e, cx_r, batch_size, gpu_available, gpu_mem_gb)
+            feasible = self._action_feasible(cx_e, cx_r, batch_size, gpu_available, gpu_mem_gb)
             if not feasible:
                 continue
             candidate_action_rows.append({
