@@ -1720,11 +1720,11 @@ class GreedyScheduler:
                     if x_e != int(getattr(self.args, "xE", 0)) or x_r != int(getattr(self.args, "xR", 0)):
                         continue
 
-                feasible, _ = self._action_feasible(x_e, x_r, bs, gpu_available, gpu_mem_gb)
+                feasible, mem_penalty = self._action_feasible(x_e, x_r, bs, gpu_available, gpu_mem_gb)
                 if not feasible:
                     continue
 
-                score = self._estimate_wall_time(bs, x_e, x_r, pending_count)
+                score = self._estimate_wall_time(bs, x_e, x_r, pending_count) + mem_penalty
 
                 if score < best_score:
                     best_score = score
