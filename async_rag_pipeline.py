@@ -882,27 +882,43 @@ class GreedyScheduler:
         self._emb_per_token_ema: Dict[int, float] = {}                      # ms/token (used in cost model)
         self._emb_L_calibration_ema: Dict[int, float] = {}                   # token length at calibration time
         self._retrieval_latency_ema_ms_per_query: Dict[int, float] = {}
+        # ── New cost model (v3) ────────────────────────────────────────────────
+        # wall_q = L_in*e[xE] + r[xR]*B^{alpha-1} + P0/B + p_lin*L_in + g + I(xE≠xR)*K[xE,xR]*L_in
+        # where:
+        #   e[xE]    = ms/token  : embedding rate (xE)
+        #   r[xR]    = ms        : ret coefficient (xR)
+        #   alpha[xR]= -         : ret sublinear exponent (xR)
+        #   P0       = ms        : gen prefill fixed overhead (shared)
+        #   p_lin    = ms/token  : gen prefill per-token rate (shared)
+        #   g        = ms/q      : gen decode marginal cost (shared)
+        #   K[xE,xR] = ms/token  : transfer rate, xE=xR→0
+        self._emb_rate_ema: Dict[int, float] = {}                    # e[xE], ms/token
+        self._ret_r_ema: Dict[int, float] = {}                      # r[xR], ms
+        self._ret_alpha_ema: Dict[int, float] = {}                   # alpha[xR], default 0.5
+        self._gen_P0_ema: float = 2072.0                            # ms, prefill fixed
+        self._gen_p_lin_ema: float = 0.0                            # ms/token, prefill per-token
+        self._gen_g_ema: float = 57.1                               # ms/q, decode marginal
+        self._transfer_K_ema: Dict[Tuple[int, int], float] = {}      # K[xE,xR], ms/token
+        self._contention_ema: Dict[Tuple[int, int], float] = {}      # obs/pred ratio
+        self._er_base_overhead_ema: float = 0.0                     # ms, not currently used
+        # ── Old fields kept for backward compat (read-only in cost model) ─────────
+        self._gen_base_overhead_ema: Dict[Tuple[int, int], float] = {}  # alias for _gen_P0_ema
+        self._gen_per_query_ema: Dict[Tuple[int, int], float] = {}      # alias for _gen_g_ema
+        self._gen_prefill_per_token_ema: Dict[Tuple[int, int], float] = {}  # alias for _gen_p_lin_ema
+        # ── Deprecated fields (kept for dead-code compatibility) ────────────────
         self._generation_latency_ema_ms_per_query: float = 0.0
-        self._transfer_latency_ema_ms_per_query: Dict[Tuple[int, int, int], float] = {}
+        self._transfer_latency_ema_ms_per_query: Dict[Tuple[int, int], float] = {}
         self._batch_size_residual_ema_ms_per_query: Dict[int, float] = {}
-
-        # New wall-time model: wall_time = max(gen_time, emb_ret_time)
-        # gen_time[(xE,xR)] = gen_base[(xE,xR)] + gen_per_query[(xE,xR)] * batch_size
-        #   (LLM inference: prefill + decode both scale linearly with batch_size)
-        # emb_ret_time = er_base_overhead + (emb_per_query + ret_per_query) * batch_size
-        self._gen_base_overhead_ema: Dict[Tuple[int, int], float] = {}   # ms (fixed overhead)
-        self._gen_per_query_ema: Dict[Tuple[int, int], float] = {}       # ms per query
-        self._contention_ema: Dict[Tuple[int, int], float] = {}            # scaling factor: obs/pred
+        self._embedding_latency_ema_ms_per_query: Dict[int, float] = {}  # alias for _emb_rate_ema
+        self._retrieval_latency_ema_ms_per_query: Dict[int, float] = {}  # deprecated
         self._startup_base_ema: Dict[Tuple[int, int], float] = {}
         self._startup_k_ema: Dict[Tuple[int, int], float] = {}
-        self._er_base_overhead_ema: float = 0.0       # ms (E+R combined base overhead)
+        # ── Tracking ──────────────────────────────────────────────────────────
         self._wall_time_measurements: Dict[Tuple[int, int], List[Tuple[int, float, float]]] = {}
-        self._overlap_factor_ema: Dict[Tuple[int, int], float] = {}  # 0.0 = full parallel, 1.0 = sequential
-        self._contention_ema: Dict[Tuple[int, int], float] = {}     # obs/pred ratio per (xE, xR)
-        self._gen_prefill_per_token_ema: Dict[Tuple[int, int], float] = {}  # ms/token per (xE, xR)
-        # Per-action best batch size (EMA-adapted)
+        self._ret_measurements: Dict[int, List[Tuple[int, float]]] = {}   # {xR: [(B, ret_ms_total), ...]}
+        # ── Scheduling state ──────────────────────────────────────────────────
+        self._overlap_factor_ema: Dict[Tuple[int, int], float] = {}
         self._best_batch_size_by_action: Dict[Tuple[int, int], int] = {}
-        # V2: single unified pending pool sorted by token_length (ascending)
         self._pending_queries: List[PendingQuery] = []
         self._query_token_lengths: Dict[int, int] = {}
         self.dispatch_trace: List[DispatchTraceEntry] = []
@@ -911,12 +927,16 @@ class GreedyScheduler:
         self.device_plan_trace: List[DevicePlanTraceEntry] = []
         self.batch_shaping_trace: List[BatchShapingTraceEntry] = []
 
-        # gen_per_query warm-start: from benchmark, gen_q = 2072/B + 57.1 (ms/q)
-        self._gen_base_overhead_ema[(0, 0)] = 2072.0   # ms, fixed prefill overhead
-        self._gen_per_query_ema[(0, 0)] = 57.1          # ms/q, marginal cost
-        self._wall_time_measurements[(0, 0)] = []
-        self._contention_ema[(0, 0)] = 1.0            # seeded at 1.0, updated online
-        self._gen_prefill_per_token_ema[(0, 0)] = 0.0  # only non-zero if L_in variance was high
+        # Warm-start defaults
+        self._emb_rate_ema[0] = 0.05     # ms/token, CPU embedding rate
+        self._emb_rate_ema[1] = 0.05     # ms/token, GPU embedding rate
+        self._ret_r_ema[0] = 0.15        # ms, CPU retrieval coefficient
+        self._ret_r_ema[1] = 0.15        # ms, GPU retrieval coefficient
+        self._ret_alpha_ema[0] = 0.5     # sublinear exponent
+        self._ret_alpha_ema[1] = 0.5
+        self._transfer_K_ema[(0, 1)] = 0.0
+        self._transfer_K_ema[(1, 0)] = 0.0
+        self._contention_ema[(0, 0)] = 1.0
 
     @staticmethod
     def _estimate_query_length(query: str) -> int:
@@ -1110,47 +1130,62 @@ class GreedyScheduler:
         x_r: int,
     ) -> float:
         """
-        Total wall time for one dispatch (ms), not per-query.
+        Complete wall_q cost model (ms/q):
 
-        Pipeline T_cycle by (xE, xR) — per-query times:
-          (0,0): max(gen_q,  emb_q*B + ret_q)
-          (1,0): emb_q*B + max(ret_q, gen_q)
-          (0,1): ret_q  + max(emb_q*B, gen_q)
-          (1,1): emb_q*B + ret_q + gen_q
-        where gen_q = (P/B + D + C_tok * L̄_in) * contention.
+        wall_q = L_in*e[xE] + r[xR]*B^{alpha-1} + P0/B + p_lin*L_in + g + I(xE≠xR)*K[xE,xR]*L_in
 
-        er_base is added to the E+R portion (serial base overhead for batch launch).
+        Component breakdown:
+          emb:  L_in * e[xE]        (constant in B)
+          ret:  r[xR] * B^{alpha-1} (sublinear in B)
+          gen:  P0/B + p_lin*L_in + g  (P0/B term: hyperbolic, p_lin*L_in: constant, g: constant)
+          xfer: I(xE≠xR) * K[xE,xR] * L_in  (constant in B, only when cross-device)
+
+        Pipeline T_cycle by (xE, xR) on total times:
+          (0,0): max(gen, emb + ret)           // CPU E+R || GPU gen
+          (1,0): emb + max(ret, gen)            // GPU emb → ret (CPU) || gen
+          (0,1): emb + max(ret, gen)            // CPU emb → ret (GPU) || gen
+          (1,1): emb + ret + gen               // all GPU serial
+        where transfer is embedded in emb for (0,1)/(1,0) and gen does NOT
+        depend on xE/xR (always on GPU).
+
+        Returns wall_q = wall_total / B (ms per query).
         """
         key = (x_e, x_r)
         B = max(1, batch_size)
-        L_avg = float(sum(lengths) / len(lengths)) if lengths else 30.0
+        L = float(sum(lengths) / len(lengths)) if lengths else 30.0
 
-        P = self._gen_base_overhead_ema.get(key, 2072.0)
-        D = self._gen_per_query_ema.get(key, 57.1)
-        C_tok = getattr(self, '_gen_prefill_per_token_ema', {}).get(key, 0.0)
+        # --- Gen (always on GPU, xE/xR only affect contention) ---
+        P0 = self._gen_P0_ema
+        p_lin = self._gen_p_lin_ema
+        g = self._gen_g_ema
         cont = self._contention_ema.get(key, 1.0)
+        gen_total = (P0 + p_lin * L * B + g * B) * cont   # ms/batch
 
-        gen_q = (P / B + D + C_tok * L_avg) * cont   # ms/q
+        # --- Emb (compute only, does not move data) ---
+        e = self._emb_rate_ema.get(x_e, 0.05)              # ms/token
+        emb_total = e * L * B                                # ms/batch
 
-        emb_per_token = self._emb_per_token_ema.get(x_e, 0.05)    # ms/token
-        # emb_total = emb_per_token * L_avg * B  (rate × length × batch)
-        emb_total = emb_per_token * L_avg * B
+        # --- Ret (sublinear in B) ---
+        r = self._ret_r_ema.get(x_r, 0.15)                 # ms
+        alpha = self._ret_alpha_ema.get(x_r, 0.5)          # exponent
+        ret_total = r * (B ** alpha)                         # ms/batch
 
-        ret_q = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.15)
-        er_base = self._er_base_overhead_ema
+        # --- Transfer (only when xE != xR) ---
+        K = self._transfer_K_ema.get((x_e, x_r), 0.0)     # ms/token
+        xfer_total = K * L * B if x_e != x_r else 0.0       # ms/batch
 
-        ret_total = ret_q        # single FAISS batch call
-        gen_total = gen_q * B
-
+        # --- T_cycle by (xE, xR) ---
         if x_e == 0 and x_r == 0:
-            er_total = er_base + emb_total + ret_total
-            wall = max(gen_total, er_total)
+            # CPU emb+ret || GPU gen
+            wall = max(emb_total + ret_total, gen_total)
         elif x_e == 1 and x_r == 0:
-            wall = er_base + emb_total + max(ret_total, gen_total)
+            # GPU emb → transfer → CPU ret, || GPU gen
+            wall = emb_total + xfer_total + max(ret_total, gen_total)
         elif x_e == 0 and x_r == 1:
-            wall = er_base + ret_total + max(emb_total, gen_total)
-        else:  # (1,1): GPU emb + GPU ret + GPU gen all serial
-            wall = er_base + emb_total + ret_total + gen_total
+            # CPU emb → transfer → GPU ret, || GPU gen
+            wall = emb_total + xfer_total + max(ret_total, gen_total)
+        else:  # (1,1): all GPU serial
+            wall = emb_total + ret_total + gen_total
 
         return wall / B   # per-query wall time
 
@@ -1223,131 +1258,112 @@ class GreedyScheduler:
         x_r: int,
         emb_ret_wall_sec: float = 0.0,
     ) -> None:
-        L_avg = sum(token_lengths) / len(token_lengths) if token_lengths else 0.0
-        embedding_ms_per_query = embedding_sec * 1000.0 / max(1, batch_size)
-        # emb_per_token: embedding time per token, averaged across queries in batch
-        emb_per_token = (embedding_sec * 1000.0 / max(1e-9, L_avg)) if L_avg > 0 else 0.0
+        """
+        Per-component fitting for the v3 cost model:
 
-        emb_key = x_e
-        previous_emb = self._embedding_latency_ema_ms_per_query.get(emb_key)
-        if previous_emb is None:
-            self._embedding_latency_ema_ms_per_query[emb_key] = embedding_ms_per_query
-            self._emb_per_token_ema[emb_key] = emb_per_token
-            self._emb_L_calibration_ema[emb_key] = L_avg
-        else:
-            self._embedding_latency_ema_ms_per_query[emb_key] = (
-                self.ema_alpha * embedding_ms_per_query + (1.0 - self.ema_alpha) * previous_emb
-            )
-            prev_tok = self._emb_per_token_ema.get(emb_key, emb_per_token)
-            prev_L = self._emb_L_calibration_ema.get(emb_key, L_avg)
-            self._emb_per_token_ema[emb_key] = (
-                self.ema_alpha * emb_per_token + (1.0 - self.ema_alpha) * prev_tok
-            )
-            # Calibrated length: exponential average of batch L_avg
-            self._emb_L_calibration_ema[emb_key] = (
-                self.ema_alpha * L_avg + (1.0 - self.ema_alpha) * prev_L
-            )
+        wall_q = L_in*e[xE] + r[xR]*B^{alpha-1} + P0/B + p_lin*L_in + g
+                 + I(xE≠xR)*K[xE,xR]*L_in
 
-        retrieval_ms_per_query = retrieval_sec * 1000.0 / max(1, batch_size)
-        ret_key = x_r
-        previous_ret = self._retrieval_latency_ema_ms_per_query.get(ret_key)
-        if previous_ret is None:
-            self._retrieval_latency_ema_ms_per_query[ret_key] = retrieval_ms_per_query
-        else:
-            self._retrieval_latency_ema_ms_per_query[ret_key] = (
-                self.ema_alpha * retrieval_ms_per_query + (1.0 - self.ema_alpha) * previous_ret
-            )
-
-        transfer_ms_per_query = 0.0
-        if x_e == 1 and x_r == 0:
-            transfer_ms_per_query = embedding_ms_per_query * 0.15
-        elif x_e == 0 and x_r == 1:
-            transfer_ms_per_query = retrieval_ms_per_query * 0.15
-        transfer_key = (x_e, x_r)
-        previous_transfer = self._transfer_latency_ema_ms_per_query.get(transfer_key)
-        if previous_transfer is None:
-            self._transfer_latency_ema_ms_per_query[transfer_key] = transfer_ms_per_query
-        else:
-            self._transfer_latency_ema_ms_per_query[transfer_key] = (
-                self.ema_alpha * transfer_ms_per_query + (1.0 - self.ema_alpha) * previous_transfer
-            )
-
-        generation_ms_per_query = generation_sec * 1000.0 / max(1, batch_size)
-        if self._generation_latency_ema_ms_per_query > 0:
-            self._generation_latency_ema_ms_per_query = (
-                self.ema_alpha * generation_ms_per_query
-                + (1.0 - self.ema_alpha) * self._generation_latency_ema_ms_per_query
-            )
-        else:
-            self._generation_latency_ema_ms_per_query = generation_ms_per_query
-
-        total_ms_per_query = (embedding_sec + retrieval_sec + generation_sec) * 1000.0 / max(1, batch_size)
-        try:
-            action_cost = self._estimate_action_cost(token_lengths, batch_size, x_e, x_r)
-        except Exception as exc:
-            import traceback as _tb2
-            print(f"[_record_batch_feedback ERROR] x_e={x_e} x_r={x_r} batch={batch_size}: {exc}\n{_tb2.format_exc()}", flush=True)
-            action_cost = 0.0
-        batch_residual = total_ms_per_query - action_cost
-        previous_batch = self._batch_size_residual_ema_ms_per_query.get(batch_size)
-        if previous_batch is None:
-            self._batch_size_residual_ema_ms_per_query[batch_size] = batch_residual
-        else:
-            self._batch_size_residual_ema_ms_per_query[batch_size] = (
-                self.ema_alpha * batch_residual + (1.0 - self.ema_alpha) * previous_batch
-            )
-
-        # --- Compute observed timings (all per-query for consistent comparison) ---
-        key = (x_e, x_r)
+        Each parameter is fitted from its own independent observation source.
+        Contention EMA absorbs residual model mismatch across all components.
+        """
         B = max(1, batch_size)
-        observed_gen_per_q = generation_sec * 1000.0 / B  # ms per query
+        L = float(sum(token_lengths) / len(token_lengths)) if token_lengths else 0.0
+        a = self.ema_alpha
 
-        # --- Update P and D via two-point fitting when we have >= 2 observations ---
-        if key not in self._wall_time_measurements:
-            self._wall_time_measurements[key] = []
-        self._wall_time_measurements[key].append((B, observed_gen_per_q, L_avg))
+        # ── 1. Emb: e[xE] = emb_ms_total / (L * B) ──────────────────────────────
+        emb_ms_total = embedding_sec * 1000.0
+        if L > 0 and B > 0:
+            e_obs = emb_ms_total / (L * B)        # ms/token
+        else:
+            e_obs = self._emb_rate_ema.get(x_e, 0.05)
+        prev_e = self._emb_rate_ema.get(x_e)
+        self._emb_rate_ema[x_e] = e_obs if prev_e is None else a * e_obs + (1 - a) * prev_e
 
-        # Keep only last 20 observations
-        if len(self._wall_time_measurements[key]) > 20:
-            self._wall_time_measurements[key] = self._wall_time_measurements[key][-20:]
+        # ── 2. Ret: r[xR] and alpha[xR] — fit from ret_ms across B values ───────
+        ret_ms_total = retrieval_sec * 1000.0
+        ret_key = x_r
+        if ret_key not in self._ret_measurements:
+            self._ret_measurements[ret_key] = []
+        if L > 0:
+            self._ret_measurements[ret_key].append((B, ret_ms_total))
+        if len(self._ret_measurements[ret_key]) > 20:
+            self._ret_measurements[ret_key] = self._ret_measurements[ret_key][-20:]
 
-        obs = self._wall_time_measurements[key]
-        if len(obs) >= 2:
-            # Two-point fit: obs_q = P/B + D + C_tok * L_avg
-            # With fixed C_tok=0 (no per-token fit unless variance is high)
-            b1, g1, _ = obs[0]
-            b2, g2, _ = obs[-1]
-            denom = (1.0/b2 - 1.0/b1)
-            if abs(denom) > 1e-9:
-                P_new = (g2 - g1) / denom
-                D_new = g1 - P_new / b1
-                P_new = max(0.0, P_new)
-                D_new = max(0.0, D_new)
-                alpha = self.ema_alpha
-                old_P = self._gen_base_overhead_ema.get(key, P_new)
-                old_D = self._gen_per_query_ema.get(key, D_new)
-                self._gen_base_overhead_ema[key] = alpha * P_new + (1 - alpha) * old_P
-                self._gen_per_query_ema[key] = alpha * D_new + (1 - alpha) * old_D
+        obs_ret = self._ret_measurements[ret_key]
+        if len(obs_ret) >= 2:
+            # Two-point fit for (r, alpha) from: ret = r * B^alpha
+            b1, t1 = obs_ret[0]
+            b2, t2 = obs_ret[-1]
+            if b1 != b2 and t1 > 0 and t2 > 0:
+                # t1 = r * b1^alpha  →  log(t1/r) = alpha * log(b1)
+                # t2 = r * b2^alpha  →  log(t2/r) = alpha * log(b2)
+                alpha_obs = math.log(t2 / t1) / math.log(b2 / b1) if b2 != b1 else 0.5
+                alpha_obs = max(0.1, min(1.0, alpha_obs))   # clamp to [0.1, 1.0]
+                r_obs = t1 / (b1 ** alpha_obs)
+                prev_alpha = self._ret_alpha_ema.get(ret_key, 0.5)
+                prev_r = self._ret_r_ema.get(ret_key, 0.15)
+                self._ret_alpha_ema[ret_key] = a * alpha_obs + (1 - a) * prev_alpha
+                self._ret_r_ema[ret_key] = a * r_obs + (1 - a) * prev_r
 
-        # Current model parameters (may have just been updated above)
-        P_cur = self._gen_base_overhead_ema.get(key, 2072.0)
-        D_cur = self._gen_per_query_ema.get(key, 57.1)
-        pred_gen_per_q = P_cur / B + D_cur
+        # ── 3. Gen: P0, p_lin, g — fit from gen_wall_sec across B values ─────────
+        gen_ms_total = gen_wall_sec * 1000.0     # wall time of generation stage
+        gen_key = (x_e, x_r)
+        if gen_key not in self._wall_time_measurements:
+            self._wall_time_measurements[gen_key] = []
+        if L > 0:
+            self._wall_time_measurements[gen_key].append((B, gen_ms_total, L))
+        if len(self._wall_time_measurements[gen_key]) > 20:
+            self._wall_time_measurements[gen_key] = self._wall_time_measurements[gen_key][-20:]
 
-        # --- Contention ratio: observed / predicted ---
-        # Absorbs genuine GPU contention + any residual model mismatch
-        if pred_gen_per_q > 0 and observed_gen_per_q > 0:
-            ratio = observed_gen_per_q / pred_gen_per_q
-            alpha = self.ema_alpha
-            prev = self._contention_ema.get(key, None)
-            if prev is None:
-                self._contention_ema[key] = ratio
+        obs_g = self._wall_time_measurements[gen_key]
+        if len(obs_g) >= 2:
+            # Two-point fit for (P0, p_lin) from: gen_total/B = P0/B + p_lin*L
+            b1, t1, L1 = obs_g[0]
+            b2, t2, L2 = obs_g[-1]
+            if b1 > 0 and b2 > 0:
+                gq1 = t1 / b1
+                gq2 = t2 / b2
+                # p_lin = (gq2 - gq1) / (L2 - L1)
+                # P0    = gq1 - p_lin*L1  (or using b2)
+                denom_L = L2 - L1
+                if abs(denom_L) > 1e-6:
+                    p_lin_new = (gq2 - gq1) / denom_L
+                    P0_new = gq1 - p_lin_new * L1
+                else:
+                    p_lin_new = self._gen_p_lin_ema
+                    P0_new = (gq1 + gq2) / 2.0 - p_lin_new * (L1 + L2) / 2.0
+                P0_new = max(0.0, P0_new)
+                p_lin_new = max(0.0, p_lin_new)
+                self._gen_P0_ema = a * P0_new + (1 - a) * self._gen_P0_ema
+                self._gen_p_lin_ema = a * p_lin_new + (1 - a) * self._gen_p_lin_ema
+
+            # g: use smallest B observation to minimize P0/B contribution
+            b_min, t_min, L_min = min(obs_g, key=lambda x: x[0])
+            g_obs = t_min / b_min - self._gen_P0_ema / b_min - self._gen_p_lin_ema * L_min
+            g_obs = max(0.0, g_obs)
+            self._gen_g_ema = a * g_obs + (1 - a) * self._gen_g_ema
+
+        # ── 4. Transfer K[xE, xR] — only when xE != xR ────────────────────────────
+        if x_e != x_r:
+            K_obs = emb_ms_total / (L * B) if L > 0 and B > 0 else 0.0   # approximate
+            prev_K = self._transfer_K_ema.get((x_e, x_r), 0.0)
+            if prev_K == 0.0:
+                self._transfer_K_ema[(x_e, x_r)] = K_obs
             else:
-                self._contention_ema[key] = alpha * ratio + (1.0 - alpha) * prev
+                self._transfer_K_ema[(x_e, x_r)] = a * K_obs + (1 - a) * prev_K
 
-        if key not in self._startup_base_ema:
-            self._startup_base_ema[key] = 0.0
-            self._startup_k_ema[key] = 10.0
+        # ── 5. Contention: obs_wall / pred_wall ratio ───────────────────────────
+        total_obs = (embedding_sec + retrieval_sec + generation_sec) * 1000.0 / B
+        try:
+            pred_wall = self._estimate_action_cost(token_lengths, B, x_e, x_r)
+        except Exception:
+            pred_wall = total_obs
+        if pred_wall > 0:
+            ratio = total_obs / pred_wall
+            ratio = max(0.1, min(10.0, ratio))
+            prev_c = self._contention_ema.get(gen_key)
+            self._contention_ema[gen_key] = ratio if prev_c is None else a * ratio + (1 - a) * prev_c
 
         self.feedback_trace.append(
             FeedbackTraceEntry(
@@ -1357,24 +1373,21 @@ class GreedyScheduler:
                 xR=x_r,
                 token_length_min=min(token_lengths) if token_lengths else 0,
                 token_length_max=max(token_lengths) if token_lengths else 0,
-                token_length_avg=(float(sum(token_lengths)) / len(token_lengths)) if token_lengths else 0.0,
-                embedding_ms_per_query=embedding_ms_per_query,
-                retrieval_ms_per_query=retrieval_ms_per_query,
-                generation_ms_per_query=generation_ms_per_query,
-                transfer_ms_per_query_est=self._transfer_latency_ema_ms_per_query.get(transfer_key, 0.0),
-                batch_size_residual_ms_per_query=self._batch_size_residual_ema_ms_per_query.get(batch_size, 0.0),
+                token_length_avg=L,
+                embedding_ms_per_query=e_obs,
+                retrieval_ms_per_query=ret_ms_total / B,
+                generation_ms_per_query=gen_ms_total / B,
+                transfer_ms_per_query_est=self._transfer_K_ema.get((x_e, x_r), 0.0) * L if x_e != x_r else 0.0,
+                batch_size_residual_ms_per_query=0.0,
                 ema_after_update={
-                    "embedding": self._embedding_latency_ema_ms_per_query.get(emb_key, 0.0),
-                    "retrieval": self._retrieval_latency_ema_ms_per_query.get(ret_key, 0.0),
-                    "generation": self._generation_latency_ema_ms_per_query,
-                    "transfer": self._transfer_latency_ema_ms_per_query.get(transfer_key, 0.0),
-                    "batch_size_residual": self._batch_size_residual_ema_ms_per_query.get(batch_size, 0.0),
-                    "max_batch_size_ema": self._max_batch_size_ema,
-                    f"gen_base_({x_e},{x_r})": self._gen_base_overhead_ema.get((x_e, x_r), 0.0),
-                    f"gen_per_query_({x_e},{x_r})": self._gen_per_query_ema.get((x_e, x_r), 0.0),
-                    f"contention_({x_e},{x_r})": self._contention_ema.get((x_e, x_r), 1.0),
-                    "er_base_overhead_ema": self._er_base_overhead_ema,
-                    f"overlap_factor_({x_e},{x_r})": self._overlap_factor_ema.get((x_e, x_r), None),
+                    f"e[{x_e}]": self._emb_rate_ema.get(x_e, 0.0),
+                    f"r[{x_r}]": self._ret_r_ema.get(x_r, 0.0),
+                    f"alpha[{x_r}]": self._ret_alpha_ema.get(x_r, 0.0),
+                    "P0": self._gen_P0_ema,
+                    "p_lin": self._gen_p_lin_ema,
+                    "g": self._gen_g_ema,
+                    f"K[{x_e},{x_r}]": self._transfer_K_ema.get((x_e, x_r), 0.0),
+                    f"contention[{x_e},{x_r}]": self._contention_ema.get(gen_key, 1.0),
                 },
             )
         )
@@ -1496,77 +1509,45 @@ class GreedyScheduler:
     def get_ema_params(self) -> Dict[str, Any]:
         """Return all current EMA parameters as a dict for inspection."""
         return {
-            "gen_base_overhead_ema": {f"({xe},{xr})": v for (xe, xr), v in self._gen_base_overhead_ema.items()},
-            "gen_per_query_ema": {f"({xe},{xr})": v for (xe, xr), v in self._gen_per_query_ema.items()},
-            "gen_prefill_per_token_ema": {f"({xe},{xr})": v for (xe, xr), v in getattr(self, '_gen_prefill_per_token_ema', {}).items()},
+            "emb_rate_ema": {f"{xe}": v for xe, v in self._emb_rate_ema.items()},
+            "ret_r_ema": {f"{xr}": v for xr, v in self._ret_r_ema.items()},
+            "ret_alpha_ema": {f"{xr}": v for xr, v in self._ret_alpha_ema.items()},
+            "gen_P0_ema": self._gen_P0_ema,
+            "gen_p_lin_ema": self._gen_p_lin_ema,
+            "gen_g_ema": self._gen_g_ema,
+            "transfer_K_ema": {f"({xe},{xr})": v for (xe, xr), v in self._transfer_K_ema.items()},
             "contention_ema": {f"({xe},{xr})": v for (xe, xr), v in self._contention_ema.items()},
             "er_base_overhead_ema": self._er_base_overhead_ema,
-            "embedding_latency_ema": {f"{xe}": v for xe, v in self._embedding_latency_ema_ms_per_query.items()},
-            "emb_per_token_ema": {f"{xe}": v for xe, v in self._emb_per_token_ema.items()},
-            "emb_L_calibration_ema": {f"{xe}": v for xe, v in self._emb_L_calibration_ema.items()},
-            "retrieval_latency_ema": {f"{xr}": v for xr, v in self._retrieval_latency_ema_ms_per_query.items()},
-            "overlap_factor_ema": {f"({xe},{xr})": v for (xe, xr), v in self._overlap_factor_ema.items()},
-            "batch_size_residual_ema": {str(bs): v for bs, v in self._batch_size_residual_ema_ms_per_query.items()},
-            "max_batch_size_ema": self._max_batch_size_ema,
-            "best_batch_size_by_action": {f"({xe},{xr})": v for (xe, xr), v in self._best_batch_size_by_action.items()},
+            "ret_measurements": {f"{xr}": ms for xr, ms in self._ret_measurements.items()},
             "wall_time_measurements": {
                 f"({xe},{xr})": ms for (xe, xr), ms in self._wall_time_measurements.items()
             },
+            "max_batch_size_ema": self._max_batch_size_ema,
+            "best_batch_size_by_action": {f"({xe},{xr})": v for (xe, xr), v in self._best_batch_size_by_action.items()},
         }
 
     def save_ema_params(self, path: str) -> None:
         """Persist all EMA parameters to a JSON file for warm-start on next run."""
         data = {
-            "version": 1,
-            "gen_base_overhead_ema": {
-                f"({xe},{xr})": v
-                for (xe, xr), v in self._gen_base_overhead_ema.items()
-            },
-            "gen_per_query_ema": {
-                f"({xe},{xr})": v
-                for (xe, xr), v in self._gen_per_query_ema.items()
-            },
+            "version": 3,
+            "emb_rate_ema": {f"{xe}": v for xe, v in self._emb_rate_ema.items()},
+            "ret_r_ema": {f"{xr}": v for xr, v in self._ret_r_ema.items()},
+            "ret_alpha_ema": {f"{xr}": v for xr, v in self._ret_alpha_ema.items()},
+            "gen_P0_ema": self._gen_P0_ema,
+            "gen_p_lin_ema": self._gen_p_lin_ema,
+            "gen_g_ema": self._gen_g_ema,
+            "transfer_K_ema": {f"({xe},{xr})": v for (xe, xr), v in self._transfer_K_ema.items()},
+            "contention_ema": {f"({xe},{xr})": v for (xe, xr), v in self._contention_ema.items()},
             "er_base_overhead_ema": self._er_base_overhead_ema,
-            "embedding_latency_ema": {
-                f"{xe}": v
-                for xe, v in self._embedding_latency_ema_ms_per_query.items()
-            },
-            "emb_per_token_ema": {
-                f"{xe}": v
-                for xe, v in self._emb_per_token_ema.items()
-            },
-            "emb_L_calibration_ema": {
-                f"{xe}": v
-                for xe, v in self._emb_L_calibration_ema.items()
-            },
-            "retrieval_latency_ema": {
-                f"{xr}": v
-                for xr, v in self._retrieval_latency_ema_ms_per_query.items()
-            },
-            "overlap_factor_ema": {
-                f"({xe},{xr})": v
-                for (xe, xr), v in self._overlap_factor_ema.items()
-            },
-            "batch_size_residual_ema": {
-                str(bs): v
-                for bs, v in self._batch_size_residual_ema_ms_per_query.items()
+            "ret_measurements": {f"{xr}": ms for xr, ms in self._ret_measurements.items()},
+            "wall_time_measurements": {
+                f"({xe},{xr})": ms
+                for (xe, xr), ms in self._wall_time_measurements.items()
             },
             "max_batch_size_ema": self._max_batch_size_ema,
             "best_batch_size_by_action": {
                 f"({xe},{xr})": v
                 for (xe, xr), v in self._best_batch_size_by_action.items()
-            },
-            "gen_prefill_per_token_ema": {
-                f"({xe},{xr})": v
-                for (xe, xr), v in getattr(self, '_gen_prefill_per_token_ema', {}).items()
-            },
-            "contention_ema": {
-                f"({xe},{xr})": v
-                for (xe, xr), v in self._contention_ema.items()
-            },
-            "wall_time_measurements": {
-                f"({xe},{xr})": ms
-                for (xe, xr), ms in self._wall_time_measurements.items()
             },
             "feasible_actions": {
                 f"({xe},{xr})": v
@@ -1595,6 +1576,55 @@ class GreedyScheduler:
             return result
 
         def parse_int_key(d: Dict[str, Any], src_key: str) -> Dict[int, float]:
+            return {int(k): float(v) for k, v in d.get(src_key, {}).items()}
+
+        version = raw.get("version", 1)
+
+        # v3: new cost model
+        self._emb_rate_ema = parse_int_key(raw, "emb_rate_ema")
+        self._ret_r_ema = parse_int_key(raw, "ret_r_ema")
+        self._ret_alpha_ema = parse_int_key(raw, "ret_alpha_ema")
+        self._gen_P0_ema = float(raw.get("gen_P0_ema", 2072.0))
+        self._gen_p_lin_ema = float(raw.get("gen_p_lin_ema", 0.0))
+        self._gen_g_ema = float(raw.get("gen_g_ema", 57.1))
+        self._transfer_K_ema = parse_tuple_key(raw, "transfer_K_ema")
+        self._contention_ema = parse_tuple_key(raw, "contention_ema")
+        self._er_base_overhead_ema = float(raw.get("er_base_overhead_ema", 0.0))
+
+        # ret_measurements
+        self._ret_measurements = {}
+        for k_str, ms_list in raw.get("ret_measurements", {}).items():
+            xr = int(k_str)
+            self._ret_measurements[xr] = [(int(item[0]), float(item[1])) for item in ms_list]
+
+        # wall_time_measurements
+        self._wall_time_measurements = {}
+        for k_str, ms_list in raw.get("wall_time_measurements", {}).items():
+            k_str = k_str.strip()
+            if k_str.startswith("(") and k_str.endswith(")"):
+                parts = k_str[1:-1].split(",")
+                if len(parts) == 2:
+                    key = (int(parts[0].strip()), int(parts[1].strip()))
+                    self._wall_time_measurements[key] = [
+                        (int(item[0]), float(item[1]), float(item[2]) if len(item) > 2 else 0.0)
+                        for item in ms_list
+                    ]
+
+        self._max_batch_size_ema = float(raw.get("max_batch_size_ema", self._max_batch_size_ema))
+        self._best_batch_size_by_action = {}
+        for k_str, v in raw.get("best_batch_size_by_action", {}).items():
+            k_str = k_str.strip()
+            if k_str.startswith("(") and k_str.endswith(")"):
+                parts = k_str[1:-1].split(",")
+                if len(parts) == 2:
+                    self._best_batch_size_by_action[(int(parts[0].strip()), int(parts[1].strip()))] = int(v)
+        self._feasible_actions_ema = {}
+        for k_str, v in raw.get("feasible_actions", {}).items():
+            k_str = k_str.strip()
+            if k_str.startswith("(") and k_str.endswith(")"):
+                parts = k_str[1:-1].split(",")
+                if len(parts) == 2:
+                    self._feasible_actions_ema[(int(parts[0].strip()), int(parts[1].strip()))] = bool(v)
             return {int(k): float(v) for k, v in d.get(src_key, {}).items()}
 
         self._gen_base_overhead_ema = parse_tuple_key(raw, "gen_base_overhead_ema")
