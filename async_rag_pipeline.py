@@ -900,7 +900,7 @@ class GreedyScheduler:
         self._gen_g_ema: float = 57.1                               # ms/q, decode marginal
         self._gen_per_token_ema: float = 0.378                       # ms/token, constant gen rate
         self._avg_output_tokens_ema: float = 120.0                     # avg output tokens per query
-        self._gpu_contention_ema: float = 38.5                        # ms/q, GPU emb+gen contention penalty
+        self._gpu_contention_ema: float = 0.0                         # ms/q, GPU emb+gen contention penalty
         self._transfer_K_ema: Dict[Tuple[int, int], float] = {}      # K[xE,xR], ms/token
         self._queue_penalty_ema: float = 2.5                        # ms/q, per-query queueing overhead
         self._contention_ema: Dict[Tuple[int, int], float] = {}      # obs/pred ratio (legacy, unused)
@@ -940,7 +940,7 @@ class GreedyScheduler:
         self._ret_alpha_ema[1] = 0.30     # sublinear exponent (GPU)
         self._gen_per_token_ema = 0.378   # ms/token, constant gen rate
         self._avg_output_tokens_ema = 120.0
-        self._gpu_contention_ema = 38.5    # ms/q, GPU contention penalty
+        self._gpu_contention_ema = 0.0    # ms/q, GPU contention penalty (adaptive, converges from xE=1 data)
         self._transfer_K_ema[(0, 1)] = 0.55   # ms/token, CPU→GPU
         self._transfer_K_ema[(1, 0)] = 0.16   # ms/token, GPU→CPU
         self._queue_penalty_ema = 2.5       # ms/q, per-query queueing
