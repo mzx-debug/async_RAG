@@ -1101,16 +1101,16 @@ class GreedyScheduler:
         pending_queries: int = 0,
     ) -> float:
         """
-        Wall-time cost model: per-query wall time in ms.
-        Delegates to _estimate_action_cost for the full T_cycle model.
+        Wall time estimation for scheduling: delegates to _estimate_action_cost.
 
-        gen_q = (P/B + D + C_tok * L̄_in) * contention
+        Uses the v4 constant-gen-rate model:
+            wall_q = gen_per_token * avg_output_tokens + queue_penalty
+                   + I(xE=1) * gpu_contention
+                   + I(xE=0) * 0.05 * (emb_q + ret_q)
+                   + xfer_q
 
-        T_cycle by (xE, xR):
-          (0,0): max(gen, emb*B + ret + er_base)
-          (1,0): er_base + emb*B + max(ret, gen)
-          (0,1): er_base + ret + max(emb*B, gen)
-          (1,1): er_base + emb*B + ret + gen
+        Note: pending_queries is accepted for API compatibility but unused
+        in the v4 model (B is the primary driver, not pending count).
         """
         return self._estimate_action_cost(lengths=[], batch_size=batch_size, x_e=x_e, x_r=x_r)
 
@@ -1260,28 +1260,38 @@ class GreedyScheduler:
         emb_ret_wall_sec: float = 0.0,
     ) -> None:
         """
-        Per-component fitting for the v3 cost model:
+        Per-component EMA fitting for the v4 cost model:
 
-        wall_q = L_in*e[xE] + r[xR]*B^{alpha-1} + P0/B + p_lin*L_in + g
-                 + I(xE≠xR)*K[xE,xR]*L_in
+        wall_q = gen_per_token * avg_output_tokens
+               + queue_penalty
+               + I(xE=1) * gpu_contention
+               + I(xE=0) * 0.05 * (emb_q + ret_q)
+               + xfer_q
 
-        Each parameter is fitted from its own independent observation source.
-        Contention EMA absorbs residual model mismatch across all components.
+        Each component is fitted independently from its own observation source.
+        Pre-update values are captured before any EMA update to avoid circularity.
         """
         B = max(1, batch_size)
         L = float(sum(token_lengths) / len(token_lengths)) if token_lengths else 0.0
         a = self.ema_alpha
 
+        # Freeze pre-update values before any EMA mutation
+        prev_gen_per_token = getattr(self, '_gen_per_token_ema', 0.378)
+        prev_queue = self._queue_penalty_ema
+        prev_e = self._emb_rate_ema.get(x_e, 0.05)
+        prev_r = self._ret_r_ema.get(x_r, 0.15)
+        prev_alpha = self._ret_alpha_ema.get(x_r, 0.5)
+        prev_avg_out = getattr(self, '_avg_output_tokens_ema', 120.0)
+
         # ── 1. Emb: e[xE] = emb_ms_total / (L * B) ──────────────────────────────
         emb_ms_total = embedding_sec * 1000.0
         if L > 0 and B > 0:
-            e_obs = emb_ms_total / (L * B)        # ms/token
+            e_obs = emb_ms_total / (L * B)
         else:
-            e_obs = self._emb_rate_ema.get(x_e, 0.05)
-        prev_e = self._emb_rate_ema.get(x_e)
-        self._emb_rate_ema[x_e] = e_obs if prev_e is None else a * e_obs + (1 - a) * prev_e
+            e_obs = prev_e
+        self._emb_rate_ema[x_e] = a * e_obs + (1 - a) * prev_e
 
-        # ── 2. Ret: r[xR] and alpha[xR] — fit from ret_ms across B values ───────
+        # ── 2. Ret: r[xR] and alpha[xR] -- fit from ret_ms across B values ───────
         ret_ms_total = retrieval_sec * 1000.0
         ret_key = x_r
         if ret_key not in self._ret_measurements:
@@ -1296,43 +1306,42 @@ class GreedyScheduler:
             b1, t1 = obs_ret[0]
             b2, t2 = obs_ret[-1]
             if b1 != b2 and t1 > 0 and t2 > 0:
-                alpha_obs = math.log(t2 / t1) / math.log(b2 / b1) if b2 != b1 else 0.5
+                ratio = t2 / t1
+                ratio = max(0.01, min(100.0, ratio))
+                alpha_obs = math.log(ratio) / math.log(b2 / b1)
                 alpha_obs = max(0.3, min(1.0, alpha_obs))
                 r_obs = t1 / (b1 ** alpha_obs)
-                prev_alpha = self._ret_alpha_ema.get(ret_key, 0.5)
-                prev_r = self._ret_r_ema.get(ret_key, 0.15)
+                r_obs = max(0.01, min(100.0, r_obs))
                 self._ret_alpha_ema[ret_key] = a * alpha_obs + (1 - a) * prev_alpha
                 self._ret_r_ema[ret_key] = a * r_obs + (1 - a) * prev_r
 
-        # ── 3. Gen per-token: gen_per_token = gen_total / total_output_tokens ─────────
+        # ── 3. Gen per-token ───────────────────────────────────────────────────
         gen_ms_total = generation_sec * 1000.0
         if total_output_tokens > 0:
-            gpt_obs = gen_ms_total / total_output_tokens  # ms/token
-            prev_gpt = getattr(self, '_gen_per_token_ema', None) or 0.378
-            self._gen_per_token_ema = a * gpt_obs + (1 - a) * prev_gpt
+            gpt_obs = gen_ms_total / total_output_tokens
+            self._gen_per_token_ema = a * gpt_obs + (1 - a) * prev_gen_per_token
 
-        # ── 4. GPU contention: only for xE=1 ────────────────────────────────────
-        if x_e == 1 and B > 0 and L > 0:
-            wall_obs_ms = wall_time_ms
-            # Compute predicted wall without GPU contention
-            avg_out = getattr(self, '_avg_output_tokens_ema', 120.0)
-            pred_no_cont = (self._gen_per_token_ema * avg_out
-                            + self._queue_penalty_ema
-                            + (self._emb_rate_ema.get(x_e, 0.05) * L
-                               + self._ret_r_ema.get(x_r, 0.15) * (B ** (self._ret_alpha_ema.get(x_r, 0.5) - 1))) * 0.05)
-            cont_obs = (wall_obs_ms / B - pred_no_cont) if pred_no_cont > 0 else 0.0
+        # ── 3b. Avg output tokens ─────────────────────────────────────────────
+        if total_output_tokens > 0 and B > 0:
+            avg_out_obs = total_output_tokens / B
+            self._avg_output_tokens_ema = a * avg_out_obs + (1 - a) * prev_avg_out
+
+        # ── 4. GPU contention (xE=1 only) ──────────────────────────────────────
+        # pred_no_cont = gen_per_token * avg_output_tokens + queue_penalty + er_overhead
+        # cont_obs = wall_q - pred_no_cont  (using pre-update values)
+        if x_e == 1 and B > 0:
+            er_q = (prev_e * L + prev_r * (B ** (prev_alpha - 1))) * 0.05
+            pred_no_cont = prev_gen_per_token * prev_avg_out + prev_queue + er_q
+            cont_obs = (wall_time_ms / B - pred_no_cont) if pred_no_cont > 0 else 0.0
             cont_obs = max(0.0, min(200.0, cont_obs))
             self._gpu_contention_ema = a * cont_obs + (1 - a) * self._gpu_contention_ema
 
-        # ── 5. Queue penalty: residual wall overhead after gen + gpu_cont ──────────
-        # Only update queue_penalty for xE=0 (xE=1 has GPU contention mixed in)
+        # ── 5. Queue penalty (xE=0 only) ─────────────────────────────────────
         if B > 0 and x_e == 0:
-            avg_out = getattr(self, '_avg_output_tokens_ema', 120.0)
-            gen_base = self._gen_per_token_ema * avg_out
-            pred_base = gen_base
-            obs_q = (wall_time_ms / B) - pred_base
+            gen_base = prev_gen_per_token * prev_avg_out
+            obs_q = (wall_time_ms / B) - gen_base
             obs_q = max(0.0, min(50.0, obs_q))
-            self._queue_penalty_ema = a * obs_q + (1 - a) * self._queue_penalty_ema
+            self._queue_penalty_ema = a * obs_q + (1 - a) * prev_queue
 
         self.feedback_trace.append(
             FeedbackTraceEntry(
@@ -1498,7 +1507,7 @@ class GreedyScheduler:
     def save_ema_params(self, path: str) -> None:
         """Persist all EMA parameters to a JSON file for warm-start on next run."""
         data = {
-            "version": 3,
+            "version": 4,
             "emb_rate_ema": {f"{xe}": v for xe, v in self._emb_rate_ema.items()},
             "ret_r_ema": {f"{xr}": v for xr, v in self._ret_r_ema.items()},
             "ret_alpha_ema": {f"{xr}": v for xr, v in self._ret_alpha_ema.items()},
@@ -1528,13 +1537,13 @@ class GreedyScheduler:
         out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def load_ema_params(self, path: str) -> None:
-        """Restore EMA parameters from a JSON file for warm-start."""
+        """Restore v4 EMA parameters from a JSON file for warm-start."""
         p = Path(path).expanduser().resolve()
         if not p.exists():
             return
         raw = json.loads(p.read_text(encoding="utf-8"))
 
-        def parse_tuple_key(d: Dict[str, Any], src_key: str) -> Dict[Tuple[int, int], float]:
+        def parse_tuple_key(d, src_key):
             result = {}
             for k_str, v in d.get(src_key, {}).items():
                 k_str = k_str.strip()
@@ -1544,29 +1553,26 @@ class GreedyScheduler:
                         result[(int(parts[0].strip()), int(parts[1].strip()))] = float(v)
             return result
 
-        def parse_int_key(d: Dict[str, Any], src_key: str) -> Dict[int, float]:
+        def parse_int_key(d, src_key):
             return {int(k): float(v) for k, v in d.get(src_key, {}).items()}
 
-        version = raw.get("version", 1)
-
-        # v3: new cost model
+        # v4 cost model parameters
         self._emb_rate_ema = parse_int_key(raw, "emb_rate_ema")
         self._ret_r_ema = parse_int_key(raw, "ret_r_ema")
         self._ret_alpha_ema = parse_int_key(raw, "ret_alpha_ema")
         self._gen_per_token_ema = float(raw.get("gen_per_token_ema", 0.378))
         self._avg_output_tokens_ema = float(raw.get("avg_output_tokens_ema", 120.0))
-        self._gpu_contention_ema = float(raw.get("gpu_contention_ema", 38.5))
         self._queue_penalty_ema = float(raw.get("queue_penalty_ema", 2.5))
+        self._gpu_contention_ema = float(raw.get("gpu_contention_ema", 0.0))
         self._transfer_K_ema = parse_tuple_key(raw, "transfer_K_ema")
         self._er_base_overhead_ema = float(raw.get("er_base_overhead_ema", 0.0))
 
-        # ret_measurements
+        # Measurement histories
         self._ret_measurements = {}
         for k_str, ms_list in raw.get("ret_measurements", {}).items():
             xr = int(k_str)
             self._ret_measurements[xr] = [(int(item[0]), float(item[1])) for item in ms_list]
 
-        # wall_time_measurements
         self._wall_time_measurements = {}
         for k_str, ms_list in raw.get("wall_time_measurements", {}).items():
             k_str = k_str.strip()
@@ -1579,6 +1585,7 @@ class GreedyScheduler:
                         for item in ms_list
                     ]
 
+        # Scheduling state
         self._max_batch_size_ema = float(raw.get("max_batch_size_ema", self._max_batch_size_ema))
         self._best_batch_size_by_action = {}
         for k_str, v in raw.get("best_batch_size_by_action", {}).items():
@@ -1587,58 +1594,6 @@ class GreedyScheduler:
                 parts = k_str[1:-1].split(",")
                 if len(parts) == 2:
                     self._best_batch_size_by_action[(int(parts[0].strip()), int(parts[1].strip()))] = int(v)
-        self._feasible_actions_ema = {}
-        for k_str, v in raw.get("feasible_actions", {}).items():
-            k_str = k_str.strip()
-            if k_str.startswith("(") and k_str.endswith(")"):
-                parts = k_str[1:-1].split(",")
-                if len(parts) == 2:
-                    self._feasible_actions_ema[(int(parts[0].strip()), int(parts[1].strip()))] = bool(v)
-
-        self._gen_base_overhead_ema = parse_tuple_key(raw, "gen_base_overhead_ema")
-        raw_gpq = parse_tuple_key(raw, "gen_per_query_ema")
-        if not raw_gpq:
-            raw_gps = parse_tuple_key(raw, "gen_per_sqrt_ema")
-            if raw_gps:
-                raw_gpq = raw_gps
-        self._gen_per_query_ema = raw_gpq
-        self._er_base_overhead_ema = float(raw.get("er_base_overhead_ema", 0.0))
-        self._embedding_latency_ema_ms_per_query = parse_int_key(raw, "embedding_latency_ema")
-        self._emb_per_token_ema = parse_int_key(raw, "emb_per_token_ema")
-        self._emb_L_calibration_ema = parse_int_key(raw, "emb_L_calibration_ema")
-        self._retrieval_latency_ema_ms_per_query = parse_int_key(raw, "retrieval_latency_ema")
-        self._overlap_factor_ema = parse_tuple_key(raw, "overlap_factor_ema")
-        self._batch_size_residual_ema_ms_per_query = {
-            int(k): float(v) for k, v in raw.get("batch_size_residual_ema", {}).items()
-        }
-        self._max_batch_size_ema = float(raw.get("max_batch_size_ema", self._max_batch_size_ema))
-        self._best_batch_size_by_action = {}
-        for k_str, v in raw.get("best_batch_size_by_action", {}).items():
-            k_str = k_str.strip()
-            if k_str.startswith("(") and k_str.endswith(")"):
-                parts = k_str[1:-1].split(",")
-                if len(parts) == 2:
-                    self._best_batch_size_by_action[(int(parts[0].strip()), int(parts[1].strip()))] = int(v)
-        # contention_ema: per (xE, xR) ratio
-        self._contention_ema = parse_tuple_key(raw, "contention_ema")
-        # gen_prefill_per_token_ema: per (xE, xR) ms/token
-        raw_tok = parse_tuple_key(raw, "gen_prefill_per_token_ema")
-        if not hasattr(self, '_gen_prefill_per_token_ema'):
-            self._gen_prefill_per_token_ema: Dict[Tuple[int, int], float] = {}
-        self._gen_prefill_per_token_ema = raw_tok
-        # wall_time_measurements: restore as list of (batch_size, gen_q_ms, L_avg)
-        raw_ms = raw.get("wall_time_measurements", {})
-        self._wall_time_measurements = {}
-        for k_str, ms_list in raw_ms.items():
-            k_str = k_str.strip()
-            if k_str.startswith("(") and k_str.endswith(")"):
-                parts = k_str[1:-1].split(",")
-                if len(parts) == 2:
-                    key = (int(parts[0].strip()), int(parts[1].strip()))
-                    self._wall_time_measurements[key] = [
-                        (int(item[0]), float(item[1]), float(item[2]) if len(item) > 2 else 0.0)
-                        for item in ms_list
-                    ]
         self._feasible_actions_ema = {}
         for k_str, v in raw.get("feasible_actions", {}).items():
             k_str = k_str.strip()

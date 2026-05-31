@@ -6,10 +6,18 @@ Uses per-batch MEDIAN (robust) estimation rather than log-log regression,
 since the power-law fit is noisy with few data points and CPU retrieval
 has a significant fixed-overhead component.
 
+Fits the v4 cost model:
+    wall_q = gen_per_token * avg_output_tokens
+           + queue_penalty
+           + gpu_contention    (xE=1 only, default 0 for portability)
+           + 0.05 * (emb_q + ret_q)  (xE=0 only)
+           + xfer_q            (xE != xR only)
+
 Usage:
     python compute_calib_params.py \
-        --files output/test_plain_b1.json output/test_plain_b4.json ...
+        --files output/calib_*.json \
         --emb-tokens-per-query 5.0 \
+        --avg-output-tokens 120.0 \
         --output output/calibrated_params.json
 """
 import argparse, json, math, statistics
@@ -48,10 +56,10 @@ def per_query_by_B(raw_points):
 
 def fit_ret_model(raw_points, xR_label):
     """
-    Fit retrieval model: ret_ms/q = r * B^(alpha-1) + base_overhead/B
+    Fit retrieval model: ret_ms/q = r * B^(alpha-1)
 
-    We use MEDIAN of per-query values per B to be robust against outliers,
-    then do log-log regression on the median values.
+    Uses MEDIAN of per-query values per B to be robust against outliers,
+    then does log-log regression on the median values.
     """
     by_B = per_query_by_B(raw_points)
     B_vals = sorted(by_B.keys())
@@ -62,7 +70,6 @@ def fit_ret_model(raw_points, xR_label):
     if len(medians) < 2:
         return 1.0, 0.5, 0.0
 
-    # Log-log regression on medians
     log_B = [math.log(B) for B in B_vals]
     log_t = [math.log(t) for B, t in medians.items()]
     n = len(log_B)
@@ -76,13 +83,11 @@ def fit_ret_model(raw_points, xR_label):
     log_r = (s_lt - alpha*s_lb) / n
     r = math.exp(log_r)
 
-    # R²
     y_mean = s_lt / n
     ss_tot = sum((lt-y_mean)**2 for lt in log_t)
     ss_res = sum((lt-(log_r+alpha*lb))**2 for lb,lt in zip(log_B,log_t))
     r2 = 1.0 - ss_res/ss_tot if ss_tot > 1e-9 else 0.0
 
-    # Clamp to physical range [0.3, 1.0]
     alpha = max(0.3, min(1.0, alpha))
     return r, alpha, r2
 
@@ -91,7 +96,6 @@ def fit_emb_model(raw_points, xE_label, L):
     """Compute embedding rate: emb_ms/q = e * L."""
     if not raw_points:
         return 0.05
-    # Per-batch emb_ms/q
     empq = [emb_ms / B for B, emb_ms in raw_points]
     avg = statistics.median(empq)
     e = avg / L
@@ -99,10 +103,56 @@ def fit_emb_model(raw_points, xE_label, L):
     return e
 
 
+def fit_gen_model(wall_raw, avg_output_tokens):
+    """
+    Fit v4 generation parameters:
+        gen_per_token: median(gen_ms/q) / avg_output_tokens
+        queue_penalty: wall_q - gen_q for xE=0 batches
+
+    gpu_contention is NOT fitted here (defaults to 0 for portability,
+    converges online from xE=1 runtime data).
+    """
+    # Collect xE=0 measurements for queue estimation
+    queue_obs = []
+    for (xE, xR), measurements in wall_raw.items():
+        for B, ret_ms, gen_ms in measurements:
+            if xE == 0:
+                wall_q = (ret_ms + gen_ms) / B
+                gen_q = gen_ms / B
+                residual = wall_q - gen_q
+                if 0 < residual < 50:
+                    queue_obs.append(residual)
+
+    if queue_obs:
+        queue_penalty = statistics.median(queue_obs)
+    else:
+        queue_penalty = 2.5
+    queue_penalty = max(0.0, min(50.0, queue_penalty))
+
+    # Fit gen_per_token: median gen_ms/q across all batches / avg_output_tokens
+    gen_per_q_list = []
+    for (_, _, gen_ms), B in [(m, m[0]) for m in sum(wall_raw.values(), [])]:
+        pass
+    for measurements in wall_raw.values():
+        for B, ret_ms, gen_ms in measurements:
+            gen_per_q_list.append(gen_ms / B)
+
+    if gen_per_q_list:
+        median_gen_per_q = statistics.median(gen_per_q_list)
+        gen_per_token = median_gen_per_q / avg_output_tokens
+        gen_per_token = max(0.1, min(1.0, gen_per_token))
+    else:
+        gen_per_token = 0.378
+
+    print(f"  gen_per_token={gen_per_token:.4f}ms/token  queue_penalty={queue_penalty:.2f}ms/q")
+    return gen_per_token, queue_penalty
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--files", nargs="+", required=True)
     ap.add_argument("--emb-tokens-per-query", type=float, default=5.0)
+    ap.add_argument("--avg-output-tokens", type=float, default=120.0)
     ap.add_argument("--output", default="output/calibrated_params.json")
     args = ap.parse_args()
     files = [Path(fp) for fp in args.files]
@@ -116,7 +166,6 @@ def main():
         r, alpha, r2 = fit_ret_model(ret_raw[xR], f"xR={xR}")
         r_params[xR] = dict(r=r, alpha=alpha, r2=r2)
         print(f"  xR={xR}: r={r:.4f} alpha={alpha:.4f} R^2={r2:.4f}")
-        # Show predictions vs actual medians
         by_B = per_query_by_B(ret_raw[xR])
         medians = {B: statistics.median(v) for B, v in by_B.items()}
         for B in sorted(medians):
@@ -131,18 +180,22 @@ def main():
         e = fit_emb_model(emb_raw[xE], f"xE={xE}", args.emb_tokens_per_query)
         e_params[xE] = e
 
-    # ── Write calibration JSON ───────────────────────────────────────────
+    # ── Generation + Queue ───────────────────────────────────────────────
+    print(f"\n=== Generation (avg_out={args.avg_output_tokens}) ===")
+    gen_per_token, queue_penalty = fit_gen_model(wall_raw, args.avg_output_tokens)
+
+    # ── Write v4 calibration JSON ───────────────────────────────────────
     out = {
-        "version": 3,
+        "version": 4,
         "emb_rate_ema": {str(k): e_params.get(k, 0.05) for k in [0, 1]},
         "ret_r_ema":    {str(k): r_params[k]["r"] for k in r_params},
         "ret_alpha_ema":{str(k): r_params[k]["alpha"] for k in r_params},
-        "gen_P0_ema": 2072.0,
-        "gen_p_lin_ema": 0.0,
-        "gen_g_ema": 57.1,
-        "transfer_K_ema": {"(0,1)": 0.0, "(1,0)": 0.0, "(1,1)": 0.0},
-        "contention_ema": {"(0,0)": 1.0, "(0,1)": 1.0, "(1,0)": 1.0, "(1,1)": 1.0},
-        "er_base_overhead_ema": {},
+        "gen_per_token_ema": gen_per_token,
+        "avg_output_tokens_ema": args.avg_output_tokens,
+        "queue_penalty_ema": queue_penalty,
+        "gpu_contention_ema": 0.0,
+        "transfer_K_ema": {"(0,1)": 0.55, "(1,0)": 0.16, "(1,1)": 0.0},
+        "er_base_overhead_ema": 0.0,
         "ret_measurements": {str(k): [list(p) for p in sorted(set(ret_raw[int(k)]))]
                              for k in ["0","1"] if ret_raw[int(k)]},
         "wall_time_measurements": {f"({k[0]},{k[1]})": [list(m) for m in sorted(set(wall_raw[k]))]
