@@ -19,6 +19,14 @@ Usage:
         --emb-tokens-per-query 5.0 \
         --avg-output-tokens 120.0 \
         --output output/calibrated_params.json
+
+    # With sweep data for queue+er_overlap separation:
+    python compute_calib_params.py \
+        --files output/calib_*.json \
+        --sweep-coeffs output/calibration_sweep/fitted_coefficients.json \
+        --emb-tokens-per-query 5.0 \
+        --avg-output-tokens 120.0 \
+        --output output/calibrated_params.json
 """
 import argparse, json, math, statistics
 from pathlib import Path
@@ -158,6 +166,10 @@ def main():
     ap.add_argument("--files", nargs="+", required=True)
     ap.add_argument("--emb-tokens-per-query", type=float, default=5.0)
     ap.add_argument("--avg-output-tokens", type=float, default=120.0)
+    ap.add_argument(
+        "--sweep-coeffs", type=str, default=None,
+        help="Path to calibrate_sweep fitted_coefficients.json for queue+er_overlap separation"
+    )
     ap.add_argument("--output", default="output/calibrated_params.json")
     args = ap.parse_args()
     files = [Path(fp) for fp in args.files]
@@ -186,8 +198,36 @@ def main():
         e_params[xE] = e
 
     # ── Generation + Queue ───────────────────────────────────────────────
-    print(f"\n=== Generation (avg_out={args.avg_output_tokens}) ===")
-    gen_per_token, queue_penalty, er_overlap_penalty = fit_gen_model(wall_raw, args.avg_output_tokens)
+    queue_penalty = 2.5
+    er_overlap_penalty = 0.0
+    gen_per_token = 0.378
+    used_sweep = False
+
+    if args.sweep_coeffs:
+        coeffs_path = Path(args.sweep_coeffs)
+        if coeffs_path.exists():
+            coeffs = json.loads(coeffs_path.read_text())
+            meta = coeffs.get("__meta__", {})
+            queue_penalty = meta.get("queue_penalty", 2.5)
+            er_overlap_penalty = meta.get("er_overlap_penalty", 0.0)
+            r2 = meta.get("overlap_r_squared", 0.0)
+            a00 = coeffs.get("(0,0)", {})
+            gen_per_query = a00.get("gen_per_query")
+            if gen_per_query is not None:
+                gen_per_token = max(0.1, min(1.0, gen_per_query / args.avg_output_tokens))
+            used_sweep = True
+            print(f"\n=== Generation + Overhead (from sweep) ===")
+            print(f"  gen_per_token       = {gen_per_token:.4f} ms/token  (from (0,0) gen_per_query={gen_per_query:.2f} / avg_out={args.avg_output_tokens})")
+            print(f"  queue_penalty       = {queue_penalty:.2f} ms/q")
+            print(f"  er_overlap_penalty  = {er_overlap_penalty:.2f} ms/q")
+            print(f"  R² (overlap fit)    = {r2:.4f}")
+        else:
+            print(f"\n  WARNING: --sweep-coeffs file not found: {coeffs_path}")
+
+    if not used_sweep:
+        # Fallback: fit queue from per-batch files (er_overlap always 0.0 offline)
+        print(f"\n=== Generation (avg_out={args.avg_output_tokens}) ===")
+        _, queue_penalty, _ = fit_gen_model(wall_raw, args.avg_output_tokens)
 
     # ── Write v4 calibration JSON ───────────────────────────────────────
     out = {

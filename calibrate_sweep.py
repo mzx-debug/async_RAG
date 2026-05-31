@@ -73,9 +73,9 @@ def run_experiment(
 
 
 def extract_data(json_path: Path):
-    """Extract (batch_size, gen_time_ms) points from a result file.
+    """Extract (batch_size, gen_ms, ret_ms) points from a result file.
 
-    gen_time_ms is the TOTAL generation time for the batch (not per-query).
+    gen_ms and ret_ms are TOTAL times for the batch (not per-query).
     """
     try:
         with open(json_path) as f:
@@ -88,7 +88,8 @@ def extract_data(json_path: Path):
     for b in d.get("per_batch", []):
         bs = b["batch_size"]
         gen_sec = b["generation_sec"]
-        points.append((bs, gen_sec * 1000))  # (batch_size, total_gen_time_ms)
+        ret_sec = b["retrieval_sec"]
+        points.append((bs, gen_sec * 1000, ret_sec * 1000))  # (bs, gen_ms, ret_ms)
 
     return points
 
@@ -120,6 +121,70 @@ def fit_linear(points):
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
     return max(0.0, a_coef), max(0.0, b_coef), r2
+
+
+def fit_overlap_model(xe0_results):
+    """
+    Fit queue_penalty and er_overlap_coef from xE=0 sweep data.
+
+    Model (per-query):
+        wall_q - gen_q = queue_penalty + er_overlap_coef * ret_q
+
+    y = a + b * x
+      y = wall_q - gen_q  (overhead above generation)
+      x = ret_q           (retrieval time per query)
+      a = queue_penalty
+      b = er_overlap_coef
+
+    er_overlap_penalty = b * median(ret_q) — the overlap residual
+    expressed as a per-query overhead.
+
+    Returns (queue_penalty, er_overlap_penalty, r_squared).
+    """
+    # Collect (ret_q, overhead) points from xE=0 data
+    points = []
+    for (xE, xR), batch_data in xe0_results.items():
+        if xE != 0:
+            continue
+        for bs, gen_ms, ret_ms in batch_data:
+            wall_q = (gen_ms + ret_ms) / bs
+            gen_q = gen_ms / bs
+            ret_q = ret_ms / bs
+            overhead = wall_q - gen_q  # = queue + er_overlap * ret_q
+            if 0 < overhead < 100 and ret_q > 0:
+                points.append((ret_q, overhead))
+
+    if len(points) < 2:
+        return None, None, None
+
+    # Linear regression: overhead = a + b * ret_q
+    n = len(points)
+    sx = sum(x for x, y in points)
+    sy = sum(y for x, y in points)
+    sxy = sum(x * y for x, y in points)
+    sxx = sum(x * x for x, y in points)
+
+    denom = n * sxx - sx * sx
+    if abs(denom) < 1e-9:
+        return None, None, None
+
+    b_coef = (n * sxy - sx * sy) / denom       # er_overlap_coef
+    a_coef = (sy - b_coef * sx) / n             # queue_penalty
+
+    # R^2
+    y_mean = sy / n
+    ss_tot = sum((y - y_mean) ** 2 for x, y in points)
+    ss_res = sum((y - (a_coef + b_coef * x)) ** 2 for x, y in points)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-9 else 0.0
+
+    # er_overlap_penalty = overlap_coef * median(ret_q)
+    median_ret_q = sorted(points)[len(points) // 2][0]
+    er_overlap_penalty = max(0.0, b_coef) * median_ret_q
+
+    queue_penalty = max(0.0, a_coef)
+    er_overlap_penalty = max(0.0, er_overlap_penalty)
+
+    return queue_penalty, er_overlap_penalty, r2
 
 
 def print_results_table(results):
@@ -199,6 +264,10 @@ def main():
         "--dry-run", action="store_true",
         help="Print planned experiments without running"
     )
+    parser.add_argument(
+        "--avg-output-tokens", type=float, default=120.0,
+        help="Average output tokens per query (default: 120.0)"
+    )
     args = parser.parse_args()
 
     # Resolve workdir
@@ -246,32 +315,57 @@ def main():
             points = extract_data(out_path)
             if points:
                 results[(xE, xR)].extend(points)
-                for bs, gen_ms in points:
-                    print(f"  → bs={bs}: gen_total={gen_ms:.0f}ms ({gen_ms/bs:.1f}ms/q)")
+                for bs, gen_ms, ret_ms in points:
+                    print(f"  → bs={bs}: gen={gen_ms:.0f}ms ret={ret_ms:.0f}ms")
 
     # Save raw data
     raw_path = output_dir / "raw_results.json"
     serializable = {
-        f"({k[0]},{k[1]})": [(b, g) for b, g in pts]
+        f"({k[0]},{k[1]})": [(b, g, r) for b, g, r in pts]
         for k, pts in results.items()
     }
     with open(raw_path, "w") as f:
         json.dump(serializable, f, indent=2)
     print(f"\nRaw data saved to: {raw_path}")
 
-    # Fit and print
+    # Fit and print per-action linear model
     print_results_table(results)
 
-    # Save fitted coefficients
+    # ── Fit queue + er_overlap from xE=0 sweep data ───────────────────
+    print()
+    print("=" * 80)
+    print("Queue + E+R Overlap (xE=0 sweep fit)")
+    print("=" * 80)
+    print("Model: wall_q - gen_q = queue_penalty + er_overlap_coef * ret_q")
+    print()
+
+    queue_penalty, er_overlap_penalty, r2 = fit_overlap_model(results)
+    if queue_penalty is not None:
+        print(f"  queue_penalty         = {queue_penalty:.2f} ms/q  (intercept)")
+        print(f"  er_overlap_penalty   = {er_overlap_penalty:.2f} ms/q  (overlap coefficient * median ret_q)")
+        print(f"  R²                   = {r2:.4f}")
+    else:
+        print("  Not enough xE=0 data to fit overlap model")
+        queue_penalty = 2.5
+        er_overlap_penalty = 0.0
+
+    # Save all fitted coefficients (v4 params)
     coeffs = {}
     for (xE, xR), points in results.items():
-        gen_base, gen_per_q, r2 = fit_linear(points)
+        gen_base, gen_per_q, gen_r2 = fit_linear(points)
         coeffs[f"({xE},{xR})"] = {
             "gen_base": gen_base,
             "gen_per_query": gen_per_q,
-            "r_squared": r2,
-            "data_points": [(b, g) for b, g in points],
+            "gen_r_squared": gen_r2,
+            "data_points": [(b, g, r) for b, g, r in points],
         }
+
+    coeffs["__meta__"] = {
+        "avg_output_tokens": args.avg_output_tokens,
+        "queue_penalty": queue_penalty,
+        "er_overlap_penalty": er_overlap_penalty,
+        "overlap_r_squared": r2,
+    }
 
     coeffs_path = output_dir / "fitted_coefficients.json"
     with open(coeffs_path, "w") as f:

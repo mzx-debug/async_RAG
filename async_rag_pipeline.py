@@ -1334,28 +1334,13 @@ class GreedyScheduler:
             cont_obs = max(0.0, min(200.0, cont_obs))
             self._gpu_contention_ema = a * cont_obs + (1 - a) * self._gpu_contention_ema
 
-        # ── 5. Queue penalty + E+R overlap (xE=0 only) ───────────────────────
-        # obs = wall_q - gen_base = queue + er_overlap + xfer_q
-        if B > 0 and x_e == 0:
-            gen_base = prev_gen_per_token * prev_avg_out
-            obs_total = (wall_time_ms / B) - gen_base
-            obs_total = max(0.0, min(50.0, obs_total))
-            xfer_q_obs = self._transfer_K_ema.get((x_e, x_r), 0.0) * L
-            residual = obs_total - xfer_q_obs
-            prev_er_overlap = getattr(self, '_er_overlap_penalty_ema', 0.0)
-            total_prev = prev_queue + prev_er_overlap
-            if total_prev > 0:
-                # Proportional split: distribute residual by current ratio
-                queue_obs = residual * prev_queue / total_prev
-                er_overlap_obs = residual * prev_er_overlap / total_prev
-            else:
-                # No history: equal split
-                queue_obs = residual * 0.5
-                er_overlap_obs = residual * 0.5
-            queue_obs = max(0.0, min(50.0, queue_obs))
-            er_overlap_obs = max(0.0, min(20.0, er_overlap_obs))
-            self._queue_penalty_ema = a * queue_obs + (1 - a) * prev_queue
-            self._er_overlap_penalty_ema = a * er_overlap_obs + (1 - a) * prev_er_overlap
+        # ── 5. Queue + E+R overlap: fixed from sweep calibration ─────────────
+        # queue_penalty and er_overlap_penalty are determined offline by
+        # calibrate_sweep + fit_overlap_model (linear regression across B).
+        # They are NOT updated online to avoid circularity and identifiability
+        # issues (the two parameters cannot be separated from single observations).
+        # They remain constant throughout runtime.
+        #
 
         self.feedback_trace.append(
             FeedbackTraceEntry(
