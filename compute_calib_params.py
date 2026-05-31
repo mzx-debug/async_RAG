@@ -209,6 +209,7 @@ def main():
     # ── Generation + Queue ───────────────────────────────────────────────
     queue_penalty = 2.5
     gen_per_token = 0.378
+    gen_base = 1000.0
     used_sweep = False
 
     if args.sweep_coeffs:
@@ -218,10 +219,12 @@ def main():
             meta = coeffs.get("__meta__", {})
             queue_penalty = meta.get("queue_penalty", 2.5)
             gen_per_token = meta.get("gen_per_token", 0.378)
+            gen_base = meta.get("gen_base", 1000.0)
             used_sweep = True
             print(f"\n=== Generation + Overhead (from sweep) ===")
-            print(f"  gen_per_token      = {gen_per_token:.4f} ms/token")
-            print(f"  queue_penalty     = {queue_penalty:.2f} ms/q")
+            print(f"  gen_per_token  = {gen_per_token:.4f} ms/token")
+            print(f"  gen_base       = {gen_base:.0f} ms  (prefill overhead)")
+            print(f"  queue_penalty  = {queue_penalty:.2f} ms/q")
         else:
             print(f"\n  WARNING: --sweep-coeffs file not found: {coeffs_path}")
 
@@ -237,6 +240,7 @@ def main():
         "ret_r_ema":    {str(k): r_params[k]["r"] for k in r_params},
         "ret_alpha_ema":{str(k): r_params[k]["alpha"] for k in r_params},
         "gen_per_token_ema": gen_per_token,
+        "gen_base_ema": gen_base,
         "avg_output_tokens_ema": args.avg_output_tokens,
         "queue_penalty_ema": queue_penalty,
         "transfer_K_ema": {"(0,1)": 0.55, "(1,0)": 0.16, "(1,1)": 0.0},

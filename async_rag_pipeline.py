@@ -895,10 +895,12 @@ class GreedyScheduler:
         self._emb_rate_ema: Dict[int, float] = {}                    # e[xE], ms/token
         self._ret_r_ema: Dict[int, float] = {}                      # r[xR], ms
         self._ret_alpha_ema: Dict[int, float] = {}                   # alpha[xR], default 0.5
+        self._transfer_K_ema: Dict[Tuple[int, int], float] = {}     # K[xE,xR], ms/token
         self._gen_P0_ema: float = 2072.0                            # ms, prefill fixed
         self._gen_p_lin_ema: float = 0.0                            # ms/token, prefill per-token
         self._gen_g_ema: float = 57.1                               # ms/q, decode marginal
         self._gen_per_token_ema: float = 0.378                       # ms/token, constant gen rate
+        self._gen_base_ema: float = 1000.0                          # ms, prefill overhead (amortized over batch as P0/B)
         self._avg_output_tokens_ema: float = 120.0                     # avg output tokens per query
         self._queue_penalty_ema: float = 2.5                        # ms/q, per-query queueing overhead
         self._contention_ema: Dict[Tuple[int, int], float] = {}      # obs/pred ratio (legacy, unused)
@@ -936,9 +938,10 @@ class GreedyScheduler:
         self._ret_r_ema[1] = 0.50        # ms, GPU Retrieval coefficient
         self._ret_alpha_ema[0] = 0.55     # sublinear exponent (CPU)
         self._ret_alpha_ema[1] = 0.30     # sublinear exponent (GPU)
-        self._gen_per_token_ema = 0.378   # ms/token, constant gen rate
+        self._gen_per_token_ema = 0.2135  # ms/token, from sweep fit
+        self._gen_base_ema = 1109.0      # ms, prefill overhead
         self._avg_output_tokens_ema = 120.0
-        self._queue_penalty_ema = 2.5       # ms/q, per-query queueing
+        self._queue_penalty_ema = 0.23     # ms/q, from sweep fit
         self._transfer_K_ema[(0, 1)] = 0.55   # ms/token, CPU→GPU
         self._transfer_K_ema[(1, 0)] = 0.16   # ms/token, GPU→CPU
 
@@ -1136,20 +1139,21 @@ class GreedyScheduler:
         Wall time model (ms/q) for async_v2 continuous batching.
 
         The pipeline runs on two device pipelines:
-          CPU_q = emb_q(xE=0) + ret_q(xR=0) + I(xE≠xR) × xfer_q
-          GPU_q = gen_q + I(xE=1) × ret_q(xR=1)
+          CPU_q = emb_q(xE=0) + ret_q(xR=0) + I(xE=0,xR=1) × xfer_q
+          GPU_q = gen_q + gen_base_q + I(xE=1) × emb_q(xE=1) + I(xR=1) × ret_q(xR=1)
           wall_q = max(CPU_q, GPU_q) + queue_penalty
 
-        Components:
-          emb_q(xE):  e[xE] × L  — ms/q per query
-          ret_q(xR,B): r[xR] × B^(alpha-1) — ms/q per query, sublinear in B
-          gen_q:       gen_per_token × avg_output_tokens — constant, Gen is the bottleneck
-          xfer_q:      K[xE,xR] × L — cross-device transfer when xE≠xR
-          queue:        per-query scheduling overhead — constant, fitted from data
+        where:
+          gen_q = gen_per_token × avg_output_tokens  (decode cost per query, ms/q)
+          gen_base_q = gen_base / B                   (prefill overhead amortized per query)
+          emb_q(xE) = emb_rate[xE] × L               (embedding cost per query)
+          ret_q(xR,B) = r[xR] × B^(alpha[xR]-1)    (retrieval cost, sublinear in B)
+          xfer_q = K × L                              (CPU→GPU transfer, only when xE=0,xR=1)
+          queue_penalty = per-query scheduling overhead (constant)
 
-        Emb and Ret times appear explicitly through max(CPU_q, GPU_q).
-        When Gen dominates (typical), max = GPU_q and wall ≈ gen_q + queue.
-        When E+R dominates (short output), max = CPU_q and wall follows E+R timing.
+        Emb and Ret appear explicitly. When Gen dominates (typical), GPU side wins
+        the max and wall ≈ gen_q + gen_base_q + queue. When E+R dominates
+        (short output), CPU side wins and wall follows E+R timing.
 
         Returns wall_q (ms per query).
         """
@@ -1157,8 +1161,9 @@ class GreedyScheduler:
         L = float(sum(lengths) / len(lengths)) if lengths else 5.0
         avg_out_tokens = getattr(self, '_avg_output_tokens_ema', None) or 120.0
 
-        # ── Gen: constant per-token rate ────────────────────────────────────
+        # ── Gen: per-query gen = gen_per_token * avg_out + prefill_overhead/B ───
         gen_q = self._gen_per_token_ema * avg_out_tokens   # ms/q
+        gen_base_q = self._gen_base_ema / B                   # amortized prefill per query
 
         # ── Emb per device ───────────────────────────────────────────────
         emb_q_cpu = self._emb_rate_ema.get(0, 0.05) * L
@@ -1172,22 +1177,16 @@ class GreedyScheduler:
         xfer_q = self._transfer_K_ema.get((0, 1), 0.0) * L if (x_e == 0 and x_r == 1) else 0.0
 
         # ── Two pipeline sides ───────────────────────────────────────────
-        # CPU side: Emb(xE=0) and Ret(xR=0) run sequentially on CPU
-        #   Emb must complete before Gen starts on GPU (transfer if needed)
-        #   Ret on CPU can overlap with Gen on GPU
-        cpu_q = emb_q_cpu + ret_q_x0 + xfer_q   # Emb blocks start of Gen; Ret overlaps Gen
+        # CPU side: Emb(xE=0) and Ret(xR=0) run sequentially on CPU.
+        #   Emb must complete before Gen starts on GPU (transfer if needed).
+        #   Ret on CPU can overlap with Gen on GPU.
+        cpu_q = emb_q_cpu + ret_q_x0 + xfer_q
 
-        # GPU side:
-        #   xE=0: Gen only (Emb already done on CPU)
-        #   xE=1: Emb serializes with Gen on GPU (both compete for GPU)
-        gpu_q = gen_q + (emb_q_gpu if x_e == 1 else 0.0)
-
-        # ── Ret on GPU (xR=1) — always serializes with Gen ──────────────
-        gpu_q += ret_q_x1 if x_r == 1 else 0.0
+        # GPU side: Gen + Emb(xE=1) + Ret(xR=1) — all on GPU, sequential.
+        #   Gen dominates; Emb and Ret serialize with Gen.
+        gpu_q = gen_q + gen_base_q + (emb_q_gpu if x_e == 1 else 0.0) + (ret_q_x1 if x_r == 1 else 0.0)
 
         # ── Pipeline: max of CPU and GPU sides ──────────────────────────
-        # CPU Emb is in parallel with GPU Gen (pipeline overlap)
-        # But GPU Emb serializes with Gen (no overlap when xE=1)
         pipeline_q = max(cpu_q, gpu_q)
 
         # ── Queue: per-query scheduling overhead (constant) ───────────────
@@ -1273,12 +1272,13 @@ class GreedyScheduler:
 
         Pipeline model:
           CPU_q = emb_cpu_q + ret_cpu_q + I(xE=0,xR=1) × xfer_q
-          GPU_q = gen_q + I(xE=1) × emb_gpu_q + I(xR=1) × ret_gpu_q
+          GPU_q = gen_q + gen_base_q + I(xE=1) × emb_gpu_q + I(xR=1) × ret_gpu_q
           wall_q = max(CPU_q, GPU_q) + queue_penalty
 
         Fitting:
           Emb and Ret rates are fitted per-device from their own timing data.
           Gen per-token and avg_output_tokens are fitted from generation data.
+          gen_base (prefill overhead) is fixed from sweep calibration.
           Queue is fitted from the residual: queue_obs = wall_q - min(CPU_q, GPU_q)
 
         Pre-update values are captured before any EMA mutation to avoid circularity.
@@ -1289,6 +1289,7 @@ class GreedyScheduler:
 
         # Freeze ALL pre-update values before any EMA mutation
         prev_gen_per_token = getattr(self, '_gen_per_token_ema', 0.378)
+        prev_gen_base = getattr(self, '_gen_base_ema', 1000.0)  # fixed calibration value
         prev_avg_out = getattr(self, '_avg_output_tokens_ema', 120.0)
         prev_e0 = self._emb_rate_ema.get(0, 0.05)
         prev_e1 = self._emb_rate_ema.get(1, 0.016)
@@ -1353,7 +1354,7 @@ class GreedyScheduler:
             xfer_q = self._transfer_K_ema.get((0, 1), 0.0) * L if (x_e == 0 and x_r == 1) else 0.0
 
             cpu_q = emb_q_cpu + ret_q_cpu + xfer_q
-            gpu_q = gen_q + (emb_q_gpu if x_e == 1 else 0.0) + (ret_q_gpu if x_r == 1 else 0.0)
+            gpu_q = gen_q + (prev_gen_base / B) + (emb_q_gpu if x_e == 1 else 0.0) + (ret_q_gpu if x_r == 1 else 0.0)
             min_side = min(cpu_q, gpu_q)
             wall_q = wall_time_ms / B
             queue_obs = wall_q - min_side
@@ -1507,6 +1508,7 @@ class GreedyScheduler:
             "ret_r_ema": {f"{xr}": v for xr, v in self._ret_r_ema.items()},
             "ret_alpha_ema": {f"{xr}": v for xr, v in self._ret_alpha_ema.items()},
             "gen_per_token_ema": self._gen_per_token_ema,
+            "gen_base_ema": self._gen_base_ema,
             "avg_output_tokens_ema": self._avg_output_tokens_ema,
             "queue_penalty_ema": self._queue_penalty_ema,
             "transfer_K_ema": {f"({xe},{xr})": v for (xe, xr), v in self._transfer_K_ema.items()},
@@ -1528,6 +1530,7 @@ class GreedyScheduler:
             "ret_r_ema": {f"{xr}": v for xr, v in self._ret_r_ema.items()},
             "ret_alpha_ema": {f"{xr}": v for xr, v in self._ret_alpha_ema.items()},
             "gen_per_token_ema": self._gen_per_token_ema,
+            "gen_base_ema": self._gen_base_ema,
             "avg_output_tokens_ema": self._avg_output_tokens_ema,
             "queue_penalty_ema": self._queue_penalty_ema,
             "transfer_K_ema": {f"({xe},{xr})": v for (xe, xr), v in self._transfer_K_ema.items()},
@@ -1576,6 +1579,7 @@ class GreedyScheduler:
         self._ret_r_ema = parse_int_key(raw, "ret_r_ema")
         self._ret_alpha_ema = parse_int_key(raw, "ret_alpha_ema")
         self._gen_per_token_ema = float(raw.get("gen_per_token_ema", 0.378))
+        self._gen_base_ema = float(raw.get("gen_base_ema", 1000.0))
         self._avg_output_tokens_ema = float(raw.get("avg_output_tokens_ema", 120.0))
         self._queue_penalty_ema = float(raw.get("queue_penalty_ema", 2.5))
         self._transfer_K_ema = parse_tuple_key(raw, "transfer_K_ema")
