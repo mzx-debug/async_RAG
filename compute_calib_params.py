@@ -10,7 +10,7 @@ Fits the v4 cost model:
     wall_q = gen_per_token * avg_output_tokens
            + queue_penalty
            + gpu_contention    (xE=1 only, default 0 for portability)
-           + 0.05 * (emb_q + ret_q)  (xE=0 only)
+           + er_overlap_penalty  (xE=0 only, learned from data)
            + xfer_q            (xE != xR only)
 
 Usage:
@@ -107,13 +107,17 @@ def fit_gen_model(wall_raw, avg_output_tokens):
     """
     Fit v4 generation parameters:
         gen_per_token: median(gen_ms/q) / avg_output_tokens
-        queue_penalty: wall_q - gen_q for xE=0 batches
+        queue_penalty + er_overlap_penalty: wall_q - gen_q for xE=0 batches
+
+    queue_penalty and er_overlap_penalty are NOT fully separable offline
+    (both contribute to xE=0 residual). This function fits their SUM as
+    queue_penalty; er_overlap_penalty defaults to 0 and refines online.
 
     gpu_contention is NOT fitted here (defaults to 0 for portability,
     converges online from xE=1 runtime data).
     """
-    # Collect xE=0 measurements for queue estimation
-    queue_obs = []
+    # Collect xE=0 measurements: wall_q - gen_q = queue + er_overlap + xfer
+    residual_obs = []
     for (xE, xR), measurements in wall_raw.items():
         for B, ret_ms, gen_ms in measurements:
             if xE == 0:
@@ -121,18 +125,19 @@ def fit_gen_model(wall_raw, avg_output_tokens):
                 gen_q = gen_ms / B
                 residual = wall_q - gen_q
                 if 0 < residual < 50:
-                    queue_obs.append(residual)
+                    residual_obs.append(residual)
 
-    if queue_obs:
-        queue_penalty = statistics.median(queue_obs)
+    if residual_obs:
+        queue_penalty = statistics.median(residual_obs)
     else:
         queue_penalty = 2.5
     queue_penalty = max(0.0, min(50.0, queue_penalty))
 
+    # er_overlap_penalty defaults to 0 offline (online EMA refines it)
+    er_overlap_penalty = 0.0
+
     # Fit gen_per_token: median gen_ms/q across all batches / avg_output_tokens
     gen_per_q_list = []
-    for (_, _, gen_ms), B in [(m, m[0]) for m in sum(wall_raw.values(), [])]:
-        pass
     for measurements in wall_raw.values():
         for B, ret_ms, gen_ms in measurements:
             gen_per_q_list.append(gen_ms / B)
@@ -144,8 +149,8 @@ def fit_gen_model(wall_raw, avg_output_tokens):
     else:
         gen_per_token = 0.378
 
-    print(f"  gen_per_token={gen_per_token:.4f}ms/token  queue_penalty={queue_penalty:.2f}ms/q")
-    return gen_per_token, queue_penalty
+    print(f"  gen_per_token={gen_per_token:.4f}ms/token  queue+er_overlap={queue_penalty:.2f}ms/q")
+    return gen_per_token, queue_penalty, er_overlap_penalty
 
 
 def main():
@@ -182,7 +187,7 @@ def main():
 
     # ── Generation + Queue ───────────────────────────────────────────────
     print(f"\n=== Generation (avg_out={args.avg_output_tokens}) ===")
-    gen_per_token, queue_penalty = fit_gen_model(wall_raw, args.avg_output_tokens)
+    gen_per_token, queue_penalty, er_overlap_penalty = fit_gen_model(wall_raw, args.avg_output_tokens)
 
     # ── Write v4 calibration JSON ───────────────────────────────────────
     out = {
@@ -194,6 +199,7 @@ def main():
         "avg_output_tokens_ema": args.avg_output_tokens,
         "queue_penalty_ema": queue_penalty,
         "gpu_contention_ema": 0.0,
+        "er_overlap_penalty_ema": er_overlap_penalty,
         "transfer_K_ema": {"(0,1)": 0.55, "(1,0)": 0.16, "(1,1)": 0.0},
         "er_base_overhead_ema": 0.0,
         "ret_measurements": {str(k): [list(p) for p in sorted(set(ret_raw[int(k)]))]

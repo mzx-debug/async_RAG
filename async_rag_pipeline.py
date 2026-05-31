@@ -900,9 +900,9 @@ class GreedyScheduler:
         self._gen_g_ema: float = 57.1                               # ms/q, decode marginal
         self._gen_per_token_ema: float = 0.378                       # ms/token, constant gen rate
         self._avg_output_tokens_ema: float = 120.0                     # avg output tokens per query
-        self._gpu_contention_ema: float = 0.0                         # ms/q, GPU emb+gen contention penalty
-        self._transfer_K_ema: Dict[Tuple[int, int], float] = {}      # K[xE,xR], ms/token
         self._queue_penalty_ema: float = 2.5                        # ms/q, per-query queueing overhead
+        self._gpu_contention_ema: float = 0.0                         # ms/q, GPU emb+gen contention penalty (xE=1)
+        self._er_overlap_penalty_ema: float = 0.0                     # ms/q, E+R imperfect overlap (xE=0)
         self._contention_ema: Dict[Tuple[int, int], float] = {}      # obs/pred ratio (legacy, unused)
         self._er_base_overhead_ema: float = 0.0                     # ms, not currently used
         # ── Old fields kept for backward compat (read-only in cost model) ─────────
@@ -941,6 +941,7 @@ class GreedyScheduler:
         self._gen_per_token_ema = 0.378   # ms/token, constant gen rate
         self._avg_output_tokens_ema = 120.0
         self._gpu_contention_ema = 0.0    # ms/q, GPU contention penalty (adaptive, converges from xE=1 data)
+        self._er_overlap_penalty_ema = 0.0   # ms/q, E+R imperfect overlap (adaptive, converges from xE=0 data)
         self._transfer_K_ema[(0, 1)] = 0.55   # ms/token, CPU→GPU
         self._transfer_K_ema[(1, 0)] = 0.16   # ms/token, GPU→CPU
         self._queue_penalty_ema = 2.5       # ms/q, per-query queueing
@@ -1106,7 +1107,7 @@ class GreedyScheduler:
         Uses the v4 constant-gen-rate model:
             wall_q = gen_per_token * avg_output_tokens + queue_penalty
                    + I(xE=1) * gpu_contention
-                   + I(xE=0) * 0.05 * (emb_q + ret_q)
+                   + I(xE=0) * er_overlap_penalty
                    + xfer_q
 
         Note: pending_queries is accepted for API compatibility but unused
@@ -1140,17 +1141,17 @@ class GreedyScheduler:
         Wall time model (ms/q) for async_v2 continuous batching:
 
         wall_q = gen_per_token * avg_output_tokens
-                 + queue_penalty
-                 + I(xE=1) * gpu_contention
-                 + I(xE=0) * 0.05 * (emb_q + ret_q)
-                 + xfer_q
+               + queue_penalty
+               + I(xE=1) * gpu_contention
+               + I(xE=0) * er_overlap_penalty
+               + xfer_q
 
         Components:
-          gen:          constant per-token rate (cross-action stable)
-          queue:        per-query scheduling overhead
-          gpu_cont:     GPU emb+gen contention when xE=1 (emb serializes with gen)
-          er_overlap:   emb+ret fully overlap Gen when xE=0 (negligible overhead)
-          xfer:         cross-device transfer overhead when xE≠xR
+          gen:           constant per-token rate (cross-action stable)
+          queue:         per-query scheduling overhead
+          gpu_cont:      GPU emb+gen contention when xE=1 (emb serializes with gen)
+          er_overlap:    E+R imperfect overlap when xE=0 (learned from data)
+          xfer:          cross-device transfer overhead when xE!=xR
 
         Returns wall_q (ms per query).
         """
@@ -1161,7 +1162,7 @@ class GreedyScheduler:
         # ── Gen: constant per-token rate ────────────────────────────────────
         gen_per_token = self._gen_per_token_ema   # ms/token
 
-        # ── Emb + Ret (CPU: fully overlap with Gen; GPU: separate) ────────
+        # ── Emb + Ret ───────────────────────────────────────────────────────
         e = self._emb_rate_ema.get(x_e, 0.05)
         r = self._ret_r_ema.get(x_r, 0.15)
         alpha = self._ret_alpha_ema.get(x_r, 0.5)
@@ -1175,15 +1176,12 @@ class GreedyScheduler:
         # ── Pipeline overheads ────────────────────────────────────────────
         queue_penalty = self._queue_penalty_ema
         gpu_contention = self._gpu_contention_ema if x_e == 1 else 0.0
-
-        # xE=0: emb+ret run on CPU, Gen on GPU — fully parallel (5% fudge)
-        # xE=1: emb competes for GPU with Gen — adds full gpu_contention penalty
-        er_wall_q = (emb_q + ret_q) * 0.05 if x_e == 0 else 0.0
+        er_overlap = self._er_overlap_penalty_ema if x_e == 0 else 0.0
 
         wall_q = (gen_per_token * avg_out_tokens
                   + queue_penalty
                   + gpu_contention
-                  + er_wall_q
+                  + er_overlap
                   + xfer_q)
 
         return wall_q
@@ -1265,7 +1263,7 @@ class GreedyScheduler:
         wall_q = gen_per_token * avg_output_tokens
                + queue_penalty
                + I(xE=1) * gpu_contention
-               + I(xE=0) * 0.05 * (emb_q + ret_q)
+               + I(xE=0) * er_overlap_penalty
                + xfer_q
 
         Each component is fitted independently from its own observation source.
@@ -1327,21 +1325,37 @@ class GreedyScheduler:
             self._avg_output_tokens_ema = a * avg_out_obs + (1 - a) * prev_avg_out
 
         # ── 4. GPU contention (xE=1 only) ──────────────────────────────────────
-        # pred_no_cont = gen_per_token * avg_output_tokens + queue_penalty + er_overhead
+        # For xE=1, er_overlap is 0 (xE=1 uses gpu_contention instead)
+        # pred_no_cont = gen + queue
         # cont_obs = wall_q - pred_no_cont  (using pre-update values)
         if x_e == 1 and B > 0:
-            er_q = (prev_e * L + prev_r * (B ** (prev_alpha - 1))) * 0.05
-            pred_no_cont = prev_gen_per_token * prev_avg_out + prev_queue + er_q
+            pred_no_cont = prev_gen_per_token * prev_avg_out + prev_queue
             cont_obs = (wall_time_ms / B - pred_no_cont) if pred_no_cont > 0 else 0.0
             cont_obs = max(0.0, min(200.0, cont_obs))
             self._gpu_contention_ema = a * cont_obs + (1 - a) * self._gpu_contention_ema
 
-        # ── 5. Queue penalty (xE=0 only) ─────────────────────────────────────
+        # ── 5. Queue penalty + E+R overlap (xE=0 only) ───────────────────────
+        # obs = wall_q - gen_base = queue + er_overlap + xfer_q
         if B > 0 and x_e == 0:
             gen_base = prev_gen_per_token * prev_avg_out
-            obs_q = (wall_time_ms / B) - gen_base
-            obs_q = max(0.0, min(50.0, obs_q))
-            self._queue_penalty_ema = a * obs_q + (1 - a) * prev_queue
+            obs_total = (wall_time_ms / B) - gen_base
+            obs_total = max(0.0, min(50.0, obs_total))
+            xfer_q_obs = self._transfer_K_ema.get((x_e, x_r), 0.0) * L
+            residual = obs_total - xfer_q_obs
+            prev_er_overlap = getattr(self, '_er_overlap_penalty_ema', 0.0)
+            total_prev = prev_queue + prev_er_overlap
+            if total_prev > 0:
+                # Proportional split: distribute residual by current ratio
+                queue_obs = residual * prev_queue / total_prev
+                er_overlap_obs = residual * prev_er_overlap / total_prev
+            else:
+                # No history: equal split
+                queue_obs = residual * 0.5
+                er_overlap_obs = residual * 0.5
+            queue_obs = max(0.0, min(50.0, queue_obs))
+            er_overlap_obs = max(0.0, min(20.0, er_overlap_obs))
+            self._queue_penalty_ema = a * queue_obs + (1 - a) * prev_queue
+            self._er_overlap_penalty_ema = a * er_overlap_obs + (1 - a) * prev_er_overlap
 
         self.feedback_trace.append(
             FeedbackTraceEntry(
@@ -1364,6 +1378,7 @@ class GreedyScheduler:
                     "gen_per_token": self._gen_per_token_ema,
                     "gpu_contention": self._gpu_contention_ema,
                     "queue_penalty": self._queue_penalty_ema,
+                    "er_overlap_penalty": getattr(self, '_er_overlap_penalty_ema', 0.0),
                     f"K[{x_e},{x_r}]": self._transfer_K_ema.get((x_e, x_r), 0.0),
                     "avg_out_tokens": getattr(self, '_avg_output_tokens_ema', 120.0),
                 },
@@ -1493,6 +1508,7 @@ class GreedyScheduler:
             "gen_per_token_ema": self._gen_per_token_ema,
             "avg_output_tokens_ema": self._avg_output_tokens_ema,
             "gpu_contention_ema": self._gpu_contention_ema,
+            "er_overlap_penalty_ema": getattr(self, '_er_overlap_penalty_ema', 0.0),
             "queue_penalty_ema": self._queue_penalty_ema,
             "transfer_K_ema": {f"({xe},{xr})": v for (xe, xr), v in self._transfer_K_ema.items()},
             "er_base_overhead_ema": self._er_base_overhead_ema,
@@ -1514,6 +1530,7 @@ class GreedyScheduler:
             "gen_per_token_ema": self._gen_per_token_ema,
             "avg_output_tokens_ema": self._avg_output_tokens_ema,
             "gpu_contention_ema": self._gpu_contention_ema,
+            "er_overlap_penalty_ema": getattr(self, '_er_overlap_penalty_ema', 0.0),
             "queue_penalty_ema": self._queue_penalty_ema,
             "transfer_K_ema": {f"({xe},{xr})": v for (xe, xr), v in self._transfer_K_ema.items()},
             "er_base_overhead_ema": self._er_base_overhead_ema,
@@ -1564,6 +1581,7 @@ class GreedyScheduler:
         self._avg_output_tokens_ema = float(raw.get("avg_output_tokens_ema", 120.0))
         self._queue_penalty_ema = float(raw.get("queue_penalty_ema", 2.5))
         self._gpu_contention_ema = float(raw.get("gpu_contention_ema", 0.0))
+        self._er_overlap_penalty_ema = float(raw.get("er_overlap_penalty_ema", 0.0))
         self._transfer_K_ema = parse_tuple_key(raw, "transfer_K_ema")
         self._er_base_overhead_ema = float(raw.get("er_base_overhead_ema", 0.0))
 
