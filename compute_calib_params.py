@@ -6,12 +6,10 @@ Uses per-batch MEDIAN (robust) estimation rather than log-log regression,
 since the power-law fit is noisy with few data points and CPU retrieval
 has a significant fixed-overhead component.
 
-Fits the v4 cost model:
-    wall_q = gen_per_token * avg_output_tokens
-           + queue_penalty
-           + gpu_contention    (xE=1 only, default 0 for portability)
-           + er_overlap_penalty  (xE=0 only, learned from data)
-           + xfer_q            (xE != xR only)
+Fits the v4 max(CPU, GPU) pipeline model:
+    CPU_q = emb_cpu_q + ret_cpu_q + I(xE=0,xR=1) × xfer_q
+    GPU_q = gen_q + I(xE=1) × emb_gpu_q + I(xR=1) × ret_gpu_q
+    wall_q = max(CPU_q, GPU_q) + queue_penalty
 
 Usage:
     python compute_calib_params.py \
@@ -20,7 +18,7 @@ Usage:
         --avg-output-tokens 120.0 \
         --output output/calibrated_params.json
 
-    # With sweep data for queue+er_overlap separation:
+    # With sweep data for queue_penalty:
     python compute_calib_params.py \
         --files output/calib_*.json \
         --sweep-coeffs output/calibration_sweep/fitted_coefficients.json \
@@ -111,54 +109,61 @@ def fit_emb_model(raw_points, xE_label, L):
     return e
 
 
-def fit_gen_model(wall_raw, avg_output_tokens):
+def fit_gen_model(wall_raw, emb_params, ret_params, avg_output_tokens, L):
     """
-    Fit v4 generation parameters:
-        gen_per_token: median(gen_ms/q) / avg_output_tokens
-        queue_penalty + er_overlap_penalty: wall_q - gen_q for xE=0 batches
+    Fit gen_per_token and queue_penalty from per-batch files (no sweep).
 
-    queue_penalty and er_overlap_penalty are NOT fully separable offline
-    (both contribute to xE=0 residual). This function fits their SUM as
-    queue_penalty; er_overlap_penalty defaults to 0 and refines online.
+    Pipeline model:
+        CPU_q = emb_cpu_q + ret_cpu_q + xfer_q(only for xE=0,xR=1)
+        GPU_q = gen_q + I(xE=1)×emb_gpu_q + I(xR=1)×ret_gpu_q
+        wall_q = max(CPU_q, GPU_q) + queue_penalty
 
-    gpu_contention is NOT fitted here (defaults to 0 for portability,
-    converges online from xE=1 runtime data).
+    gen_per_token = median(gen_ms/q) / avg_output_tokens.
+    queue_penalty = median(wall_q - max(CPU_q, GPU_q)) across observations.
+
+    emb_params: {xE: e_rate}
+    ret_params: {xR: (r, alpha)}
     """
-    # Collect xE=0 measurements: wall_q - gen_q = queue + er_overlap + xfer
-    residual_obs = []
+    e0 = emb_params.get(0, 0.05)
+    e1 = emb_params.get(1, 0.016)
+    r0, alpha0 = ret_params.get(0, (0.15, 0.5))
+    r1, alpha1 = ret_params.get(1, (0.10, 0.3))
+
+    queue_obs = []
+    gen_per_q_list = []
     for (xE, xR), measurements in wall_raw.items():
         for B, ret_ms, gen_ms in measurements:
-            if xE == 0:
-                wall_q = (ret_ms + gen_ms) / B
-                gen_q = gen_ms / B
-                residual = wall_q - gen_q
-                if 0 < residual < 50:
-                    residual_obs.append(residual)
+            gen_q = gen_ms / B
+            gen_per_q_list.append(gen_q)
 
-    if residual_obs:
-        queue_penalty = statistics.median(residual_obs)
-    else:
-        queue_penalty = 2.5
-    queue_penalty = max(0.0, min(50.0, queue_penalty))
+            emb_cpu_q = e0 * L
+            emb_gpu_q = e1 * L
+            ret_cpu_q = r0 * (B ** (alpha0 - 1))
+            ret_gpu_q = r1 * (B ** (alpha1 - 1))
+            xfer_q = 0.55 * L if (xE == 0 and xR == 1) else 0.0
 
-    # er_overlap_penalty defaults to 0 offline (online EMA refines it)
-    er_overlap_penalty = 0.0
+            cpu_q = emb_cpu_q + ret_cpu_q + xfer_q
+            gpu_q = gen_q + (emb_gpu_q if xE == 1 else 0.0) + (ret_gpu_q if xR == 1 else 0.0)
+            pipeline_q = max(cpu_q, gpu_q)
+            wall_q = (ret_ms + gen_ms) / B
 
-    # Fit gen_per_token: median gen_ms/q across all batches / avg_output_tokens
-    gen_per_q_list = []
-    for measurements in wall_raw.values():
-        for B, ret_ms, gen_ms in measurements:
-            gen_per_q_list.append(gen_ms / B)
+            q_obs = wall_q - pipeline_q
+            if -10 < q_obs < 50:
+                queue_obs.append(q_obs)
 
     if gen_per_q_list:
         median_gen_per_q = statistics.median(gen_per_q_list)
-        gen_per_token = median_gen_per_q / avg_output_tokens
-        gen_per_token = max(0.1, min(1.0, gen_per_token))
+        gen_per_token = max(0.1, min(1.0, median_gen_per_q / avg_output_tokens))
     else:
         gen_per_token = 0.378
 
-    print(f"  gen_per_token={gen_per_token:.4f}ms/token  queue+er_overlap={queue_penalty:.2f}ms/q")
-    return gen_per_token, queue_penalty, er_overlap_penalty
+    if queue_obs:
+        queue_penalty = max(0.0, min(50.0, statistics.median(queue_obs)))
+    else:
+        queue_penalty = 2.5
+
+    print(f"  gen_per_token={gen_per_token:.4f}ms/token  queue_penalty={queue_penalty:.2f}ms/q")
+    return gen_per_token, queue_penalty
 
 
 def main():
@@ -168,7 +173,7 @@ def main():
     ap.add_argument("--avg-output-tokens", type=float, default=120.0)
     ap.add_argument(
         "--sweep-coeffs", type=str, default=None,
-        help="Path to calibrate_sweep fitted_coefficients.json for queue+er_overlap separation"
+        help="Path to calibrate_sweep fitted_coefficients.json for queue_penalty"
     )
     ap.add_argument("--output", default="output/calibrated_params.json")
     args = ap.parse_args()
@@ -196,10 +201,13 @@ def main():
     for xE in [0, 1]:
         e = fit_emb_model(emb_raw[xE], f"xE={xE}", args.emb_tokens_per_query)
         e_params[xE] = e
+    r_params = {}
+    for xR in [0, 1]:
+        r, alpha, r2 = fit_ret_model(ret_raw[xR], f"xR={xR}")
+        r_params[xR] = dict(r=r, alpha=alpha, r2=r2)
 
     # ── Generation + Queue ───────────────────────────────────────────────
     queue_penalty = 2.5
-    er_overlap_penalty = 0.0
     gen_per_token = 0.378
     used_sweep = False
 
@@ -209,25 +217,18 @@ def main():
             coeffs = json.loads(coeffs_path.read_text())
             meta = coeffs.get("__meta__", {})
             queue_penalty = meta.get("queue_penalty", 2.5)
-            er_overlap_penalty = meta.get("er_overlap_penalty", 0.0)
-            r2 = meta.get("overlap_r_squared", 0.0)
-            a00 = coeffs.get("(0,0)", {})
-            gen_per_query = a00.get("gen_per_query")
-            if gen_per_query is not None:
-                gen_per_token = max(0.1, min(1.0, gen_per_query / args.avg_output_tokens))
+            gen_per_token = meta.get("gen_per_token", 0.378)
             used_sweep = True
             print(f"\n=== Generation + Overhead (from sweep) ===")
-            print(f"  gen_per_token       = {gen_per_token:.4f} ms/token  (from (0,0) gen_per_query={gen_per_query:.2f} / avg_out={args.avg_output_tokens})")
-            print(f"  queue_penalty       = {queue_penalty:.2f} ms/q")
-            print(f"  er_overlap_penalty  = {er_overlap_penalty:.2f} ms/q")
-            print(f"  R² (overlap fit)    = {r2:.4f}")
+            print(f"  gen_per_token      = {gen_per_token:.4f} ms/token")
+            print(f"  queue_penalty     = {queue_penalty:.2f} ms/q")
         else:
             print(f"\n  WARNING: --sweep-coeffs file not found: {coeffs_path}")
 
     if not used_sweep:
-        # Fallback: fit queue from per-batch files (er_overlap always 0.0 offline)
+        # Fallback: fit queue from per-batch files
         print(f"\n=== Generation (avg_out={args.avg_output_tokens}) ===")
-        _, queue_penalty, _ = fit_gen_model(wall_raw, args.avg_output_tokens)
+        _, queue_penalty = fit_gen_model(wall_raw, e_params, r_params, args.avg_output_tokens, args.emb_tokens_per_query)
 
     # ── Write v4 calibration JSON ───────────────────────────────────────
     out = {
@@ -238,8 +239,6 @@ def main():
         "gen_per_token_ema": gen_per_token,
         "avg_output_tokens_ema": args.avg_output_tokens,
         "queue_penalty_ema": queue_penalty,
-        "gpu_contention_ema": 0.0,
-        "er_overlap_penalty_ema": er_overlap_penalty,
         "transfer_K_ema": {"(0,1)": 0.55, "(1,0)": 0.16, "(1,1)": 0.0},
         "er_base_overhead_ema": 0.0,
         "ret_measurements": {str(k): [list(p) for p in sorted(set(ret_raw[int(k)]))]
