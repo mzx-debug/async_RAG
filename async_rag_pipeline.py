@@ -933,11 +933,11 @@ class GreedyScheduler:
         self.device_plan_trace: List[DevicePlanTraceEntry] = []
         self.batch_shaping_trace: List[BatchShapingTraceEntry] = []
 
-        # Warm-start defaults
-        self._emb_rate_ema[0] = 0.11    # ms/token, CPU Embedding per-token rate
+        # Warm-start defaults (fitted from GPU cost measurements)
+        self._emb_rate_ema[0] = 0.36    # ms/token, CPU Embedding per-token rate
         self._emb_rate_ema[1] = 0.00    # ms/token, GPU Embedding per-token rate (overhead-dominant)
-        self._emb_overhead_ema[0] = 2.91  # ms, CPU Embedding fixed overhead
-        self._emb_overhead_ema[1] = 5.18  # ms, GPU Embedding fixed overhead
+        self._emb_overhead_ema[0] = 2.71  # ms, CPU Embedding fixed overhead
+        self._emb_overhead_ema[1] = 4.87  # ms, GPU Embedding fixed overhead
         self._ret_r_ema[0] = 0.20        # ms, CPU Retrieval per-query marginal
         self._ret_r_ema[1] = 0.00        # ms, GPU Retrieval per-query marginal (overhead-dominant)
         self._ret_overhead_ema[0] = 1.36  # ms, CPU Retrieval fixed overhead
@@ -1174,8 +1174,8 @@ class GreedyScheduler:
         # ── Emb per device (parallel transformer, overhead amortized) ───
         # Theory: emb_total = e_base * L * B + overhead_e
         #   emb_per_query = e_base * L + overhead_e / B
-        emb_q_cpu = self._emb_rate_ema.get(0, 0.11) * L + self._emb_overhead_ema.get(0, 2.91) / B
-        emb_q_gpu = self._emb_rate_ema.get(1, 0.00) * L + self._emb_overhead_ema.get(1, 5.18) / B
+        emb_q_cpu = self._emb_rate_ema.get(0, 0.36) * L + self._emb_overhead_ema.get(0, 2.71) / B
+        emb_q_gpu = self._emb_rate_ema.get(1, 0.00) * L + self._emb_overhead_ema.get(1, 4.87) / B
 
         # ── Ret per device (linear model: fixed + marginal) ───────────
         # Theory: ret_total = r_base * B + overhead_r
@@ -1303,10 +1303,10 @@ class GreedyScheduler:
         prev_gen_per_token = getattr(self, '_gen_per_token_ema', 0.378)
         prev_gen_base = getattr(self, '_gen_base_ema', 1000.0)  # fixed calibration value
         prev_avg_out = getattr(self, '_avg_output_tokens_ema', 120.0)
-        prev_e0 = self._emb_rate_ema.get(0, 0.11)
+        prev_e0 = self._emb_rate_ema.get(0, 0.36)
         prev_e1 = self._emb_rate_ema.get(1, 0.00)
-        prev_oh_e0 = self._emb_overhead_ema.get(0, 2.91)
-        prev_oh_e1 = self._emb_overhead_ema.get(1, 5.18)
+        prev_oh_e0 = self._emb_overhead_ema.get(0, 2.71)
+        prev_oh_e1 = self._emb_overhead_ema.get(1, 4.87)
         prev_r0 = self._ret_r_ema.get(0, 0.20)
         prev_r1 = self._ret_r_ema.get(1, 0.00)
         prev_oh_r0 = self._ret_overhead_ema.get(0, 1.36)
@@ -1649,7 +1649,7 @@ class GreedyScheduler:
         # v4 backward compat: init overhead from defaults if missing
         for xe in [0, 1]:
             if xe not in self._emb_overhead_ema:
-                self._emb_overhead_ema[xe] = 2.91 if xe == 0 else 5.18
+                self._emb_overhead_ema[xe] = 2.71 if xe == 0 else 4.87
         for xr in [0, 1]:
             if xr not in self._ret_overhead_ema:
                 self._ret_overhead_ema[xr] = 1.36 if xr == 0 else 1.50
