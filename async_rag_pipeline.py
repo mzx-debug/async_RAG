@@ -892,9 +892,10 @@ class GreedyScheduler:
         #   p_lin    = ms/token  : gen prefill per-token rate (shared)
         #   g        = ms/q      : gen decode marginal cost (shared)
         #   K[xE,xR] = ms/token  : transfer rate, xE=xR→0
-        self._emb_rate_ema: Dict[int, float] = {}                    # e[xE], ms/token
-        self._ret_r_ema: Dict[int, float] = {}                      # r[xR], ms
-        self._ret_alpha_ema: Dict[int, float] = {}                   # alpha[xR], default 0.5
+        self._emb_rate_ema: Dict[int, float] = {}        # e_base[xE], ms/token
+        self._emb_overhead_ema: Dict[int, float] = {}  # overhead_e[xE], ms (fixed latency amortized over batch)
+        self._ret_r_ema: Dict[int, float] = {}         # r_base[xR], ms (per-query marginal, no B factor)
+        self._ret_overhead_ema: Dict[int, float] = {}  # overhead_r[xR], ms (fixed latency amortized over batch)
         self._transfer_K_ema: Dict[Tuple[int, int], float] = {}     # K[xE,xR], ms/token
         self._gen_P0_ema: float = 2072.0                            # ms, prefill fixed
         self._gen_p_lin_ema: float = 0.0                            # ms/token, prefill per-token
@@ -919,6 +920,7 @@ class GreedyScheduler:
         self._startup_k_ema: Dict[Tuple[int, int], float] = {}
         # ── Tracking ──────────────────────────────────────────────────────────
         self._wall_time_measurements: Dict[Tuple[int, int], List[Tuple[int, float, float]]] = {}
+        self._emb_measurements: Dict[int, List[Tuple[int, float]]] = {}   # {xE: [(B, emb_ms_total), ...]}
         self._ret_measurements: Dict[int, List[Tuple[int, float]]] = {}   # {xR: [(B, ret_ms_total), ...]}
         # ── Scheduling state ──────────────────────────────────────────────────
         self._overlap_factor_ema: Dict[Tuple[int, int], float] = {}
@@ -932,12 +934,14 @@ class GreedyScheduler:
         self.batch_shaping_trace: List[BatchShapingTraceEntry] = []
 
         # Warm-start defaults
-        self._emb_rate_ema[0] = 0.084    # ms/token, CPU Embedding rate
-        self._emb_rate_ema[1] = 0.016    # ms/token, GPU Embedding rate
-        self._ret_r_ema[0] = 0.68        # ms, CPU Retrieval coefficient
-        self._ret_r_ema[1] = 0.50        # ms, GPU Retrieval coefficient
-        self._ret_alpha_ema[0] = 0.14     # sublinear exponent (CPU)
-        self._ret_alpha_ema[1] = 0.30     # sublinear exponent (GPU)
+        self._emb_rate_ema[0] = 0.11    # ms/token, CPU Embedding per-token rate
+        self._emb_rate_ema[1] = 0.00    # ms/token, GPU Embedding per-token rate (overhead-dominant)
+        self._emb_overhead_ema[0] = 2.91  # ms, CPU Embedding fixed overhead
+        self._emb_overhead_ema[1] = 5.18  # ms, GPU Embedding fixed overhead
+        self._ret_r_ema[0] = 0.20        # ms, CPU Retrieval per-query marginal
+        self._ret_r_ema[1] = 0.00        # ms, GPU Retrieval per-query marginal (overhead-dominant)
+        self._ret_overhead_ema[0] = 1.36  # ms, CPU Retrieval fixed overhead
+        self._ret_overhead_ema[1] = 1.50  # ms, GPU Retrieval fixed overhead
         self._gen_per_token_ema = 0.2135  # ms/token, from sweep fit
         self._gen_base_ema = 1109.0      # ms, prefill overhead
         self._avg_output_tokens_ema = 120.0
@@ -1167,13 +1171,17 @@ class GreedyScheduler:
         gen_q = self._gen_per_token_ema * avg_out_tokens   # ms/q
         gen_base_q = self._gen_base_ema / B                   # amortized prefill per query
 
-        # ── Emb per device ───────────────────────────────────────────────
-        emb_q_cpu = self._emb_rate_ema.get(0, 0.48) * L
-        emb_q_gpu = self._emb_rate_ema.get(1, 0.74) * L
+        # ── Emb per device (parallel transformer, overhead amortized) ───
+        # Theory: emb_total = e_base * L * B + overhead_e
+        #   emb_per_query = e_base * L + overhead_e / B
+        emb_q_cpu = self._emb_rate_ema.get(0, 0.11) * L + self._emb_overhead_ema.get(0, 2.91) / B
+        emb_q_gpu = self._emb_rate_ema.get(1, 0.00) * L + self._emb_overhead_ema.get(1, 5.18) / B
 
-        # ── Ret per device (sublinear in B) ─────────────────────────────
-        ret_q_cpu = self._ret_r_ema.get(0, 1.78) * (B ** (self._ret_alpha_ema.get(0, 0.14) - 1))
-        ret_q_gpu = self._ret_r_ema.get(1, 1.30) * (B ** (self._ret_alpha_ema.get(1, 0.05) - 1))
+        # ── Ret per device (linear model: fixed + marginal) ───────────
+        # Theory: ret_total = r_base * B + overhead_r
+        #   ret_per_query = r_base + overhead_r / B
+        ret_q_cpu = self._ret_r_ema.get(0, 0.20) + self._ret_overhead_ema.get(0, 1.36) / B
+        ret_q_gpu = self._ret_r_ema.get(1, 0.00) + self._ret_overhead_ema.get(1, 1.50) / B
 
         # ── Transfer (CPU↔GPU when xE≠xR) ──────────────────────────────────
         # K[(0,1)] = CPU→GPU, K[(1,0)] = GPU→CPU
@@ -1295,20 +1303,50 @@ class GreedyScheduler:
         prev_gen_per_token = getattr(self, '_gen_per_token_ema', 0.378)
         prev_gen_base = getattr(self, '_gen_base_ema', 1000.0)  # fixed calibration value
         prev_avg_out = getattr(self, '_avg_output_tokens_ema', 120.0)
-        prev_e0 = self._emb_rate_ema.get(0, 0.48)
-        prev_e1 = self._emb_rate_ema.get(1, 0.74)
-        prev_r0 = self._ret_r_ema.get(0, 1.78)
-        prev_r1 = self._ret_r_ema.get(1, 1.30)
-        prev_alpha0 = self._ret_alpha_ema.get(0, 0.14)
-        prev_alpha1 = self._ret_alpha_ema.get(1, 0.05)
+        prev_e0 = self._emb_rate_ema.get(0, 0.11)
+        prev_e1 = self._emb_rate_ema.get(1, 0.00)
+        prev_oh_e0 = self._emb_overhead_ema.get(0, 2.91)
+        prev_oh_e1 = self._emb_overhead_ema.get(1, 5.18)
+        prev_r0 = self._ret_r_ema.get(0, 0.20)
+        prev_r1 = self._ret_r_ema.get(1, 0.00)
+        prev_oh_r0 = self._ret_overhead_ema.get(0, 1.36)
+        prev_oh_r1 = self._ret_overhead_ema.get(1, 1.50)
         prev_queue = self._queue_penalty_ema
 
-        # ── 1. Emb: e[xE] = emb_ms_total / (L * B) ──────────────────────────────
+        # ── 1. Emb: fit e_base[xE] and overhead_e[xE] from total = e_base * L * B + overhead ─
         emb_ms_total = embedding_sec * 1000.0
         e_obs = emb_ms_total / (L * B) if (L > 0 and B > 0) else (prev_e0 if x_e == 0 else prev_e1)
-        self._emb_rate_ema[x_e] = a * e_obs + (1 - a) * (prev_e0 if x_e == 0 else prev_e1)
+        emb_key = x_e
+        if emb_key not in self._emb_measurements:
+            self._emb_measurements[emb_key] = []
+        if L > 0:
+            self._emb_measurements[emb_key].append((B, emb_ms_total))
+        if len(self._emb_measurements[emb_key]) > 20:
+            self._emb_measurements[emb_key] = self._emb_measurements[emb_key][-20:]
 
-        # ── 2. Ret: r[xR] and alpha[xR] -- fit from ret_ms across B values ───────
+        obs_emb = self._emb_measurements[emb_key]
+        if len(obs_emb) >= 2:
+            # Linear regression: emb_total = a * (L*B) + b
+            # Compute a=e_base, b=overhead from all history
+            n = len(obs_emb)
+            sum_x = sum_x2 = sum_y = sum_xy = 0.0
+            for bi, emb_t in obs_emb:
+                x = L * bi
+                sum_x += x; sum_x2 += x*x; sum_y += emb_t; sum_xy += x*emb_t
+            d = n * sum_x2 - sum_x * sum_x
+            if abs(d) > 1e-9:
+                e_base_fit = (n * sum_xy - sum_x * sum_y) / d
+                overhead_fit = (sum_y - e_base_fit * sum_x) / n
+                e_base_fit = max(0.0, min(10.0, e_base_fit))
+                overhead_fit = max(0.0, min(50.0, overhead_fit))
+                if x_e == 0:
+                    self._emb_rate_ema[0] = a * e_base_fit + (1 - a) * prev_e0
+                    self._emb_overhead_ema[0] = a * overhead_fit + (1 - a) * prev_oh_e0
+                else:
+                    self._emb_rate_ema[1] = a * e_base_fit + (1 - a) * prev_e1
+                    self._emb_overhead_ema[1] = a * overhead_fit + (1 - a) * prev_oh_e1
+
+        # ── 2. Ret: fit r_base[xR] and overhead_r[xR] from total = r_base * B + overhead ─
         ret_ms_total = retrieval_sec * 1000.0
         ret_key = x_r
         if ret_key not in self._ret_measurements:
@@ -1320,17 +1358,23 @@ class GreedyScheduler:
 
         obs_ret = self._ret_measurements[ret_key]
         if len(obs_ret) >= 2:
-            b1, t1 = obs_ret[0]
-            b2, t2 = obs_ret[-1]
-            if b1 != b2 and t1 > 0 and t2 > 0:
-                ratio = t2 / t1
-                ratio = max(0.01, min(100.0, ratio))
-                alpha_obs = math.log(ratio) / math.log(b2 / b1)
-                alpha_obs = max(0.3, min(1.0, alpha_obs))
-                r_obs = t1 / (b1 ** alpha_obs)
-                r_obs = max(0.01, min(100.0, r_obs))
-                self._ret_alpha_ema[ret_key] = a * alpha_obs + (1 - a) * (prev_alpha0 if ret_key == 0 else prev_alpha1)
-                self._ret_r_ema[ret_key] = a * r_obs + (1 - a) * (prev_r0 if ret_key == 0 else prev_r1)
+            # Linear regression: ret_total = a * B + b
+            n = len(obs_ret)
+            sum_x = sum_x2 = sum_y = sum_xy = 0.0
+            for bi, ret_t in obs_ret:
+                sum_x += bi; sum_x2 += bi*bi; sum_y += ret_t; sum_xy += bi*ret_t
+            d = n * sum_x2 - sum_x * sum_x
+            if abs(d) > 1e-9:
+                r_base_fit = (n * sum_xy - sum_x * sum_y) / d
+                overhead_fit = (sum_y - r_base_fit * sum_x) / n
+                r_base_fit = max(0.0, min(10.0, r_base_fit))
+                overhead_fit = max(0.0, min(50.0, overhead_fit))
+                if ret_key == 0:
+                    self._ret_r_ema[0] = a * r_base_fit + (1 - a) * prev_r0
+                    self._ret_overhead_ema[0] = a * overhead_fit + (1 - a) * prev_oh_r0
+                else:
+                    self._ret_r_ema[1] = a * r_base_fit + (1 - a) * prev_r1
+                    self._ret_overhead_ema[1] = a * overhead_fit + (1 - a) * prev_oh_r1
 
         # ── 3. Gen per-token ───────────────────────────────────────────────────
         gen_ms_total = generation_sec * 1000.0
@@ -1347,15 +1391,15 @@ class GreedyScheduler:
         # Uses the PRE-FROZEN Emb/Ret rates to compute both pipeline sides,
         # then extracts queue from the residual. Consistent across all actions.
         #
-        # CPU pipeline: I(xE=0)×Emb + I(xR=0)×Ret + I(xE≠xR)×xfer
-        # GPU pipeline: Gen + I(xE=1)×Emb + I(xR=1)×Ret
-        # Emb is a common prefix on both sides, captured by max(CPU, GPU).
+        # New models:
+        #   Emb: emb_q = e_base * L + overhead_e / B
+        #   Ret: ret_q = r_base + overhead_r / B
         if B > 0:
             gen_q = prev_gen_per_token * prev_avg_out
-            emb_q_cpu = prev_e0 * L
-            emb_q_gpu = prev_e1 * L
-            ret_q_cpu = prev_r0 * (B ** (prev_alpha0 - 1))
-            ret_q_gpu = prev_r1 * (B ** (prev_alpha1 - 1))
+            emb_q_cpu = prev_e0 * L + prev_oh_e0 / B
+            emb_q_gpu = prev_e1 * L + prev_oh_e1 / B
+            ret_q_cpu = prev_r0 + prev_oh_r0 / B
+            ret_q_gpu = prev_r1 + prev_oh_r1 / B
             xfer_q = (self._transfer_K_ema.get((x_e, x_r), 0.0) * L) if x_e != x_r else 0.0
 
             cpu_q = (emb_q_cpu if x_e == 0 else 0.0) + (ret_q_cpu if x_r == 0 else 0.0) + xfer_q
@@ -1383,8 +1427,12 @@ class GreedyScheduler:
                 ema_after_update={
                     f"e0": self._emb_rate_ema.get(0, 0.0),
                     f"e1": self._emb_rate_ema.get(1, 0.0),
+                    f"oh_e0": self._emb_overhead_ema.get(0, 0.0),
+                    f"oh_e1": self._emb_overhead_ema.get(1, 0.0),
                     f"r0": self._ret_r_ema.get(0, 0.0),
                     f"r1": self._ret_r_ema.get(1, 0.0),
+                    f"oh_r0": self._ret_overhead_ema.get(0, 0.0),
+                    f"oh_r1": self._ret_overhead_ema.get(1, 0.0),
                     "gen_per_token": self._gen_per_token_ema,
                     "queue_penalty": self._queue_penalty_ema,
                     "avg_out_tokens": getattr(self, '_avg_output_tokens_ema', 120.0),
@@ -1510,14 +1558,15 @@ class GreedyScheduler:
         """Return all current EMA parameters as a dict for inspection."""
         return {
             "emb_rate_ema": {f"{xe}": v for xe, v in self._emb_rate_ema.items()},
+            "emb_overhead_ema": {f"{xe}": v for xe, v in self._emb_overhead_ema.items()},
             "ret_r_ema": {f"{xr}": v for xr, v in self._ret_r_ema.items()},
-            "ret_alpha_ema": {f"{xr}": v for xr, v in self._ret_alpha_ema.items()},
+            "ret_overhead_ema": {f"{xr}": v for xr, v in self._ret_overhead_ema.items()},
             "gen_per_token_ema": self._gen_per_token_ema,
             "gen_base_ema": self._gen_base_ema,
             "avg_output_tokens_ema": self._avg_output_tokens_ema,
             "queue_penalty_ema": self._queue_penalty_ema,
             "transfer_K_ema": {f"({xe},{xr})": v for (xe, xr), v in self._transfer_K_ema.items()},
-            "er_base_overhead_ema": self._er_base_overhead_ema,
+            "emb_measurements": {f"{xe}": ms for xe, ms in self._emb_measurements.items()},
             "ret_measurements": {f"{xr}": ms for xr, ms in self._ret_measurements.items()},
             "wall_time_measurements": {
                 f"({xe},{xr})": ms
@@ -1530,16 +1579,17 @@ class GreedyScheduler:
     def save_ema_params(self, path: str) -> None:
         """Persist all EMA parameters to a JSON file for warm-start on next run."""
         data = {
-            "version": 4,
+            "version": 5,
             "emb_rate_ema": {f"{xe}": v for xe, v in self._emb_rate_ema.items()},
+            "emb_overhead_ema": {f"{xe}": v for xe, v in self._emb_overhead_ema.items()},
             "ret_r_ema": {f"{xr}": v for xr, v in self._ret_r_ema.items()},
-            "ret_alpha_ema": {f"{xr}": v for xr, v in self._ret_alpha_ema.items()},
+            "ret_overhead_ema": {f"{xr}": v for xr, v in self._ret_overhead_ema.items()},
             "gen_per_token_ema": self._gen_per_token_ema,
             "gen_base_ema": self._gen_base_ema,
             "avg_output_tokens_ema": self._avg_output_tokens_ema,
             "queue_penalty_ema": self._queue_penalty_ema,
             "transfer_K_ema": {f"({xe},{xr})": v for (xe, xr), v in self._transfer_K_ema.items()},
-            "er_base_overhead_ema": self._er_base_overhead_ema,
+            "emb_measurements": {f"{xe}": ms for xe, ms in self._emb_measurements.items()},
             "ret_measurements": {f"{xr}": ms for xr, ms in self._ret_measurements.items()},
             "wall_time_measurements": {
                 f"({xe},{xr})": ms
@@ -1579,18 +1629,42 @@ class GreedyScheduler:
         def parse_int_key(d, src_key):
             return {int(k): float(v) for k, v in d.get(src_key, {}).items()}
 
-        # v4 cost model parameters
+        # v5 cost model parameters (replaces v4: emb & ret use linear model with overhead)
         self._emb_rate_ema = parse_int_key(raw, "emb_rate_ema")
+        self._emb_overhead_ema = parse_int_key(raw, "emb_overhead_ema")
         self._ret_r_ema = parse_int_key(raw, "ret_r_ema")
-        self._ret_alpha_ema = parse_int_key(raw, "ret_alpha_ema")
+        self._ret_overhead_ema = parse_int_key(raw, "ret_overhead_ema")
+        # v4 backward compat: convert ret_alpha to overhead (approximate)
+        if not self._ret_overhead_ema and "ret_alpha_ema" in raw:
+            v4_alpha = parse_int_key(raw, "ret_alpha_ema")
+            for xr, alpha in v4_alpha.items():
+                r = float(raw.get("ret_r_ema", {}).get(str(xr), 0.5))
+                # Old model: ret_q = r * B^(alpha-1)
+                # New model: ret_q = r_new + overhead_new / B
+                # Approximate: r_new = r * B_typical^(alpha-1), overhead_new = r * B_typical^alpha * (1 - 1/B_typical)
+                B_t = 8.0
+                r_new = r * (B_t ** (alpha - 1))
+                oh_new = r * (B_t ** alpha) * (1 - 1.0 / B_t)
+                self._ret_overhead_ema[xr] = oh_new
+        # v4 backward compat: init overhead from defaults if missing
+        for xe in [0, 1]:
+            if xe not in self._emb_overhead_ema:
+                self._emb_overhead_ema[xe] = 2.91 if xe == 0 else 5.18
+        for xr in [0, 1]:
+            if xr not in self._ret_overhead_ema:
+                self._ret_overhead_ema[xr] = 1.36 if xr == 0 else 1.50
+
         self._gen_per_token_ema = float(raw.get("gen_per_token_ema", 0.378))
         self._gen_base_ema = float(raw.get("gen_base_ema", 1000.0))
         self._avg_output_tokens_ema = float(raw.get("avg_output_tokens_ema", 120.0))
         self._queue_penalty_ema = float(raw.get("queue_penalty_ema", 2.5))
         self._transfer_K_ema = parse_tuple_key(raw, "transfer_K_ema")
-        self._er_base_overhead_ema = float(raw.get("er_base_overhead_ema", 0.0))
 
         # Measurement histories
+        self._emb_measurements = {}
+        for k_str, ms_list in raw.get("emb_measurements", {}).items():
+            xe = int(k_str)
+            self._emb_measurements[xe] = [(int(item[0]), float(item[1])) for item in ms_list]
         self._ret_measurements = {}
         for k_str, ms_list in raw.get("ret_measurements", {}).items():
             xr = int(k_str)
