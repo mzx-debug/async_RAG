@@ -1,14 +1,12 @@
-# Async RAG Pipeline — 技术架构说明文档
+# Async RAG Pipeline — 技术架构说明
 
-> 面向项目负责人 | 2026-06-01
+> 2026-06-01
 
 ---
 
 ## 一、流水线做什么
 
 Async RAG Pipeline 是一个**异步检索增强生成系统**，核心目标是在 GPU 资源受限的环境下，通过动态调度 CPU 和 GPU 上的嵌入（Embedding）、检索（Retrieval）和生成（Generation）三个阶段，最小化每个查询的端到端延迟。
-
-一句话概括：**让 CPU 和 GPU 并行干活，谁先干完谁先走。**
 
 ---
 
@@ -60,21 +58,16 @@ RAG 推理有三个计算密集阶段：
 └─────────────────────────────────────────────────────────┘
 ```
 
-**为什么这样建模？**
-- CPU 嵌入很慢（0.084 ms/token），但**不占用 GPU**，GPU 可以同时做生成
-- GPU 嵌入很快（0.016 ms/token），但会和生成**抢 GPU 算力**
-- 两条流水线同时跑，哪个更长就是实际的端到端延迟
-
 ---
 
-## 五、成本模型（调度器的决策依据）
+## 五、成本模型
 
 每做一个调度决策，调度器需要估算每种 `(xE, xR)` action 在给定 batch size 下的耗时。
 
 ### 5.1 模型公式
 
 ```
-CPU_q  = CPU嵌入 + CPU检索 + [跨设备传输]（仅 xE≠xR 时）
+CPU_q  = [CPU嵌入] + [CPU检索] + [跨设备传输]（仅 xE≠xR 时）
        = I(xE=0) × e0 × L + I(xR=0) × r0 × B^(α0-1) + I(xE≠xR) × K[xE,xR] × L
 
 GPU_q  = 生成解码 + 分摊的预填充开销 + [GPU嵌入] + [GPU检索]
@@ -100,8 +93,9 @@ wall_q = max(CPU_q, GPU_q) + queue_penalty
 | `avg_output` | 120 tokens | EMA 自适应 | 平均输出长度 |
 | `queue_penalty` | 0.23 ms/q | Sweep 拟合 | 调度开销 |
 | `K01` | 0.55 ms/token | 初始值 | CPU→GPU 传输速率 |
+| `K10` | 0.16 ms/token | 初始值 | GPU→CPU 传输速率 |
 
-### 5.3 关键公式解读
+### 5.3 关键公式
 
 **生成成本的分摊**（`gen_base / B`）：vLLM 的 continuous batching 下，每个 batch 的预填充（prefill）开销是固定的 1109 ms，与 batch size 无关。因此 batch 越大，每个查询分摊的预填充成本越低。这就是为什么更大的 batch 通常更快——但也不能无限大，因为 GPU 显存有限。
 

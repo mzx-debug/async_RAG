@@ -1104,7 +1104,7 @@ class GreedyScheduler:
         Wall time estimation for scheduling: delegates to _estimate_action_cost.
 
         Uses the max(CPU, GPU) pipeline model:
-            CPU_q = emb_cpu_q + ret_cpu_q + I(xE=0,xR=1) × xfer_q
+            CPU_q = emb_cpu_q + ret_cpu_q + I(xE≠xR) × xfer_q
             GPU_q = gen_q + I(xE=1) × emb_gpu_q + I(xR=1) × ret_gpu_q
             wall_q = max(CPU_q, GPU_q) + queue_penalty
 
@@ -1138,22 +1138,24 @@ class GreedyScheduler:
         """
         Wall time model (ms/q) for async_v2 continuous batching.
 
-        The pipeline runs on two device pipelines:
-          CPU_q = emb_q(xE=0) + ret_q(xR=0) + I(xE=0,xR=1) × xfer_q
-          GPU_q = gen_q + gen_base_q + I(xE=1) × emb_q(xE=1) + I(xR=1) × ret_q(xR=1)
+        Emb is a common prefix on both pipeline sides and is captured by max(CPU, GPU):
+          CPU_q = I(xE=0) × emb_q + I(xR=0) × ret_q + I(xE≠xR) × xfer_q
+          GPU_q = gen_q + gen_base_q + I(xE=1) × emb_q + I(xR=1) × ret_q
           wall_q = max(CPU_q, GPU_q) + queue_penalty
+
+        Per-action breakdown (Emb is the common prefix, absorbed into max):
+          (0,0): wall = max(emb+ret,  gen)     = Emb + max(Ret, Gen)
+          (0,1): wall = max(emb+xfer, gen+ret)  = Emb + max(Xfer, Gen+Ret)
+          (1,0): wall = max(xfer+ret, gen+emb)  = Emb + max(Xfer+Ret, Gen)
+          (1,1): wall = max(0,       gen+emb+ret) = Emb + Ret + Gen  (no overlap possible)
 
         where:
           gen_q = gen_per_token × avg_output_tokens  (decode cost per query, ms/q)
           gen_base_q = gen_base / B                   (prefill overhead amortized per query)
           emb_q(xE) = emb_rate[xE] × L               (embedding cost per query)
-          ret_q(xR,B) = r[xR] × B^(alpha[xR]-1)    (retrieval cost, sublinear in B)
-          xfer_q = K × L                              (CPU→GPU transfer, only when xE=0,xR=1)
+          ret_q(xR,B) = r[xR] × B^(alpha[xR]-1)      (retrieval cost, sublinear in B)
+          xfer_q = K[xE,xR] × L                       (CPU↔GPU transfer, only when xE≠xR)
           queue_penalty = per-query scheduling overhead (constant)
-
-        Emb and Ret appear explicitly. When Gen dominates (typical), GPU side wins
-        the max and wall ≈ gen_q + gen_base_q + queue. When E+R dominates
-        (short output), CPU side wins and wall follows E+R timing.
 
         Returns wall_q (ms per query).
         """
@@ -1170,23 +1172,25 @@ class GreedyScheduler:
         emb_q_gpu = self._emb_rate_ema.get(1, 0.016) * L
 
         # ── Ret per device (sublinear in B) ─────────────────────────────
-        ret_q_x0 = self._ret_r_ema.get(0, 0.15) * (B ** (self._ret_alpha_ema.get(0, 0.5) - 1))
-        ret_q_x1 = self._ret_r_ema.get(1, 0.10) * (B ** (self._ret_alpha_ema.get(1, 0.3) - 1))
+        ret_q_cpu = self._ret_r_ema.get(0, 0.15) * (B ** (self._ret_alpha_ema.get(0, 0.5) - 1))
+        ret_q_gpu = self._ret_r_ema.get(1, 0.10) * (B ** (self._ret_alpha_ema.get(1, 0.3) - 1))
 
-        # ── Transfer (CPU→GPU when xE=0, xR=1) ─────────────────────────
-        xfer_q = self._transfer_K_ema.get((0, 1), 0.0) * L if (x_e == 0 and x_r == 1) else 0.0
+        # ── Transfer (CPU↔GPU when xE≠xR) ──────────────────────────────────
+        # K[(0,1)] = CPU→GPU, K[(1,0)] = GPU→CPU
+        xfer_q = (self._transfer_K_ema.get((x_e, x_r), 0.0) * L) if x_e != x_r else 0.0
 
         # ── Two pipeline sides ───────────────────────────────────────────
-        # CPU side: Emb(xE=0) and Ret(xR=0) run sequentially on CPU.
-        #   Emb must complete before Gen starts on GPU (transfer if needed).
-        #   Ret on CPU can overlap with Gen on GPU.
-        cpu_q = emb_q_cpu + ret_q_x0 + xfer_q
+        # Physical model per action:
+        #   (0,0): CPU=Emb+Ret,  GPU=Gen              → max(Emb+Ret, Gen)
+        #   (0,1): CPU=Emb,      GPU=Ret+Gen           → Emb + max(Ret, Gen)
+        #   (1,0): CPU=xfer+Ret, GPU=Emb+Gen           → Emb + max(xfer+Ret, Gen)
+        #   (1,1): CPU=0,        GPU=Emb+Ret+Gen       → Emb+Ret+Gen
+        # Overlap: Emb(CPU) serial before CPU pipeline; Emb(GPU) serial before GPU pipeline.
+        cpu_q = (emb_q_cpu if x_e == 0 else 0.0) + (ret_q_cpu if x_r == 0 else 0.0) + xfer_q
+        gpu_q = gen_q + gen_base_q + (emb_q_gpu if x_e == 1 else 0.0) + (ret_q_gpu if x_r == 1 else 0.0)
 
-        # GPU side: Gen + Emb(xE=1) + Ret(xR=1) — all on GPU, sequential.
-        #   Gen dominates; Emb and Ret serialize with Gen.
-        gpu_q = gen_q + gen_base_q + (emb_q_gpu if x_e == 1 else 0.0) + (ret_q_x1 if x_r == 1 else 0.0)
-
-        # ── Pipeline: max of CPU and GPU sides ──────────────────────────
+        # CPU Emb serial before CPU pipeline; GPU Emb serial before GPU pipeline.
+        # Emb(CPU) and Emb(GPU) run concurrently (parallel pipeline stages).
         pipeline_q = max(cpu_q, gpu_q)
 
         # ── Queue: per-query scheduling overhead (constant) ───────────────
@@ -1271,8 +1275,8 @@ class GreedyScheduler:
         Per-component EMA fitting for the v4 cost model.
 
         Pipeline model:
-          CPU_q = emb_cpu_q + ret_cpu_q + I(xE=0,xR=1) × xfer_q
-          GPU_q = gen_q + gen_base_q + I(xE=1) × emb_gpu_q + I(xR=1) × ret_gpu_q
+          CPU_q = I(xE=0) × emb_q + I(xR=0) × ret_q + I(xE≠xR) × xfer_q
+          GPU_q = gen_q + gen_base_q + I(xE=1) × emb_q + I(xR=1) × ret_q
           wall_q = max(CPU_q, GPU_q) + queue_penalty
 
         Fitting:
@@ -1343,17 +1347,18 @@ class GreedyScheduler:
         # Uses the PRE-FROZEN Emb/Ret rates to compute both pipeline sides,
         # then extracts queue from the residual. Consistent across all actions.
         #
-        # CPU pipeline: Emb(xE=0) + Ret(xR=0) + xfer (only when xE=0, xR=1)
-        # GPU pipeline: Gen + Emb(xE=1) + Ret(xR=1) — all on GPU, sequential
+        # CPU pipeline: I(xE=0)×Emb + I(xR=0)×Ret + I(xE≠xR)×xfer
+        # GPU pipeline: Gen + I(xE=1)×Emb + I(xR=1)×Ret
+        # Emb is a common prefix on both sides, captured by max(CPU, GPU).
         if B > 0:
             gen_q = prev_gen_per_token * prev_avg_out
             emb_q_cpu = prev_e0 * L
             emb_q_gpu = prev_e1 * L
             ret_q_cpu = prev_r0 * (B ** (prev_alpha0 - 1))
             ret_q_gpu = prev_r1 * (B ** (prev_alpha1 - 1))
-            xfer_q = self._transfer_K_ema.get((0, 1), 0.0) * L if (x_e == 0 and x_r == 1) else 0.0
+            xfer_q = (self._transfer_K_ema.get((x_e, x_r), 0.0) * L) if x_e != x_r else 0.0
 
-            cpu_q = emb_q_cpu + ret_q_cpu + xfer_q
+            cpu_q = (emb_q_cpu if x_e == 0 else 0.0) + (ret_q_cpu if x_r == 0 else 0.0) + xfer_q
             gpu_q = gen_q + (prev_gen_base / B) + (emb_q_gpu if x_e == 1 else 0.0) + (ret_q_gpu if x_r == 1 else 0.0)
             min_side = min(cpu_q, gpu_q)
             wall_q = wall_time_ms / B
@@ -1373,7 +1378,7 @@ class GreedyScheduler:
                 embedding_ms_per_query=e_obs,
                 retrieval_ms_per_query=ret_ms_total / B,
                 generation_ms_per_query=gen_ms_total / B,
-                transfer_ms_per_query_est=self._transfer_K_ema.get((0, 1), 0.0) * L if (x_e == 0 and x_r == 1) else 0.0,
+                transfer_ms_per_query_est=self._transfer_K_ema.get((x_e, x_r), 0.0) * L if x_e != x_r else 0.0,
                 batch_size_residual_ms_per_query=0.0,
                 ema_after_update={
                     f"e0": self._emb_rate_ema.get(0, 0.0),
