@@ -42,11 +42,12 @@ GEN_BASE = 1109.0         # ms
 QUEUE_PENALTY = 0.23      # ms/q
 AVG_OUTPUT = 120.0        # tokens
 L_DEFAULT = 5.0            # default query length
-# Fitted from measurement: e0=0.48, e1=0.74, r0=1.78(a=0.14), r1=1.30(a=0.05)
-E0, E1 = 0.48, 0.74      # ms/token
-R0, A0 = 1.78, 0.14      # CPU retrieval
-R1, A1 = 1.30, 0.05      # GPU retrieval
-K01 = 0.55               # ms/token
+# Linear model: emb_per_q = e_base*L + overhead/B,  ret_per_q = r_base + overhead/B
+E0, E1 = 0.36, 0.00          # ms/token, CPU and GPU embedding per-token rate
+OH_E0, OH_E1 = 2.71, 4.87    # ms, CPU and GPU embedding fixed overhead
+R0, OH_R0 = 0.20, 1.36       # CPU retrieval: per-query marginal + overhead/B
+R1, OH_R1 = 0.00, 1.50       # GPU retrieval: per-query marginal + overhead/B
+K01 = 0.55                    # ms/token, CPU->GPU transfer
 
 
 def predict_wall_q(xE: int, xR: int, B: int, L_q: float = L_DEFAULT) -> float:
@@ -54,10 +55,11 @@ def predict_wall_q(xE: int, xR: int, B: int, L_q: float = L_DEFAULT) -> float:
     L_q = L_q if L_q > 0 else L_DEFAULT
     gen_q = GEN_PER_TOKEN * AVG_OUTPUT
     gen_base_q = GEN_BASE / B
-    ret_cpu = R0 * (B ** (A0 - 1)) if xR == 0 else 0.0
-    ret_gpu = R1 * (B ** (A1 - 1)) if xR == 1 else 0.0
-    emb_cpu = E0 * L_q if xE == 0 else 0.0
-    emb_gpu = E1 * L_q if xE == 1 else 0.0
+    # New linear models: emb = e*L + overhead/B,  ret = r + overhead/B
+    emb_cpu = E0 * L_q + OH_E0 / B if xE == 0 else 0.0
+    emb_gpu = E1 * L_q + OH_E1 / B if xE == 1 else 0.0
+    ret_cpu = R0 + OH_R0 / B if xR == 0 else 0.0
+    ret_gpu = R1 + OH_R1 / B if xR == 1 else 0.0
     xfer = K01 * L_q if (xE == 0 and xR == 1) else 0.0
     cpu_q = emb_cpu + ret_cpu + xfer
     gpu_q = gen_q + gen_base_q + emb_gpu + ret_gpu
@@ -370,7 +372,7 @@ def main():
     print(f"  Output:     {OUTPUT_DIR}")
     print(f"  Model params:")
     print(f"    gen_per_token={GEN_PER_TOKEN}, gen_base={GEN_BASE}, queue={QUEUE_PENALTY}")
-    print(f"    e0={E0}, e1={E1}, r0={R0}(α={A0}), r1={R1}(α={A1}), K01={K01}")
+    print(f"    e0={E0}(oh={OH_E0}), e1={E1}(oh={OH_E1}), r0={R0}(oh={OH_R0}), r1={R1}(oh={OH_R1}), K01={K01}")
     print(f"{'='*80}\n")
 
     if args.dry_run:
