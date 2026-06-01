@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Targeted measurement of GPU embedding (xE=1) and GPU retrieval (xR=1) costs.
+Targeted measurement of all 4 action costs.
 
-For each action and batch size, run async_plain (fixed action) and measure:
-  - (1,0): GPU Emb + GPU Gen — gives e1 = emb_ms / (L * B)
-  - (1,1): GPU Emb + GPU Ret + GPU Gen — gives r1, alpha1
+Phase 1: (0,0) and (0,1) — gpu=0.8, max_model_len=8192
+Phase 2: (1,0) and (1,1) — gpu=0.5, max_model_len=8192 (reduce for GPU Emb safety)
 
 Usage:
-    python3 measure_gpu_costs.py          # all 4 actions, 3 batch sizes
-    python3 measure_gpu_costs.py --dry-run
+    python3 measure_gpu_costs.py --phase 1    # (0,0), (0,1)
+    python3 measure_gpu_costs.py --phase 2    # (1,0), (1,1)
+    python3 measure_gpu_costs.py              # both phases
 """
 
 import argparse
 import json
+import math
 import os
 import random
 import statistics
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -27,16 +27,7 @@ PYTHON = "/home/cloudteam/Software/conda/envs/p702/bin/python"
 OUTPUT_DIR = ROOT / "output" / "gpu_cost_measurement"
 TIMEOUT_PER_RUN = 600
 
-# Actions to measure
-ACTIONS = [
-    (0, 0),  # CPU Emb + CPU Ret + GPU Gen (baseline, already known)
-    (1, 0),  # GPU Emb + GPU Gen (measures e1)
-    (0, 1),  # CPU Emb + GPU Ret + GPU Gen (measures r1, alpha1 — partial data from sweep)
-    (1, 1),  # GPU Emb + GPU Ret + GPU Gen (measures combined GPU cost)
-]
-BATCH_SIZES = [1, 4, 16]
 QUERIES = 100
-SCENARIO = "S1"  # nfcorpus + flat + short + gpu=0.8
 
 CORPUS_CONFIG = {
     "beir_nfcorpus": {
@@ -57,13 +48,14 @@ def load_queries_short(path: str, n: int) -> List[Dict]:
             rec = json.loads(line)
             if rec.get("token_length", 0) <= 8:
                 records.append(rec)
+    random.seed(42)
     random.shuffle(records)
     return records[:n]
 
 
-def build_query_file(n: int) -> str:
+def build_query_file() -> str:
     cfg = CORPUS_CONFIG["beir_nfcorpus"]
-    queries = load_queries_short(cfg["queries_path"], n)
+    queries = load_queries_short(cfg["queries_path"], QUERIES * 2)
     out = OUTPUT_DIR / "queries.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
@@ -72,11 +64,13 @@ def build_query_file(n: int) -> str:
     return str(out)
 
 
-def run_fixed_action(xE: int, xR: int, B: int, queries_path: str) -> Optional[Dict]:
+def run_fixed_action(
+    xE: int, xR: int, B: int, queries_path: str,
+    gpu_util: float, max_model_len: int,
+) -> Optional[Dict]:
     cfg = CORPUS_CONFIG["beir_nfcorpus"]
     gpu_id = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
-    out_json = OUTPUT_DIR / f"cost_xE{xE}_xR{xR}_b{B}.json"
-    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json = OUTPUT_DIR / f"cost_xE{xE}_xR{xR}_b{B}_gpu{int(gpu_util*10)}.json"
 
     cmd = [
         PYTHON, str(ROOT / "async_rag_pipeline.py"),
@@ -89,8 +83,8 @@ def run_fixed_action(xE: int, xR: int, B: int, queries_path: str) -> Optional[Di
         "--queries-file", queries_path,
         "--generator-model", "Qwen/Qwen2.5-1.5B-Instruct",
         "--output-json", str(out_json),
-        "--max-model-len", "8192",
-        "--gpu-memory-utilization", "0.8",
+        "--max-model-len", str(max_model_len),
+        "--gpu-memory-utilization", str(gpu_util),
         "--gpu-id", str(gpu_id),
         "--sample-queries", str(QUERIES),
     ]
@@ -103,10 +97,7 @@ def run_fixed_action(xE: int, xR: int, B: int, queries_path: str) -> Optional[Di
     print(f"  {label}...", end=" ", flush=True)
     t0 = time.time()
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=TIMEOUT_PER_RUN, env=env,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_PER_RUN, env=env)
         elapsed = time.time() - t0
         if result.returncode == 0 and out_json.exists():
             with open(out_json) as f:
@@ -114,24 +105,20 @@ def run_fixed_action(xE: int, xR: int, B: int, queries_path: str) -> Optional[Di
             print(f"OK ({elapsed:.0f}s)")
             return data
         else:
-            print(f"FAIL (exit={result.returncode}, {elapsed:.0f}s)")
-            for ln in result.stderr.strip().split("\n")[-3:]:
-                if ln.strip():
-                    print(f"    {ln}")
+            print(f"FAIL ({elapsed:.0f}s)")
+            for ln in result.stderr.strip().split("\n"):
+                if any(k in ln.lower() for k in ["error", "fail", "cuda", "memory", "oom"]):
+                    print(f"    {ln[:120]}")
+            return None
     except subprocess.TimeoutExpired:
         print(f"TIMEOUT")
-    except Exception as e:
-        print(f"ERROR: {e}")
-    return None
+        return None
 
 
-def extract_costs(data: Dict) -> Dict:
-    """Extract per-batch cost components."""
+def extract_costs(data: Dict) -> List[Dict]:
     batches = data.get("per_batch", [])
     fb = data.get("feedback_trace", [])
-
     fb_by_idx = {f["batch_index"]: f for f in fb}
-
     rows = []
     for b in batches:
         idx = b.get("batch_index", 0)
@@ -141,42 +128,30 @@ def extract_costs(data: Dict) -> Dict:
             "emb_ms": fb_entry.get("embedding_ms_per_query", 0),
             "ret_ms": fb_entry.get("retrieval_ms_per_query", 0),
             "gen_ms": fb_entry.get("generation_ms_per_query", 0),
-            "wall_ms": (
-                fb_entry.get("embedding_ms_per_query", 0) +
-                fb_entry.get("retrieval_ms_per_query", 0) +
-                fb_entry.get("generation_ms_per_query", 0)
-            ),
-            "tokens": b.get("generated_tokens", 0),
+            "wall_ms": fb_entry.get("embedding_ms_per_query", 0)
+                      + fb_entry.get("retrieval_ms_per_query", 0)
+                      + fb_entry.get("generation_ms_per_query", 0),
         })
     return rows
 
 
-def fit_gpu_emb_rate(rows: List[Dict]) -> Optional[float]:
-    """Fit e1 = emb_ms / (L * B) from (1,0) data."""
+def fit_emb_rate(rows: List[Dict], L: float = 5.0) -> Optional[float]:
     pts = [(r["B"], r["emb_ms"]) for r in rows if r["emb_ms"] > 0]
     if len(pts) < 2:
         return None
-    # emb_ms = e1 * L * B; emb_ms/B = e1 * L
-    # L ~ 5 tokens (short queries)
-    L = 5.0
     rates = [emb_ms / (L * B) for B, emb_ms in pts if B > 0]
     return statistics.mean(rates) if rates else None
 
 
-def fit_gpu_ret_params(rows: List[Dict]) -> Optional[Tuple[float, float]]:
-    """Fit r1, alpha1 from (1,1) or (0,1) data: ret_ms = r1 * B^(alpha1-1)."""
+def fit_ret_params(rows: List[Dict]) -> Optional[Tuple[float, float]]:
     pts = [(r["B"], r["ret_ms"]) for r in rows if r["ret_ms"] > 0]
+    pts = [(B, r) for B, r in pts if B > 0 and r > 0]
     if len(pts) < 2:
         return None
-    # log(ret_ms) = log(r1) + (alpha1-1) * log(B)
-    import math
-    log_B = [math.log(B) for B, _ in pts if B > 0]
-    log_r = [math.log(r) for _, r in pts if r > 0]
-    if len(log_B) < 2:
-        return None
+    log_B = [math.log(B) for B, _ in pts]
+    log_r = [math.log(r) for _, r in pts]
     n = len(log_B)
-    sx = sum(log_B)
-    sy = sum(log_r)
+    sx, sy = sum(log_B), sum(log_r)
     sxy = sum(x * y for x, y in zip(log_B, log_r))
     sxx = sum(x * x for x in log_B)
     d = n * sxx - sx * sx
@@ -184,162 +159,170 @@ def fit_gpu_ret_params(rows: List[Dict]) -> Optional[Tuple[float, float]]:
         return None
     alpha = 1 + (n * sxy - sx * sy) / d
     r = math.exp((sy - (alpha - 1) * sx) / n)
-    alpha = max(0.1, min(1.0, alpha))
-    r = max(0.01, r)
-    return r, alpha
+    return max(0.01, r), max(0.1, min(1.0, alpha))
+
+
+def predict(xE, xR, B, params: Dict) -> float:
+    p = params
+    gen_q = p["gen_per_token"] * p["avg_out"]
+    gen_base_q = p["gen_base"] / B
+    ret_cpu = p["r0"] * (B ** (p["a0"] - 1))
+    ret_gpu = p["r1"] * (B ** (p["a1"] - 1))
+    emb_cpu = (p["e0"] * p["L"]) if xE == 0 else 0.0
+    emb_gpu = (p["e1"] * p["L"]) if xE == 1 else 0.0
+    xfer = p["K01"] * p["L"] if (xE == 0 and xR == 1) else (
+        p["K10"] * p["L"] if (xE == 1 and xR == 0) else 0.0)
+    cpu_q = emb_cpu + ret_cpu + xfer
+    gpu_q = gen_q + gen_base_q + emb_gpu + ret_gpu
+    return max(cpu_q, gpu_q) + p["queue"]
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--phase", type=int, choices=[1, 2], default=None,
+                        help="Run only phase 1 (0,0),(0,1) or phase 2 (1,0),(1,1)")
     args = parser.parse_args()
 
-    print(f"\n{'='*70}")
-    print(f"GPU COST MEASUREMENT")
-    print(f"{'='*70}")
-    print(f"  Actions:  {ACTIONS}")
-    print(f"  B sizes:  {BATCH_SIZES}")
-    print(f"  Queries:   {QUERIES}")
-    print(f"  Scenario:  {SCENARIO}")
-    print(f"  Output:    {OUTPUT_DIR}")
-    print(f"{'='*70}\n")
-
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    queries_path = build_query_file(QUERIES)
+    queries_path = build_query_file()
 
-    if args.dry_run:
-        for xE, xR in ACTIONS:
+    # Phase configs
+    phases = []
+    if args.phase is None or args.phase == 1:
+        phases.append({
+            "name": "Phase 1: CPU Emb actions (0,0) and (0,1)",
+            "actions": [(0, 0), (0, 1)],
+            "gpu_util": 0.8,
+            "max_model_len": 8192,
+        })
+    if args.phase is None or args.phase == 2:
+        phases.append({
+            "name": "Phase 2: GPU Emb actions (1,0) and (1,1)",
+            "actions": [(1, 0), (1, 1)],
+            "gpu_util": 0.5,  # lower to give headroom for GPU Emb
+            "max_model_len": 8192,
+        })
+
+    BATCH_SIZES = [1, 4, 8]
+
+    all_results = {}
+
+    for phase in phases:
+        print(f"\n{'='*70}")
+        print(f"  {phase['name']}")
+        print(f"  gpu_util={phase['gpu_util']}, max_model_len={phase['max_model_len']}")
+        print(f"{'='*70}")
+
+        for xE, xR in phase["actions"]:
+            print(f"\n  Action ({xE},{xR}):")
+            all_results[(xE, xR)] = {}
             for B in BATCH_SIZES:
-                print(f"  Would run: xE={xE}, xR={xR}, B={B}")
-        return
+                data = run_fixed_action(
+                    xE, xR, B, queries_path,
+                    gpu_util=phase["gpu_util"],
+                    max_model_len=phase["max_model_len"],
+                )
+                rows = extract_costs(data) if data else None
+                all_results[(xE, xR)][B] = rows
 
-    results = {}
-
-    for xE, xR in ACTIONS:
-        print(f"\n{'─'*70}")
-        print(f"  Action ({xE},{xR}):")
-        print(f"{'─'*70}")
-        results[(xE, xR)] = {}
-
-        for B in BATCH_SIZES:
-            data = run_fixed_action(xE, xR, B, queries_path)
-            if data:
-                rows = extract_costs(data)
-                results[(xE, xR)][B] = rows
-            else:
-                results[(xE, xR)][B] = None
-
-    # ── Print results ──────────────────────────────────────────────────────────
+    # ── Print measured costs ─────────────────────────────────────────────────
     print(f"\n\n{'='*70}")
-    print(f"MEASURED COSTS PER ACTION AND BATCH SIZE")
+    print(f"  MEASURED COSTS")
     print(f"{'='*70}")
-    print(f"  {'Action':>8} | {'B':>4} | {'emb_ms/q':>10} | {'ret_ms/q':>10} | {'gen_ms/q':>10} | {'wall_ms/q':>10}")
-    print(f"  {'-'*65}")
+    print(f"  {'Action':>8} | {'B':>4} | {'emb_ms':>10} | {'ret_ms':>10} | {'gen_ms':>10} | {'wall_ms':>10}")
+    print(f"  {'-'*62}")
 
-    for xE, xR in ACTIONS:
+    for xE, xR in sorted(all_results.keys()):
         for B in BATCH_SIZES:
-            rows = results.get((xE, xR), {}).get(B)
+            rows = all_results[(xE, xR)].get(B)
             if rows:
-                # average across batches
                 emb = statistics.mean(r["emb_ms"] for r in rows)
                 ret = statistics.mean(r["ret_ms"] for r in rows)
                 gen = statistics.mean(r["gen_ms"] for r in rows)
                 wall = statistics.mean(r["wall_ms"] for r in rows)
                 print(f"  ({xE},{xR})     | {B:>4} | {emb:>10.4f} | {ret:>10.4f} | {gen:>10.2f} | {wall:>10.2f}")
 
-    # ── Fit GPU embedding rate from (1,0) ────────────────────────────────────
+    # ── Fit parameters ───────────────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print(f"FITTED GPU COSTS")
+    print(f"  FITTED PARAMETERS")
     print(f"{'='*70}")
+
+    fitted = {}
 
     # e1 from (1,0)
-    all_10_rows = []
-    for B in BATCH_SIZES:
-        rows = results.get((1, 0), {}).get(B)
-        if rows:
-            all_10_rows.extend(rows)
-    if all_10_rows:
-        e1 = fit_gpu_emb_rate(all_10_rows)
-        if e1:
-            print(f"  e1 (GPU emb rate)       = {e1:.4f} ms/token  (from (1,0) data)")
-            print(f"  [Previous default: 0.016 ms/token]")
+    rows_10 = [r for B in BATCH_SIZES for r in (all_results.get((1,0), {}).get(B) or [])]
+    e1 = fit_emb_rate(rows_10) if rows_10 else None
+    if e1:
+        print(f"  e1 (GPU emb rate): {e1:.4f} ms/token  [default: 0.016]")
+        fitted["e1"] = e1
+    else:
+        print(f"  e1: NOT MEASURED (need (1,0) data)")
+        fitted["e1"] = 0.016
 
-    # r1, alpha1 from (1,1) or (0,1)
-    for key, label in [((1, 1), "(1,1)"), ((0, 1), "(0,1)")]:
-        all_rows = []
-        for B in BATCH_SIZES:
-            rows = results.get(key, {}).get(B)
-            if rows:
-                all_rows.extend(rows)
-        if all_rows:
-            fit = fit_gpu_ret_params(all_rows)
-            if fit:
-                r1, a1 = fit
-                print(f"  r1 ({label} ret) = {r1:.4f}  alpha1 = {a1:.4f}")
-                print(f"  [Previous default: r1=0.50, alpha1=0.30]")
+    # r0, a0 from (0,0)
+    rows_00 = [r for B in BATCH_SIZES for r in (all_results.get((0,0), {}).get(B) or [])]
+    r0_fit = fit_ret_params(rows_00) if rows_00 else None
+    if r0_fit:
+        r0, a0 = r0_fit
+        print(f"  r0 (CPU ret):      {r0:.4f}  alpha0={a0:.4f}  [default: 0.68/0.55]")
+        fitted["r0"], fitted["a0"] = r0, a0
+    else:
+        fitted["r0"], fitted["a0"] = 0.68, 0.55
 
-    # ── Compare model predictions vs actual for each action ──────────────────
+    # r1, a1 from (0,1)
+    rows_01 = [r for B in BATCH_SIZES for r in (all_results.get((0,1), {}).get(B) or [])]
+    r1_fit = fit_ret_params(rows_01) if rows_01 else None
+    if r1_fit:
+        r1, a1 = r1_fit
+        print(f"  r1 (GPU ret):      {r1:.4f}  alpha1={a1:.4f}  [default: 0.50/0.30]")
+        fitted["r1"], fitted["a1"] = r1, a1
+    else:
+        fitted["r1"], fitted["a1"] = 0.50, 0.30
+
+    # ── Model validation ────────────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print(f"MODEL PREDICTIONS vs ACTUAL (using fitted GPU costs)")
+    print(f"  MODEL PREDICTION vs ACTUAL")
     print(f"{'='*70}")
 
-    # Use fitted e1 if available, otherwise default
-    e1_fitted = e1 if all_10_rows else 0.016
-    r1_fitted, a1_fitted = None, None
-    for key, label in [((1, 1), "(1,1)"), ((0, 1), "(0,1)")]:
-        all_rows = []
-        for B in BATCH_SIZES:
-            rows = results.get(key, {}).get(B)
-            if rows:
-                all_rows.extend(rows)
-        if all_rows:
-            fit = fit_gpu_ret_params(all_rows)
-            if fit:
-                r1_fitted, a1_fitted = fit
-                break
-
-    # Model params
-    gen_per_token = 0.2135
-    gen_base = 1109.0
-    queue = 0.23
-    avg_out = 120.0
-    L = 5.0
-    e0, e1_model = 0.084, e1_fitted
-    r0, a0 = 0.68, 0.55
-    r1_model, a1_model = r1_fitted if r1_fitted else 0.50, a1_fitted if a1_fitted else 0.30
-    K01 = 0.55
-
-    def predict(xE, xR, B):
-        gen_q = gen_per_token * avg_out
-        gen_base_q = gen_base / B
-        ret_cpu = r0 * (B ** (a0 - 1))
-        ret_gpu = r1_model * (B ** (a1_model - 1))
-        emb_cpu = e0 * L
-        emb_gpu = e1_model * L
-        xfer = K01 * L if (xE == 0 and xR == 1) else 0.0
-        cpu_q = emb_cpu + ret_cpu + xfer
-        gpu_q = gen_q + gen_base_q + (emb_gpu if xE == 1 else 0.0) + (ret_gpu if xR == 1 else 0.0)
-        return max(cpu_q, gpu_q) + queue
-
-    print(f"  Using: e1={e1_model:.4f}, r1={r1_model:.4f}(α={a1_model:.2f})")
+    params = {
+        "e0": 0.084, "e1": fitted.get("e1", 0.016),
+        "r0": fitted.get("r0", 0.68), "a0": fitted.get("a0", 0.55),
+        "r1": fitted.get("r1", 0.50), "a1": fitted.get("a1", 0.30),
+        "gen_per_token": 0.2135, "gen_base": 1109.0,
+        "avg_out": 120.0, "L": 5.0, "queue": 0.23,
+        "K01": 0.55, "K10": 0.16,
+    }
+    print(f"  Params: e1={params['e1']:.4f}, r0={params['r0']:.4f}(α0={params['a0']:.2f}), "
+          f"r1={params['r1']:.4f}(α1={params['a1']:.2f})")
     print()
-    print(f"  {'Action':>8} | {'B':>4} | {'actual_wall':>12} | {'pred_wall':>11} | {'err%':>8}")
-    print(f"  {'-'*55}")
+    print(f"  {'Action':>8} | {'B':>4} | {'actual':>10} | {'pred':>10} | {'err%':>8}")
+    print(f"  {'-'*50}")
 
-    for xE, xR in ACTIONS:
+    has_error = False
+    for xE, xR in sorted(all_results.keys()):
         for B in BATCH_SIZES:
-            rows = results.get((xE, xR), {}).get(B)
-            if rows:
-                actual = statistics.mean(r["wall_ms"] for r in rows)
-                pred = predict(xE, xR, B)
-                err = (pred - actual) / actual * 100
-                print(f"  ({xE},{xR})     | {B:>4} | {actual:>12.2f} | {pred:>11.2f} | {err:>+8.2f}%")
+            rows = all_results[(xE, xR)].get(B)
+            if not rows:
+                continue
+            actual = statistics.mean(r["wall_ms"] for r in rows)
+            pred = predict(xE, xR, B, params)
+            err = (pred - actual) / actual * 100 if actual > 0 else 0
+            flag = " ← FIX ME" if abs(err) > 10 else ""
+            print(f"  ({xE},{xR})     | {B:>4} | {actual:>10.2f} | {pred:>10.2f} | {err:>+7.1f}%{flag}")
+            if abs(err) > 10:
+                has_error = True
+
+    if not has_error:
+        print(f"\n  All predictions within 10% — model is well calibrated.")
 
     # ── Save ────────────────────────────────────────────────────────────────
     out = OUTPUT_DIR / "measurement_results.json"
+    serializable = {}
+    for k, v in all_results.items():
+        serializable[f"{k[0]}_{k[1]}"] = {str(bk): bv for bk, bv in v.items()}
     with open(out, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\n  Results saved to: {out}")
+        json.dump({"results": serializable, "fitted": fitted, "params": params}, f, indent=2)
+    print(f"\n  Saved: {out}")
 
 
 if __name__ == "__main__":

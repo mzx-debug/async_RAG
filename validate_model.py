@@ -42,9 +42,10 @@ GEN_BASE = 1109.0         # ms
 QUEUE_PENALTY = 0.23      # ms/q
 AVG_OUTPUT = 120.0        # tokens
 L_DEFAULT = 5.0            # default query length
-E0, E1 = 0.084, 0.016    # ms/token
-R0, A0 = 0.68, 0.55      # CPU retrieval
-R1, A1 = 0.50, 0.30      # GPU retrieval
+# Fitted from measurement: e0=0.48, e1=0.74, r0=1.78(a=0.14), r1=1.30(a=0.05)
+E0, E1 = 0.48, 0.74      # ms/token
+R0, A0 = 1.78, 0.14      # CPU retrieval
+R1, A1 = 1.30, 0.05      # GPU retrieval
 K01 = 0.55               # ms/token
 
 
@@ -53,13 +54,13 @@ def predict_wall_q(xE: int, xR: int, B: int, L_q: float = L_DEFAULT) -> float:
     L_q = L_q if L_q > 0 else L_DEFAULT
     gen_q = GEN_PER_TOKEN * AVG_OUTPUT
     gen_base_q = GEN_BASE / B
-    ret_cpu = R0 * (B ** (A0 - 1))
-    ret_gpu = R1 * (B ** (A1 - 1))
-    emb_cpu = E0 * L_q
-    emb_gpu = E1 * L_q
+    ret_cpu = R0 * (B ** (A0 - 1)) if xR == 0 else 0.0
+    ret_gpu = R1 * (B ** (A1 - 1)) if xR == 1 else 0.0
+    emb_cpu = E0 * L_q if xE == 0 else 0.0
+    emb_gpu = E1 * L_q if xE == 1 else 0.0
     xfer = K01 * L_q if (xE == 0 and xR == 1) else 0.0
     cpu_q = emb_cpu + ret_cpu + xfer
-    gpu_q = gen_q + gen_base_q + (emb_gpu if xE == 1 else 0.0) + (ret_gpu if xR == 1 else 0.0)
+    gpu_q = gen_q + gen_base_q + emb_gpu + ret_gpu
     return max(cpu_q, gpu_q) + QUEUE_PENALTY
 
 

@@ -936,7 +936,7 @@ class GreedyScheduler:
         self._emb_rate_ema[1] = 0.016    # ms/token, GPU Embedding rate
         self._ret_r_ema[0] = 0.68        # ms, CPU Retrieval coefficient
         self._ret_r_ema[1] = 0.50        # ms, GPU Retrieval coefficient
-        self._ret_alpha_ema[0] = 0.55     # sublinear exponent (CPU)
+        self._ret_alpha_ema[0] = 0.14     # sublinear exponent (CPU)
         self._ret_alpha_ema[1] = 0.30     # sublinear exponent (GPU)
         self._gen_per_token_ema = 0.2135  # ms/token, from sweep fit
         self._gen_base_ema = 1109.0      # ms, prefill overhead
@@ -1104,8 +1104,8 @@ class GreedyScheduler:
         Wall time estimation for scheduling: delegates to _estimate_action_cost.
 
         Uses the max(CPU, GPU) pipeline model:
-            CPU_q = emb_cpu_q + ret_cpu_q + I(xE≠xR) × xfer_q
-            GPU_q = gen_q + I(xE=1) × emb_gpu_q + I(xR=1) × ret_gpu_q
+            CPU_q = I(xE=0)×emb_q + I(xR=0)×ret_q + I(xE≠xR)×xfer_q
+            GPU_q = gen_q + gen_base_q + I(xE=1)×emb_q + I(xR=1)×ret_q
             wall_q = max(CPU_q, GPU_q) + queue_penalty
 
         Note: pending_queries is accepted for API compatibility but unused
@@ -1168,12 +1168,12 @@ class GreedyScheduler:
         gen_base_q = self._gen_base_ema / B                   # amortized prefill per query
 
         # ── Emb per device ───────────────────────────────────────────────
-        emb_q_cpu = self._emb_rate_ema.get(0, 0.05) * L
-        emb_q_gpu = self._emb_rate_ema.get(1, 0.016) * L
+        emb_q_cpu = self._emb_rate_ema.get(0, 0.48) * L
+        emb_q_gpu = self._emb_rate_ema.get(1, 0.74) * L
 
         # ── Ret per device (sublinear in B) ─────────────────────────────
-        ret_q_cpu = self._ret_r_ema.get(0, 0.15) * (B ** (self._ret_alpha_ema.get(0, 0.5) - 1))
-        ret_q_gpu = self._ret_r_ema.get(1, 0.10) * (B ** (self._ret_alpha_ema.get(1, 0.3) - 1))
+        ret_q_cpu = self._ret_r_ema.get(0, 1.78) * (B ** (self._ret_alpha_ema.get(0, 0.14) - 1))
+        ret_q_gpu = self._ret_r_ema.get(1, 1.30) * (B ** (self._ret_alpha_ema.get(1, 0.05) - 1))
 
         # ── Transfer (CPU↔GPU when xE≠xR) ──────────────────────────────────
         # K[(0,1)] = CPU→GPU, K[(1,0)] = GPU→CPU
@@ -1295,12 +1295,12 @@ class GreedyScheduler:
         prev_gen_per_token = getattr(self, '_gen_per_token_ema', 0.378)
         prev_gen_base = getattr(self, '_gen_base_ema', 1000.0)  # fixed calibration value
         prev_avg_out = getattr(self, '_avg_output_tokens_ema', 120.0)
-        prev_e0 = self._emb_rate_ema.get(0, 0.05)
-        prev_e1 = self._emb_rate_ema.get(1, 0.016)
-        prev_r0 = self._ret_r_ema.get(0, 0.15)
-        prev_r1 = self._ret_r_ema.get(1, 0.10)
-        prev_alpha0 = self._ret_alpha_ema.get(0, 0.5)
-        prev_alpha1 = self._ret_alpha_ema.get(1, 0.3)
+        prev_e0 = self._emb_rate_ema.get(0, 0.48)
+        prev_e1 = self._emb_rate_ema.get(1, 0.74)
+        prev_r0 = self._ret_r_ema.get(0, 1.78)
+        prev_r1 = self._ret_r_ema.get(1, 1.30)
+        prev_alpha0 = self._ret_alpha_ema.get(0, 0.14)
+        prev_alpha1 = self._ret_alpha_ema.get(1, 0.05)
         prev_queue = self._queue_penalty_ema
 
         # ── 1. Emb: e[xE] = emb_ms_total / (L * B) ──────────────────────────────
