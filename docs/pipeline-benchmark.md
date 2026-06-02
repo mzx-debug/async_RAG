@@ -73,9 +73,10 @@ async_v2 vs serial B=64:   1.08x  ← beats the best fixed-B serial
 The cost model predicts:
 
 ```
-wall_q = gen_per_token × avg_out + gen_base/B + queue_penalty
-       = 0.2135 × 120 + 1109/B + 0.23
-       = 25.6 + 1109/B + 0.23
+# Full model: wall_q = max(emb + xfer_EtoR, ret + xfer_RtoG, gen) + queue_penalty
+# When gen dominates: wall_q ≈ gen_per_token × avg_out + gen_base/B + queue_penalty
+#                    = 0.2135 × 120 + 1109/B + 0.23
+#                    = 25.6 + 1109/B + 0.23
 
 At B=64:  25.6 + 17.3 + 0.2 = 43.2 ms/q → wall = 43.2 × 300/64 = 20,250 ms
 At B=75:  25.6 + 14.8 + 0.2 = 40.6 ms/q → wall = 40.6 × 300/75 = 16,250 ms

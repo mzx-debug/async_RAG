@@ -6,10 +6,8 @@ Uses per-batch MEDIAN (robust) estimation rather than log-log regression,
 since the power-law fit is noisy with few data points and CPU retrieval
 has a significant fixed-overhead component.
 
-Fits the v4 max(CPU, GPU) pipeline model:
-    CPU_q = emb_cpu_q + ret_cpu_q + I(xE=0,xR=1) × xfer_q
-    GPU_q = gen_q + I(xE=1) × emb_gpu_q + I(xR=1) × ret_gpu_q
-    wall_q = max(CPU_q, GPU_q) + queue_penalty
+Fits the v4 three-stage parallel pipeline model:
+    wall_q = max(emb + xfer_EtoR, ret + xfer_RtoG, gen) + queue_penalty
 
 Usage:
     python compute_calib_params.py \
@@ -114,16 +112,10 @@ def fit_gen_model(wall_raw, emb_params, ret_params, avg_output_tokens, L):
     Fit gen_per_token and queue_penalty from per-batch files (no sweep).
 
     Pipeline model:
-        CPU_q = emb_cpu_q + ret_cpu_q + xfer_q(only for xE=0,xR=1)
-        GPU_q = gen_q + I(xE=1)×emb_gpu_q + I(xR=1)×ret_gpu_q
-        wall_q = max(CPU_q, GPU_q) + queue_penalty
-
-    gen_per_token = median(gen_ms/q) / avg_output_tokens.
-    queue_penalty = median(wall_q - max(CPU_q, GPU_q)) across observations.
-
-    emb_params: {xE: e_rate}
-    ret_params: {xR: (r, alpha)}
+        wall_q = max(emb + xfer_EtoR, ret + xfer_RtoG, gen) + queue_penalty
     """
+    oh_e0, oh_e1 = 2.71, 4.87
+    oh_r0, oh_r1 = 1.36, 1.50
     e0 = emb_params.get(0, 0.05)
     e1 = emb_params.get(1, 0.016)
     r0, alpha0 = ret_params.get(0, (0.15, 0.5))
@@ -132,19 +124,22 @@ def fit_gen_model(wall_raw, emb_params, ret_params, avg_output_tokens, L):
     queue_obs = []
     gen_per_q_list = []
     for (xE, xR), measurements in wall_raw.items():
+        K_ER = {  # K[xE,xR]
+            (0, 1): 0.55, (1, 0): 0.16,
+        }.get((xE, xR), 0.0)
+        K_RG = {  # K[xR,1]
+            (0, 1): 0.55,
+        }.get((xR, 1), 0.0)
         for B, ret_ms, gen_ms in measurements:
+            B = max(1, B)
             gen_q = gen_ms / B
             gen_per_q_list.append(gen_q)
 
-            emb_cpu_q = e0 * L
-            emb_gpu_q = e1 * L
-            ret_cpu_q = r0 * (B ** (alpha0 - 1))
-            ret_gpu_q = r1 * (B ** (alpha1 - 1))
-            xfer_q = 0.55 * L if (xE == 0 and xR == 1) else 0.0
-
-            cpu_q = emb_cpu_q + ret_cpu_q + xfer_q
-            gpu_q = gen_q + (emb_gpu_q if xE == 1 else 0.0) + (ret_gpu_q if xR == 1 else 0.0)
-            pipeline_q = max(cpu_q, gpu_q)
+            emb_q = (e0 * L + oh_e0 / B) if xE == 0 else (e1 * L + oh_e1 / B)
+            ret_q = (r0 * (B ** (alpha0 - 1)) + oh_r0 / B) if xR == 0 else (r1 * (B ** (alpha1 - 1)) + oh_r1 / B)
+            xfer_ER = K_ER * L if xE != xR else 0.0
+            xfer_RG = K_RG * L if xR != 1 else 0.0
+            pipeline_q = max(emb_q + xfer_ER, ret_q + xfer_RG, gen_q)
             wall_q = (ret_ms + gen_ms) / B
 
             q_obs = wall_q - pipeline_q

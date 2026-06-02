@@ -67,39 +67,43 @@ RAG 推理有三个计算密集阶段：
 ### 5.1 模型公式
 
 ```
-CPU_q  = [CPU嵌入] + [CPU检索] + [跨设备传输]（仅 xE≠xR 时）
-       = I(xE=0) × e0 × L + I(xR=0) × r0 × B^(α0-1) + I(xE≠xR) × K[xE,xR] × L
+# 三阶段并行，xfer 加在前一阶段
+wall_q = max(emb + xfer_EtoR, ret + xfer_RtoG, gen) + queue_penalty
 
-GPU_q  = 生成解码 + 分摊的预填充开销 + [GPU嵌入] + [GPU检索]
-       = gen_per_token × avg_output + gen_base / B
-         + I(xE=1) × e1 × L
-         + I(xR=1) × r1 × B^(α1-1)
-
-wall_q = max(CPU_q, GPU_q) + queue_penalty
+其中：
+  xfer_EtoR = I(xE≠xR) × K[xE,xR] × L   (Emb→Ret 传输，加在 Emb)
+  xfer_RtoG = I(xR≠1)  × K[xR,1]  × L   (Ret→Gen 传输，加在 Ret)
+  gen       = gen_per_token × avg_output + gen_base / B
+  emb       = e[xE] × L + oh_e[xE] / B
+  ret       = r[xR] + oh_r[xR] / B
 ```
 
 ### 5.2 参数含义
 
 | 参数 | 默认值 | 来源 | 含义 |
 |------|--------|------|------|
-| `e0` | 0.084 ms/token | 初始值 | CPU 嵌入速率 |
-| `e1` | 0.016 ms/token | 初始值 | GPU 嵌入速率 |
-| `r0` | 0.68 ms | 初始值 | CPU 检索系数 |
-| `r1` | 0.50 ms | 初始值 | GPU 检索系数 |
-| `α0` | 0.55 | 初始值 | CPU 检索亚线性指数 |
-| `α1` | 0.30 | 初始值 | GPU 检索亚线性指数 |
+| `e0` | 0.36 ms/token | 初始值 | CPU 嵌入速率 |
+| `e1` | 0.00 ms/token | 初始值 | GPU 嵌入速率（overhead 主导） |
+| `oh_e0` | 2.71 ms | 初始值 | CPU 嵌入固定开销 |
+| `oh_e1` | 4.87 ms | 初始值 | GPU 嵌入固定开销 |
+| `r0` | 0.20 ms | 初始值 | CPU 检索边际成本 |
+| `r1` | 0.00 ms | 初始值 | GPU 检索边际成本（overhead 主导） |
+| `oh_r0` | 1.36 ms | 初始值 | CPU 检索固定开销 |
+| `oh_r1` | 1.50 ms | 初始值 | GPU 检索固定开销 |
 | `gen_per_token` | 0.2135 ms/token | **Sweep 拟合** | 生成解码速率 |
 | `gen_base` | 1109 ms | **Sweep 拟合** | 生成预填充固定开销 |
 | `avg_output` | 120 tokens | EMA 自适应 | 平均输出长度 |
 | `queue_penalty` | 0.23 ms/q | Sweep 拟合 | 调度开销 |
-| `K01` | 0.55 ms/token | 初始值 | CPU→GPU 传输速率 |
-| `K10` | 0.16 ms/token | 初始值 | GPU→CPU 传输速率 |
+| `K[xE,xR]` | 0.55/0.16 ms/token | 初始值 | Emb→Ret 传输速率（xE≠xR 时生效） |
+| `K[xR,1]` | 0.55 ms/token | 初始值 | Ret→Gen 传输速率（xR≠1 时生效） |
 
 ### 5.3 关键公式
 
-**生成成本的分摊**（`gen_base / B`）：vLLM 的 continuous batching 下，每个 batch 的预填充（prefill）开销是固定的 1109 ms，与 batch size 无关。因此 batch 越大，每个查询分摊的预填充成本越低。这就是为什么更大的 batch 通常更快——但也不能无限大，因为 GPU 显存有限。
+**三阶段并行**：Emb、Ret、Gen 三个阶段完全并行运行，三者的耗时加上各自的 xfer 后取最大值。
 
-**检索的亚线性扩展**（`B^(α-1)`）：当 batch size 翻倍时，FAISS 检索时间不是翻倍，而是增长到 2^(α-1) 倍。α0=0.55 意味着 batch 翻倍，CPU 检索仅增加 47%；α1=0.30 意味着 GPU 检索仅增加 23%。这解释了为什么大 batch 在检索端很高效。
+**xfer 加在发射端**：跨设备传输加在发射端（Emb 完成后给 Ret，Ret 完成后给 Gen），因为传输触发由发射侧驱动，它增加了发射侧工作的完成代价。
+
+**生成成本的分摊**（`gen_base / B`）：vLLM 的 continuous batching 下，每个 batch 的预填充（prefill）开销是固定的 1109 ms，与 batch size 无关。因此 batch 越大，每个查询分摊的预填充成本越低。
 
 ---
 

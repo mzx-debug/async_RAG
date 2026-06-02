@@ -194,20 +194,17 @@ batch 完成 → _record_batch_feedback()
 运行时用成本模型预测每种 action 的 wall time：
 
 ```
-wall_q = gen_per_token × avg_output_tokens
-       + queue_penalty
-       + gpu_contention              (仅 xE=1)
-       + 0.05 × (emb_q + ret_q)   (xE=0 时，E+R 与 Gen 完全 overlap)
-       + xfer_q                     (仅 xE≠xR)
+wall_q = max(emb + xfer_EtoR, ret + xfer_RtoG, gen) + queue_penalty
+
+其中：
+  xfer_EtoR = I(xE≠xR) × K[xE,xR] × L   (Emb→Ret 传输，加在 Emb)
+  xfer_RtoG = I(xR≠1)  × K[xR,1]  × L   (Ret→Gen 传输，加在 Ret)
+  gen       = gen_per_token × avg_output + gen_base / B
+  emb       = e[xE] × L + oh_e[xE] / B
+  ret       = r[xR] + oh_r[xR] / B
 ```
 
-其中每个分量独立拟合：
-
-```
-emb_q  = e[xE] × L                  (embedding 速率 × 平均 token 数)
-ret_q  = r[xR] × B^(alpha-1)       (检索亚线性模型)
-xfer_q = K[xE,xR] × L              (跨设备传输)
-```
+Emb、Ret、Gen 三阶段并行，xfer 加在前一阶段尾部。
 
 ### 3.4 EMA 在线学习
 

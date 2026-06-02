@@ -125,49 +125,45 @@ def fit_linear(points):
 
 def fit_overlap_model(all_results, gen_per_token, gen_base, avg_output_tokens, emb_rates, ret_params):
     """
-    Fit queue_penalty from all sweep data using the max(CPU, GPU) pipeline model.
+    Fit queue_penalty from all sweep data using the three-stage parallel pipeline model.
 
     Pipeline model:
-        CPU_q = emb_cpu_q + ret_cpu_q + I(xE=0,xR=1) × xfer_q
-        GPU_q = gen_q + gen_base_q + I(xE=1) × emb_gpu_q + I(xR=1) × ret_gpu_q
-        wall_q = max(CPU_q, GPU_q) + queue_penalty
+        wall_q = max(emb + xfer_EtoR, ret + xfer_RtoG, gen) + queue_penalty
 
     where:
-        gen_q = gen_per_token × avg_output_tokens   (decode cost, per-query)
-        gen_base_q = gen_base / B                  (prefill overhead amortized per query)
+        xfer_EtoR = I(xE≠xR) × K[xE,xR] × L   (added to Emb)
+        xfer_RtoG = I(xR≠1)  × K[xR,1]  × L   (added to Ret)
+        gen       = gen_per_token × avg_output + gen_base / B
+        emb       = e[xE] × L + oh_e[xE] / B
+        ret       = r[xR] + oh_r[xR] / B
 
-    For each observation:
-        queue_obs = wall_q - max(CPU_q, GPU_q)
-
-    queue_penalty = median(queue_obs) across all observations.
-
-    emb_rates: {0: e0, 1: e1} in ms/token
-    ret_params: {xR: (r, alpha)}
+    queue_penalty = median(wall_q - max(emb+xfer_ER, ret+xfer_RG, gen)) across all observations.
+    """
     """
     L = 5.0  # avg tokens per query
+    oh_e0, oh_e1 = 2.71, 4.87
+    oh_r0, oh_r1 = 1.36, 1.50
     queue_obs = []
     for (xE, xR), batch_data in all_results.items():
         e0 = emb_rates.get(0, 0.05)
         e1 = emb_rates.get(1, 0.016)
         r0, a0 = ret_params.get(0, (0.15, 0.5))
         r1, a1 = ret_params.get(1, (0.10, 0.3))
+        K_ER = {  # K[xE,xR]
+            (0,1): 0.55, (1,0): 0.16,
+        }.get((xE, xR), 0.0)
+        K_RG = {  # K[xR,1]
+            (0,1): 0.55,
+        }.get((xR, 1), 0.0)
         for bs, gen_ms, ret_ms in batch_data:
-            # Gen: decode + amortized prefill
-            gen_q = gen_per_token * avg_output_tokens
-            gen_base_q = gen_base / bs
-            # Emb times
-            emb_cpu_q = e0 * L
-            emb_gpu_q = e1 * L
-            # Ret times
-            ret_cpu_q = r0 * (bs ** (a0 - 1))
-            ret_gpu_q = r1 * (bs ** (a1 - 1))
-            # Xfer
-            xfer_q = 0.55 * L if (xE == 0 and xR == 1) else 0.0
-            # Sides
-            cpu_q = emb_cpu_q + ret_cpu_q + xfer_q
-            gpu_q = gen_q + gen_base_q + (emb_gpu_q if xE == 1 else 0.0) + (ret_gpu_q if xR == 1 else 0.0)
-            wall_q = (gen_ms + ret_ms) / bs
-            q_obs = wall_q - max(cpu_q, gpu_q)
+            B = max(1, bs)
+            gen_q = gen_per_token * avg_output_tokens + gen_base / B
+            emb_q = (e0 * L + oh_e0 / B) if xE == 0 else (e1 * L + oh_e1 / B)
+            ret_q = (r0 * (B ** (a0 - 1)) + oh_r0 / B) if xR == 0 else (r1 * (B ** (a1 - 1)) + oh_r1 / B)
+            xfer_ER = K_ER * L if xE != xR else 0.0
+            xfer_RG = K_RG * L if xR != 1 else 0.0
+            wall_q = (gen_ms + ret_ms) / B
+            q_obs = wall_q - max(emb_q + xfer_ER, ret_q + xfer_RG, gen_q)
             if -10 < q_obs < 50:
                 queue_obs.append(q_obs)
 
@@ -358,7 +354,7 @@ def main():
     print(f"  gen_per_token = {gen_per_token:.4f} ms/token  (from (0,0) slope / avg_out={args.avg_output_tokens})")
     print(f"  gen_base     = {gen_base:.0f} ms  (prefill overhead)")
 
-    # queue = median(wall_q - max(CPU_q, GPU_q)) across all observations
+    # queue = median(wall_q - max(emb+xfer_ER, ret+xfer_RG, gen)) across all observations
     queue_penalty, _ = fit_overlap_model(results, gen_per_token, gen_base, args.avg_output_tokens,
                                           emb_rates={0: 0.084, 1: 0.016},
                                           ret_params={0: (0.68, 0.55), 1: (0.50, 0.30)})

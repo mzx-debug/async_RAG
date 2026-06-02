@@ -920,7 +920,7 @@ class GreedyScheduler:
         self._startup_k_ema: Dict[Tuple[int, int], float] = {}
         # ── Tracking ──────────────────────────────────────────────────────────
         self._wall_time_measurements: Dict[Tuple[int, int], List[Tuple[int, float, float]]] = {}
-        self._emb_measurements: Dict[int, List[Tuple[int, float]]] = {}   # {xE: [(B, emb_ms_total), ...]}
+        self._emb_measurements: Dict[int, List[Tuple[float, int, float]]] = {}  # {xE: [(L, B, emb_ms_total), ...]}
         self._ret_measurements: Dict[int, List[Tuple[int, float]]] = {}   # {xR: [(B, ret_ms_total), ...]}
         # ── Scheduling state ──────────────────────────────────────────────────
         self._overlap_factor_ema: Dict[Tuple[int, int], float] = {}
@@ -946,8 +946,8 @@ class GreedyScheduler:
         self._gen_base_ema = 1109.0      # ms, prefill overhead
         self._avg_output_tokens_ema = 120.0
         self._queue_penalty_ema = 0.23     # ms/q, from sweep fit
-        self._transfer_K_ema[(0, 1)] = 0.55   # ms/token, CPU→GPU
-        self._transfer_K_ema[(1, 0)] = 0.16   # ms/token, GPU→CPU
+        self._transfer_K_ema[(0, 1)] = 0.55   # ms/token, CPU→GPU (xfer_EtoR & xfer_RtoG share key)
+        self._transfer_K_ema[(1, 0)] = 0.16   # ms/token, GPU→CPU (xfer_EtoR only)
 
     @staticmethod
     def _estimate_query_length(query: str) -> int:
@@ -1107,10 +1107,8 @@ class GreedyScheduler:
         """
         Wall time estimation for scheduling: delegates to _estimate_action_cost.
 
-        Uses the max(CPU, GPU) pipeline model:
-            CPU_q = I(xE=0)×emb_q + I(xR=0)×ret_q + I(xE≠xR)×xfer_q
-            GPU_q = gen_q + gen_base_q + I(xE=1)×emb_q + I(xR=1)×ret_q
-            wall_q = max(CPU_q, GPU_q) + queue_penalty
+        Uses the three-stage parallel model:
+            wall_q = max(emb + xfer_EtoR, ret + xfer_RtoG, gen) + queue_penalty
 
         Note: pending_queries is accepted for API compatibility but unused
         (B is the primary driver, not pending count).
@@ -1142,26 +1140,16 @@ class GreedyScheduler:
         """
         Wall time model (ms/q) for async_v2 continuous batching.
 
-        Emb is a common prefix on both pipeline sides and is captured by max(CPU, GPU):
-          CPU_q = I(xE=0) × emb_q + I(xR=0) × ret_q + I(xE≠xR) × xfer_q
-          GPU_q = gen_q + gen_base_q + I(xE=1) × emb_q + I(xR=1) × ret_q
-          wall_q = max(CPU_q, GPU_q) + queue_penalty
-
-        Per-action breakdown (Emb is the common prefix, absorbed into max):
-          (0,0): wall = max(emb+ret,  gen)     = Emb + max(Ret, Gen)
-          (0,1): wall = max(emb+xfer, gen+ret)  = Emb + max(Xfer, Gen+Ret)
-          (1,0): wall = max(xfer+ret, gen+emb)  = Emb + max(Xfer+Ret, Gen)
-          (1,1): wall = max(0,       gen+emb+ret) = Emb + Ret + Gen  (no overlap possible)
+        Emb, Ret, Gen are three fully parallel stages:
+          wall_q = max(emb + xfer_EtoR, ret + xfer_RtoG, gen) + queue_penalty
 
         where:
-          gen_q = gen_per_token × avg_output_tokens  (decode cost per query, ms/q)
-          gen_base_q = gen_base / B                   (prefill overhead amortized per query)
-          emb_q(xE) = emb_rate[xE] × L               (embedding cost per query)
-          ret_q(xR,B) = r[xR] × B^(alpha[xR]-1)      (retrieval cost, sublinear in B)
-          xfer_q = K[xE,xR] × L                       (CPU↔GPU transfer, only when xE≠xR)
+          xfer_EtoR = K[xE,xR] × L   (only when xE != xR, added to Emb before Ret)
+          xfer_RtoG = K[xR,1] × L    (only when xR != 1, added to Ret before Gen)
+          gen_q_total = gen_per_token × avg_output_tokens + gen_base / B
+          emb_q       = emb_rate[xE] × L + overhead_e[xE] / B
+          ret_q       = r[xR] + overhead_r[xR] / B
           queue_penalty = per-query scheduling overhead (constant)
-
-        Returns wall_q (ms per query).
         """
         B = max(1, batch_size)
         L = float(sum(lengths) / len(lengths)) if lengths else 5.0
@@ -1183,28 +1171,18 @@ class GreedyScheduler:
         ret_q_cpu = self._ret_r_ema.get(0, 0.20) + self._ret_overhead_ema.get(0, 1.36) / B
         ret_q_gpu = self._ret_r_ema.get(1, 0.00) + self._ret_overhead_ema.get(1, 1.50) / B
 
-        # ── Transfer (CPU↔GPU when xE≠xR) ──────────────────────────────────
-        # K[(0,1)] = CPU→GPU, K[(1,0)] = GPU→CPU
-        xfer_q = (self._transfer_K_ema.get((x_e, x_r), 0.0) * L) if x_e != x_r else 0.0
+        # wall_q = max(emb + xfer_EtoR, ret + xfer_RtoG, gen) + queue_penalty
+        # xfer added to the SENDING stage:
+        #   xfer_EtoR = K[xE,xR] × L  (only when xE != xR, added to Emb before Ret)
+        #   xfer_RtoG = K[xR,1] × L   (only when xR != 1, added to Ret before Gen)
+        xfer_EtoR = (self._transfer_K_ema.get((x_e, x_r), 0.0) * L) if x_e != x_r else 0.0
+        xfer_RtoG = (self._transfer_K_ema.get((x_r, 1), 0.0) * L) if x_r != 1 else 0.0
 
-        # ── Two pipeline sides ───────────────────────────────────────────
-        # Physical model per action:
-        #   (0,0): CPU=Emb+Ret,  GPU=Gen              → max(Emb+Ret, Gen)
-        #   (0,1): CPU=Emb,      GPU=Ret+Gen           → Emb + max(Ret, Gen)
-        #   (1,0): CPU=xfer+Ret, GPU=Emb+Gen           → Emb + max(xfer+Ret, Gen)
-        #   (1,1): CPU=0,        GPU=Emb+Ret+Gen       → Emb+Ret+Gen
-        # Overlap: Emb(CPU) serial before CPU pipeline; Emb(GPU) serial before GPU pipeline.
-        cpu_q = (emb_q_cpu if x_e == 0 else 0.0) + (ret_q_cpu if x_r == 0 else 0.0) + xfer_q
-        gpu_q = gen_q + gen_base_q + (emb_q_gpu if x_e == 1 else 0.0) + (ret_q_gpu if x_r == 1 else 0.0)
+        emb_q = emb_q_cpu if x_e == 0 else emb_q_gpu
+        ret_q = ret_q_cpu if x_r == 0 else ret_q_gpu
+        gen_q_total = gen_q + gen_base_q
 
-        # CPU Emb serial before CPU pipeline; GPU Emb serial before GPU pipeline.
-        # Emb(CPU) and Emb(GPU) run concurrently (parallel pipeline stages).
-        pipeline_q = max(cpu_q, gpu_q)
-
-        # ── Queue: per-query scheduling overhead (constant) ───────────────
-        queue_penalty = self._queue_penalty_ema
-
-        wall_q = pipeline_q + queue_penalty
+        wall_q = max(emb_q + xfer_EtoR, ret_q + xfer_RtoG, gen_q_total) + self._queue_penalty_ema
 
         return wall_q
 
@@ -1282,16 +1260,19 @@ class GreedyScheduler:
         """
         Per-component EMA fitting for the v4 cost model.
 
-        Pipeline model:
-          CPU_q = I(xE=0) × emb_q + I(xR=0) × ret_q + I(xE≠xR) × xfer_q
-          GPU_q = gen_q + gen_base_q + I(xE=1) × emb_q + I(xR=1) × ret_q
-          wall_q = max(CPU_q, GPU_q) + queue_penalty
+        Pipeline model (three fully parallel stages):
+          wall_q = max(emb + xfer_EtoR, ret + xfer_RtoG, gen) + queue_penalty
+
+        where:
+          xfer_EtoR = K[xE,xR] × L   (only when xE != xR, added to Emb)
+          xfer_RtoG = K[xR,1] × L    (only when xR != 1, added to Ret)
+          gen_q_total = gen_per_token × avg_output_tokens + gen_base / B
 
         Fitting:
           Emb and Ret rates are fitted per-device from their own timing data.
           Gen per-token and avg_output_tokens are fitted from generation data.
-          gen_base (prefill overhead) is fixed from sweep calibration.
-          Queue is fitted from the residual: queue_obs = wall_q - min(CPU_q, GPU_q)
+          transfer_K[xE,xR] and transfer_K[xR,1] are fitted from wall-time residual.
+          Queue is fitted from the residual after subtracting all model terms.
 
         Pre-update values are captured before any EMA mutation to avoid circularity.
         """
@@ -1311,40 +1292,82 @@ class GreedyScheduler:
         prev_r1 = self._ret_r_ema.get(1, 0.00)
         prev_oh_r0 = self._ret_overhead_ema.get(0, 1.36)
         prev_oh_r1 = self._ret_overhead_ema.get(1, 1.50)
+        prev_K_ER = self._transfer_K_ema.get((x_e, x_r), 0.0)
+        prev_K_RG = self._transfer_K_ema.get((x_r, 1), 0.0)
         prev_queue = self._queue_penalty_ema
 
         # ── 1. Emb: fit e_base[xE] and overhead_e[xE] from total = e_base * L * B + overhead ─
         emb_ms_total = embedding_sec * 1000.0
-        e_obs = emb_ms_total / (L * B) if (L > 0 and B > 0) else (prev_e0 if x_e == 0 else prev_e1)
         emb_key = x_e
         if emb_key not in self._emb_measurements:
             self._emb_measurements[emb_key] = []
         if L > 0:
-            self._emb_measurements[emb_key].append((B, emb_ms_total))
+            self._emb_measurements[emb_key].append((L, B, emb_ms_total))
         if len(self._emb_measurements[emb_key]) > 20:
             self._emb_measurements[emb_key] = self._emb_measurements[emb_key][-20:]
 
         obs_emb = self._emb_measurements[emb_key]
-        if len(obs_emb) >= 2:
-            # Linear regression: emb_total = a * (L*B) + b
-            # Compute a=e_base, b=overhead from all history
-            n = len(obs_emb)
-            sum_x = sum_x2 = sum_y = sum_xy = 0.0
-            for bi, emb_t in obs_emb:
-                x = L * bi
-                sum_x += x; sum_x2 += x*x; sum_y += emb_t; sum_xy += x*emb_t
-            d = n * sum_x2 - sum_x * sum_x
-            if abs(d) > 1e-9:
-                e_base_fit = (n * sum_xy - sum_x * sum_y) / d
-                overhead_fit = (sum_y - e_base_fit * sum_x) / n
-                e_base_fit = max(0.0, min(10.0, e_base_fit))
-                overhead_fit = max(0.0, min(50.0, overhead_fit))
+        n_emb = len(obs_emb)
+
+        # Single-point warm start (n=1): extract rate and overhead directly.
+        # Emb total = e * L * B + oh  →  e = (total - oh) / (L*B)
+        # Use prev overhead to solve for e, then EMA both.
+        if n_emb == 1:
+            Li_1, Bi_1, total_1 = obs_emb[0]
+            oh_prior = prev_oh_e0 if x_e == 0 else prev_oh_e1
+            if Bi_1 > 0:
+                e_obs = max(0.0, (total_1 - oh_prior) / (Li_1 * Bi_1))
+                e_obs = max(0.0, min(10.0, e_obs))
+                oh_obs = max(0.0, min(50.0, total_1 - e_obs * Li_1 * Bi_1))
                 if x_e == 0:
-                    self._emb_rate_ema[0] = a * e_base_fit + (1 - a) * prev_e0
-                    self._emb_overhead_ema[0] = a * overhead_fit + (1 - a) * prev_oh_e0
+                    self._emb_rate_ema[0] = a * e_obs + (1 - a) * prev_e0
+                    self._emb_overhead_ema[0] = a * oh_obs + (1 - a) * prev_oh_e0
                 else:
-                    self._emb_rate_ema[1] = a * e_base_fit + (1 - a) * prev_e1
-                    self._emb_overhead_ema[1] = a * overhead_fit + (1 - a) * prev_oh_e1
+                    self._emb_rate_ema[1] = a * e_obs + (1 - a) * prev_e1
+                    self._emb_overhead_ema[1] = a * oh_obs + (1 - a) * prev_oh_e1
+
+        # Exponential-weighted regression (n>=2): recent points dominate.
+        # Clipped variance check avoids degenerate fits when all B_i are identical.
+        if n_emb >= 2:
+            x_vals = [Li * bi for Li, bi, _ in obs_emb]
+            x_min, x_max = min(x_vals), max(x_vals)
+            has_variance = (x_max - x_min) > 1e-6
+            if has_variance:
+                n = len(obs_emb)
+                sum_w = sum_wx = sum_wx2 = sum_wy = sum_wxy = 0.0
+                for i, (Li, bi, emb_t) in enumerate(obs_emb):
+                    w = 2.0 ** (i - n + 1)
+                    x = Li * bi
+                    sum_w += w; sum_wx += w * x; sum_wx2 += w * x*x
+                    sum_wy += w * emb_t; sum_wxy += w * x * emb_t
+                d = sum_w * sum_wx2 - sum_wx * sum_wx
+                if abs(d) > 1e-9:
+                    e_base_fit = (sum_w * sum_wxy - sum_wx * sum_wy) / d
+                    overhead_fit = (sum_wy - e_base_fit * sum_wx) / sum_w
+                    e_base_fit = max(0.0, min(10.0, e_base_fit))
+                    overhead_fit = max(0.0, min(50.0, overhead_fit))
+                    if x_e == 0:
+                        self._emb_rate_ema[0] = a * e_base_fit + (1 - a) * prev_e0
+                        self._emb_overhead_ema[0] = a * overhead_fit + (1 - a) * prev_oh_e0
+                    else:
+                        self._emb_rate_ema[1] = a * e_base_fit + (1 - a) * prev_e1
+                        self._emb_overhead_ema[1] = a * overhead_fit + (1 - a) * prev_oh_e1
+            # No variance: fall back to single-point update using most-recent measurement
+            elif n_emb > 0:
+                Li_1, Bi_1, total_1 = obs_emb[-1]
+                oh_prior = prev_oh_e0 if x_e == 0 else prev_oh_e1
+                if Bi_1 > 0:
+                    e_obs = max(0.0, min(10.0, (total_1 - oh_prior) / (Li_1 * Bi_1)))
+                    oh_obs = max(0.0, min(50.0, total_1 - e_obs * Li_1 * Bi_1))
+                    if x_e == 0:
+                        self._emb_rate_ema[0] = a * e_obs + (1 - a) * prev_e0
+                        self._emb_overhead_ema[0] = a * oh_obs + (1 - a) * prev_oh_e0
+                    else:
+                        self._emb_rate_ema[1] = a * e_obs + (1 - a) * prev_e1
+                        self._emb_overhead_ema[1] = a * oh_obs + (1 - a) * prev_oh_e1
+
+        # e_obs for feedback trace: model-consistent rate (prev)
+        e_obs = prev_e0 if x_e == 0 else prev_e1
 
         # ── 2. Ret: fit r_base[xR] and overhead_r[xR] from total = r_base * B + overhead ─
         ret_ms_total = retrieval_sec * 1000.0
@@ -1357,58 +1380,105 @@ class GreedyScheduler:
             self._ret_measurements[ret_key] = self._ret_measurements[ret_key][-20:]
 
         obs_ret = self._ret_measurements[ret_key]
-        if len(obs_ret) >= 2:
-            # Linear regression: ret_total = a * B + b
-            n = len(obs_ret)
-            sum_x = sum_x2 = sum_y = sum_xy = 0.0
-            for bi, ret_t in obs_ret:
-                sum_x += bi; sum_x2 += bi*bi; sum_y += ret_t; sum_xy += bi*ret_t
-            d = n * sum_x2 - sum_x * sum_x
-            if abs(d) > 1e-9:
-                r_base_fit = (n * sum_xy - sum_x * sum_y) / d
-                overhead_fit = (sum_y - r_base_fit * sum_x) / n
-                r_base_fit = max(0.0, min(10.0, r_base_fit))
-                overhead_fit = max(0.0, min(50.0, overhead_fit))
-                if ret_key == 0:
-                    self._ret_r_ema[0] = a * r_base_fit + (1 - a) * prev_r0
-                    self._ret_overhead_ema[0] = a * overhead_fit + (1 - a) * prev_oh_r0
-                else:
-                    self._ret_r_ema[1] = a * r_base_fit + (1 - a) * prev_r1
-                    self._ret_overhead_ema[1] = a * overhead_fit + (1 - a) * prev_oh_r1
+        n_ret = len(obs_ret)
 
-        # ── 3. Gen per-token ───────────────────────────────────────────────────
+        # Single-point warm start (n=1)
+        if n_ret == 1:
+            Bi_1, total_1 = obs_ret[0]
+            oh_prior = prev_oh_r0 if ret_key == 0 else prev_oh_r1
+            if Bi_1 > 0:
+                r_obs = max(0.0, min(10.0, (total_1 - oh_prior) / Bi_1))
+                oh_obs = max(0.0, min(50.0, total_1 - r_obs * Bi_1))
+                if ret_key == 0:
+                    self._ret_r_ema[0] = a * r_obs + (1 - a) * prev_r0
+                    self._ret_overhead_ema[0] = a * oh_obs + (1 - a) * prev_oh_r0
+                else:
+                    self._ret_r_ema[1] = a * r_obs + (1 - a) * prev_r1
+                    self._ret_overhead_ema[1] = a * oh_obs + (1 - a) * prev_oh_r1
+
+        # Exponential-weighted regression (n>=2)
+        if n_ret >= 2:
+            b_vals = [bi for bi, _ in obs_ret]
+            if (max(b_vals) - min(b_vals)) > 1e-6:
+                n = len(obs_ret)
+                sum_w = sum_wx = sum_wx2 = sum_wy = sum_wxy = 0.0
+                for i, (bi, ret_t) in enumerate(obs_ret):
+                    w = 2.0 ** (i - n + 1)
+                    sum_w += w; sum_wx += w * bi; sum_wx2 += w * bi*bi
+                    sum_wy += w * ret_t; sum_wxy += w * bi * ret_t
+                d = sum_w * sum_wx2 - sum_wx * sum_wx
+                if abs(d) > 1e-9:
+                    r_base_fit = (sum_w * sum_wxy - sum_wx * sum_wy) / d
+                    overhead_fit = (sum_wy - r_base_fit * sum_wx) / sum_w
+                    r_base_fit = max(0.0, min(10.0, r_base_fit))
+                    overhead_fit = max(0.0, min(50.0, overhead_fit))
+                    if ret_key == 0:
+                        self._ret_r_ema[0] = a * r_base_fit + (1 - a) * prev_r0
+                        self._ret_overhead_ema[0] = a * overhead_fit + (1 - a) * prev_oh_r0
+                    else:
+                        self._ret_r_ema[1] = a * r_base_fit + (1 - a) * prev_r1
+                        self._ret_overhead_ema[1] = a * overhead_fit + (1 - a) * prev_oh_r1
+
+        # ── 3. Gen per-token and avg_output ──────────────────────────────────────
         gen_ms_total = generation_sec * 1000.0
         if total_output_tokens > 0:
             gpt_obs = gen_ms_total / total_output_tokens
             self._gen_per_token_ema = a * gpt_obs + (1 - a) * prev_gen_per_token
 
-        # ── 3b. Avg output tokens ─────────────────────────────────────────────
         if total_output_tokens > 0 and B > 0:
             avg_out_obs = total_output_tokens / B
             self._avg_output_tokens_ema = a * avg_out_obs + (1 - a) * prev_avg_out
 
-        # ── 4. Queue: fitted from wall_q - min(CPU_q, GPU_q) ────────────────────
-        # Uses the PRE-FROZEN Emb/Ret rates to compute both pipeline sides,
-        # then extracts queue from the residual. Consistent across all actions.
-        #
-        # New models:
-        #   Emb: emb_q = e_base * L + overhead_e / B
-        #   Ret: ret_q = r_base + overhead_r / B
-        if B > 0:
-            gen_q = prev_gen_per_token * prev_avg_out
+        # ── 3c. gen_base: adaptive from generation wall-time residual ──────────
+        # gen_q = gen_per_token * avg_output + gen_base / B
+        # → gen_base_obs = (gen_ms_total - gen_per_token * total_output_tokens) / B
+        # Only update when we have meaningful output; clamp to plausible range.
+        if total_output_tokens > 0 and B > 0:
+            gen_per_token_cost = prev_gen_per_token * total_output_tokens  # ms total
+            gen_base_obs = max(100.0, min(5000.0, gen_ms_total - gen_per_token_cost)) / B
+            # Blend: EMA toward observation weighted by output volume (more tokens → more confident)
+            token_weight = min(1.0, total_output_tokens / 200.0)  # 0→1 as output grows
+            b_factor = token_weight * a
+            self._gen_base_ema = b_factor * gen_base_obs + (1 - b_factor) * prev_gen_base
+
+        # ── 4. xfer_K and Queue: wall_q = max(emb+xfer_ER, ret+xfer_RG, gen) + queue ──
+        # Fitted from wall-time residual after subtracting the slow-side cost.
+        # xfer_ER uses K[xE,xR] (already in _transfer_K_ema).
+        # xfer_RG uses K[xR,1]   (new, also stored in _transfer_K_ema).
+        # Queue = wall_q - max(emb+xfer_ER, ret+xfer_RG, gen)
+        if B > 0 and L > 0:
             emb_q_cpu = prev_e0 * L + prev_oh_e0 / B
             emb_q_gpu = prev_e1 * L + prev_oh_e1 / B
             ret_q_cpu = prev_r0 + prev_oh_r0 / B
             ret_q_gpu = prev_r1 + prev_oh_r1 / B
-            xfer_q = (self._transfer_K_ema.get((x_e, x_r), 0.0) * L) if x_e != x_r else 0.0
+            emb_q = emb_q_cpu if x_e == 0 else emb_q_gpu
+            ret_q = ret_q_cpu if x_r == 0 else ret_q_gpu
+            gen_q = prev_gen_per_token * prev_avg_out + prev_gen_base / B
 
-            cpu_q = (emb_q_cpu if x_e == 0 else 0.0) + (ret_q_cpu if x_r == 0 else 0.0) + xfer_q
-            gpu_q = gen_q + (prev_gen_base / B) + (emb_q_gpu if x_e == 1 else 0.0) + (ret_q_gpu if x_r == 1 else 0.0)
-            min_side = min(cpu_q, gpu_q)
+            xfer_ER = prev_K_ER * L if x_e != x_r else 0.0
+            xfer_RG = prev_K_RG * L if x_r != 1 else 0.0
+
+            emb_with_xfer = emb_q + xfer_ER
+            ret_with_xfer = ret_q + xfer_RG
+            model_max = max(emb_with_xfer, ret_with_xfer, gen_q)
             wall_q = wall_time_ms / B
-            queue_obs = wall_q - min_side
+            queue_obs = wall_q - model_max
             queue_obs = max(0.0, min(50.0, queue_obs))
             self._queue_penalty_ema = a * queue_obs + (1 - a) * prev_queue
+
+            # Fit K[xE,xR] (xfer_EtoR) from residual on the emb side
+            if x_e != x_r and emb_with_xfer >= ret_with_xfer and emb_with_xfer >= gen_q:
+                residual = wall_q - max(ret_with_xfer, gen_q)
+                K_ER_obs = residual / L if L > 0 else prev_K_ER
+                K_ER_obs = max(0.0, min(10.0, K_ER_obs))
+                self._transfer_K_ema[(x_e, x_r)] = a * K_ER_obs + (1 - a) * prev_K_ER
+
+            # Fit K[xR,1] (xfer_RtoG) from residual on the ret side
+            if x_r != 1 and ret_with_xfer >= emb_with_xfer and ret_with_xfer >= gen_q:
+                residual = wall_q - max(emb_with_xfer, gen_q)
+                K_RG_obs = residual / L if L > 0 else prev_K_RG
+                K_RG_obs = max(0.0, min(10.0, K_RG_obs))
+                self._transfer_K_ema[(x_r, 1)] = a * K_RG_obs + (1 - a) * prev_K_RG
 
         self.feedback_trace.append(
             FeedbackTraceEntry(
@@ -1422,7 +1492,11 @@ class GreedyScheduler:
                 embedding_ms_per_query=e_obs,
                 retrieval_ms_per_query=ret_ms_total / B,
                 generation_ms_per_query=gen_ms_total / B,
-                transfer_ms_per_query_est=self._transfer_K_ema.get((x_e, x_r), 0.0) * L if x_e != x_r else 0.0,
+                transfer_ms_per_query_est=(
+                    self._transfer_K_ema.get((x_e, x_r), 0.0) * L if x_e != x_r else 0.0
+                ) + (
+                    self._transfer_K_ema.get((x_r, 1), 0.0) * L if x_r != 1 else 0.0
+                ),
                 batch_size_residual_ms_per_query=0.0,
                 ema_after_update={
                     f"e0": self._emb_rate_ema.get(0, 0.0),
@@ -1433,6 +1507,8 @@ class GreedyScheduler:
                     f"r1": self._ret_r_ema.get(1, 0.0),
                     f"oh_r0": self._ret_overhead_ema.get(0, 0.0),
                     f"oh_r1": self._ret_overhead_ema.get(1, 0.0),
+                    "K_ER": self._transfer_K_ema.get((x_e, x_r), 0.0),
+                    "K_RG": self._transfer_K_ema.get((x_r, 1), 0.0),
                     "gen_per_token": self._gen_per_token_ema,
                     "queue_penalty": self._queue_penalty_ema,
                     "avg_out_tokens": getattr(self, '_avg_output_tokens_ema', 120.0),
@@ -1664,7 +1740,7 @@ class GreedyScheduler:
         self._emb_measurements = {}
         for k_str, ms_list in raw.get("emb_measurements", {}).items():
             xe = int(k_str)
-            self._emb_measurements[xe] = [(int(item[0]), float(item[1])) for item in ms_list]
+            self._emb_measurements[xe] = [(float(item[0]), int(item[1]), float(item[2])) for item in ms_list]
         self._ret_measurements = {}
         for k_str, ms_list in raw.get("ret_measurements", {}).items():
             xr = int(k_str)
