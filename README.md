@@ -236,7 +236,7 @@ Warm-start defaults for `(0, 0)` (CPU embed, CPU retrieval):
 
 | Parameter | Value | Source |
 |-----------|-------|--------|
-| `gen_base` | 1170 ms | measured, vLLM Qwen2.5-1.5B-Instruct (prefill + kernel launch) |
+| `gen_base` | 1109 ms | measured, vLLM Qwen2.5-1.5B-Instruct (prefill fixed cost) |
 | `gen_per_query` | 28.2 ms/q | measured, linear fit across bs=32/64/256 |
 | `emb_per_query` | 1.31 ms/q | measured, CPU sentence-transformers/all-MiniLM-L6-v2 |
 | `ret_per_query` | 0.05 ms/q | measured, CPU FAISS Flat search |
@@ -327,7 +327,7 @@ CALIBRATION RESULTS
 
 Action (0,0) — CPU embed + CPU retrieval
   Status         OK
-  gen_base       1170 ms
+  gen_base       1109 ms
   gen_per_q      28.2 ms/q
   emb_per_q      1.31 ms/q
   ret_per_q      0.051 ms/q
@@ -471,7 +471,7 @@ Each run produces a JSON summary (at `--output-json`). Key fields:
     "max_q_rg": 1
   },
   "ema_params": {
-    "gen_base_overhead_ema": {"(0,0)": 1170.0},
+    "gen_base_overhead_ema": {"(0,0)": 1109.0},
     "gen_per_query_ema": {"(0,0)": 28.2}
   },
   "per_batch": [

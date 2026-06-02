@@ -90,10 +90,10 @@ wall_q = max(emb + xfer_EtoR, ret + xfer_RtoG, gen) + queue_penalty
 | `r1` | 0.00 ms | 初始值 | GPU 检索边际成本（overhead 主导） |
 | `oh_r0` | 1.36 ms | 初始值 | CPU 检索固定开销 |
 | `oh_r1` | 1.50 ms | 初始值 | GPU 检索固定开销 |
-| `gen_per_token` | 0.2135 ms/token | **Sweep 拟合** | 生成解码速率 |
-| `gen_base` | 1109 ms | **Sweep 拟合** | 生成预填充固定开销 |
+| `gen_per_token` | 0.2135 ms/token | **实测** | 生成解码速率 |
+| `gen_base` | 1109 ms | **实测** | 生成预填充固定开销 |
 | `avg_output` | 120 tokens | EMA 自适应 | 平均输出长度 |
-| `queue_penalty` | 0.23 ms/q | Sweep 拟合 | 调度开销 |
+| `queue_penalty` | 0.23 ms/q | 实测 | 调度开销 |
 | `K[xE,xR]` | 0.55/0.16 ms/token | 初始值 | Emb→Ret 传输速率（xE≠xR 时生效） |
 | `K[xR,1]` | 0.55 ms/token | 初始值 | Ret→Gen 传输速率（xR≠1 时生效） |
 
@@ -232,13 +232,13 @@ new_value = 0.25 × observed + 0.75 × old_value
 
 ## 十一、当前验证状态
 
-### 已验证（通过 Sweep 标定实验）
+### 已验证（通过实测标定）
 
 | 指标 | 结果 |
 |------|------|
-| Sweep 拟合质量 | `gen_ms = 1109 + 25.62 × B`，R² = 0.998 |
-| (0,0) 预测误差 | < 3%（Sweep 条件下） |
-| (0,1) 预测误差 | < 3%（Sweep 条件下） |
+| 实测拟合质量 | `gen_ms = 1109 + 25.62 × B`，R² = 0.998 |
+| (0,0) 预测误差 | < 3%（实测条件下） |
+| (0,1) 预测误差 | < 3%（实测条件下） |
 | prefill 分摊模型 | **完全正确**，gen_ms 随 B 反比变化符合预期 |
 | 亚线性检索扩展 | **符合预期** |
 
@@ -275,8 +275,8 @@ new_value = 0.25 × observed + 0.75 × old_value
 | 文件 | 职责 |
 |------|------|
 | `async_rag_pipeline.py` | 全部逻辑：调度器、流水线线程、EMA、ResourceTracker |
-| `calibrate_sweep.py` | 离线 Sweep：固定 action × 固定 batch 测真实延迟 |
-| `compute_calib_params.py` | 从 Sweep 数据拟合 gen_base、gen_per_token |
+| `calibrate_sweep.py` | 离线 profiling：固定 action × 固定 batch 测真实延迟 |
+| `compute_calib_params.py` | 从 profiling JSON 拟合初始 EMA 参数 |
 | `validate_model.py` | async_v2 真实场景验证：预测 vs 实际对比 |
 | `measure_gpu_costs.py` | 固定 action 测 GPU embedding/retrieval 真实代价 |
 | `改进文档.md` | 快速参考 + 最新实验数据 |
