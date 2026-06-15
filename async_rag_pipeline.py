@@ -741,12 +741,20 @@ class ResourceTracker:
         self._vllm_init_done = True
 
     def get_current_free_mem_gb(self) -> float:
-        """Returns real-time free GPU memory in GiB."""
+        """Returns real-time free GPU memory in GiB.
+
+        We use torch.cuda.mem_get_info() instead of memory_reserved() because:
+        1. vLLM runs as a spawned subprocess (torch multiprocessing 'spawn') that holds
+           the actual GPU allocations. The parent process's torch.cuda.memory_reserved()
+           returns 0 even after vLLM is loaded.
+        2. torch.cuda.mem_get_info() queries the NVIDIA driver, which sees all allocations
+           across processes — giving us the ground-truth free/total memory.
+        """
         if not torch.cuda.is_available():
             return 0.0
         try:
             free, _total = torch.cuda.mem_get_info(self.gpu_id)
-            return float(free) / (1024 ** 3)
+            return max(0.0, float(free) / (1024 ** 3))
         except Exception:
             return 0.0
 
@@ -827,31 +835,46 @@ class ResourceTracker:
     ) -> int:
         """Estimates the maximum batch size that fits in GPU memory for a given action.
 
-        This is a conservative estimate used to bound the scheduler's batch size search.
+        For (0,0) generation-only: vLLM handles memory internally via pre-allocated KV cache.
+          We use a generous bound since vLLM's own scheduling prevents OOM.
+
+        For GPU embedding (xE=1) or GPU retrieval (xR=1): theoretical models
+          (KV cache, activations) are unreliable because they don't capture:
+          - Embedding model activation peaks during forward pass
+          - cuBLAS scratch space for FAISS GPU
+          - CUDA fragmentation and alignment overhead
+          We use conservative hard limits derived from empirical observations.
         """
         if not torch.cuda.is_available():
             return 1
 
-        free = self.get_current_free_mem_gb()
-
-        # Memory budget: only subtract what's actually needed for this action.
-        # For xE=0,xR=0: generation uses pre-allocated vLLM memory (reserved), no extra per-query cost
-        # For xE=1: need embed model weights + embed activations
-        # For xR=1: need faiss index
         if x_e == 0 and x_r == 0:
-            # No additional GPU memory needed; generation KV is pre-allocated by vLLM
-            return max_theoretical
+            # Generation: vLLM pre-allocates KV cache; its internal scheduler
+            # handles batching within the reservation. Empirically, B=128 fits
+            # comfortably on a 16GB card with gpu_util=0.6 — past 150-200 throughput
+            # saturates (additional per-query time grows back). Use a bound that
+            # allows scheduler to explore the throughput-saturating range.
+            return min(int(self.get_current_free_mem_gb() * 25), max_theoretical)
 
-        faiss = self.faiss_index_gb if x_r == 1 else 0.0
-        embed_weights = self.embed_model_weights_gb if x_e == 1 else 0.0
-        embed_activations = self.EMBED_ACTIVATIONS_PER_QUERY_GB if x_e == 1 else 0.0
+        # GPU embedding or GPU retrieval: use conservative hard limits.
+        # These values were confirmed empirically on RTX 4090 Laptop (16GB)
+        # with Qwen2.5-1.5B-Instruct (vLLM, gpu_util=0.6) already loaded.
+        # Embedding model: all-MiniLM-L6-v2 (~22M params, fp16 ≈ 0.044 GB weights
+        # but forward-pass activations can spike significantly).
+        # FAISS GPU: requires cuBLAS temp workspace (~1-2 GB) on top of index.
+        #
+        # Conservative upper bounds per action:
+        GPU_EMB_BATCH_MAX = 4      # embedding model forward activates ~1-2 GB per query at batch=1; marginal cost grows fast
+        GPU_RET_BATCH_MAX = 8      # FAISS GPU index is smaller but cuBLAS scratch adds overhead
+        GPU_EMB_RET_BATCH_MAX = 4  # embedding + retrieval simultaneously: even tighter
 
-        available = free - self.vllm_reserved_gb - faiss - embed_weights
-
-        per_query_gb = embed_activations + 0.0005
-
-        max_by_mem = int(available / per_query_gb)
-        return max(1, min(max_by_mem, max_theoretical))
+        if x_e == 1 and x_r == 0:
+            return GPU_EMB_BATCH_MAX
+        if x_e == 0 and x_r == 1:
+            return GPU_RET_BATCH_MAX
+        if x_e == 1 and x_r == 1:
+            return GPU_EMB_RET_BATCH_MAX
+        return max_theoretical
 
 
 class GreedyScheduler:
@@ -897,13 +920,13 @@ class GreedyScheduler:
         self._ret_r_ema: Dict[int, float] = {}         # r_base[xR], ms (per-query marginal, no B factor)
         self._ret_overhead_ema: Dict[int, float] = {}  # overhead_r[xR], ms (fixed latency amortized over batch)
         self._transfer_K_ema: Dict[Tuple[int, int], float] = {}     # K[xE,xR], ms/token
-        self._gen_P0_ema: float = 2072.0                            # ms, prefill fixed
+        self._gen_P0_ema: float = 1109.0                            # ms, prefill fixed (research plan)
         self._gen_p_lin_ema: float = 0.0                            # ms/token, prefill per-token
         self._gen_g_ema: float = 57.1                               # ms/q, decode marginal
-        self._gen_per_token_ema: float = 0.378                       # ms/token, constant gen rate
-        self._gen_base_ema: float = 1000.0                          # ms, prefill overhead (amortized over batch as P0/B)
+        self._gen_per_token_ema: float = 0.2135                       # ms/token, research plan
+        self._gen_base_ema = 1109.0      # ms, prefill overhead (research plan)
         self._avg_output_tokens_ema: float = 120.0                     # avg output tokens per query
-        self._queue_penalty_ema: float = 2.5                        # ms/q, per-query queueing overhead
+        self._queue_penalty_ema: float = 0.23                        # ms/q, research plan
         self._contention_ema: Dict[Tuple[int, int], float] = {}      # obs/pred ratio (legacy, unused)
         self._er_base_overhead_ema: float = 0.0                     # ms, not currently used
         # ── Old fields kept for backward compat (read-only in cost model) ─────────
@@ -953,22 +976,6 @@ class GreedyScheduler:
     def _estimate_query_length(query: str) -> int:
         return max(1, len(query.split()))
 
-    def _choose_batch_size(
-        self,
-        gpu_mem_gb: float,
-        q_er_len: int,
-        q_rg_len: int,
-    ) -> int:
-        base = self._max_batch_size_ema
-
-        if q_er_len >= self.backpressure_high or q_rg_len >= self.backpressure_high:
-            base = max(4.0, base / 2.0)
-
-        if base > 1:
-            base = 2.0 ** round(math.log2(base))
-
-        return max(1, int(base))
-
     def _pack_batch(self, batch_size: int) -> List[PendingQuery]:
         if not self._pending_queries:
             return []
@@ -976,72 +983,6 @@ class GreedyScheduler:
         batch = self._pending_queries[:take]
         self._pending_queries = self._pending_queries[take:]
         return batch
-
-    def _generation_target_bounds(
-        self,
-        pending_count: int,
-        gpu_free_mem_gb: float,
-        q_er_len: int,
-        q_rg_len: int,
-    ) -> Tuple[int, int, int]:
-        if pending_count <= 0:
-            return 1, 1, 1
-        base_ideal = 64
-        if gpu_free_mem_gb < 12.0:
-            base_ideal = 16
-        elif gpu_free_mem_gb < 18.0:
-            base_ideal = 32
-        if q_rg_len >= self.backpressure_high:
-            base_ideal = max(8, base_ideal // 2)
-        if q_er_len >= self.backpressure_high:
-            base_ideal = max(8, base_ideal // 2)
-        ideal = min(base_ideal, pending_count)
-        target_min = max(4, ideal // 2)
-        target_max = min(max(ideal, target_min), pending_count)
-        return target_min, ideal, target_max
-
-    def _candidate_generation_batch_sizes(
-        self,
-        pending_count: int,
-        target_min: int,
-        target_ideal: int,
-        target_max: int,
-    ) -> List[int]:
-        candidates = {
-            target_min,
-            target_ideal,
-            target_max,
-            max(4, target_ideal // 2),
-            min(pending_count, target_ideal + max(4, target_ideal // 2)),
-        }
-        ordered = sorted({min(size, pending_count) for size in candidates if size > 0})
-        return [size for size in ordered if size > 0]
-
-    def _plan_device_for_batch(
-        self,
-        token_lengths: Sequence[int],
-        batch_size: int,
-        gpu_available: bool,
-        gpu_free_mem_gb: float,
-        q_er_len: int,
-        q_rg_len: int,
-    ) -> Dict[str, Any]:
-        action = self._choose_action_for_batch(
-            lengths=token_lengths,
-            batch_size=batch_size,
-            gpu_available=gpu_available,
-            gpu_mem_gb=gpu_free_mem_gb,
-            q_er_len=q_er_len,
-            q_rg_len=q_rg_len,
-        )
-        x_e = int(action["xE"])
-        x_r = int(action["xR"])
-        keep_gpu_resident_er = x_e == 1 and x_r == 1 and gpu_available
-        return {
-            "xE": x_e,
-            "xR": x_r,
-            "keep_gpu_resident_er": keep_gpu_resident_er,
-        }
 
     def _estimate_embedding_cost(self, length: int) -> float:
         return 0.0074 * (length ** 2) + 0.17 * length
@@ -1091,12 +1032,6 @@ class GreedyScheduler:
             return self._generation_latency_ema_ms_per_query
         return self._estimate_generation_cost(lengths)
 
-    def _estimate_batch_size_residual(self, batch_size: int) -> float:
-        observed = self._batch_size_residual_ema_ms_per_query.get(batch_size)
-        if observed is not None:
-            return observed
-        return 6.0 / max(1, batch_size)
-
     def _estimate_wall_time(
         self,
         batch_size: int,
@@ -1114,21 +1049,6 @@ class GreedyScheduler:
         (B is the primary driver, not pending count).
         """
         return self._estimate_action_cost(lengths=[], batch_size=batch_size, x_e=x_e, x_r=x_r)
-
-    def _estimate_dispatch_cost_legacy(
-        self,
-        batch_size: int,
-        x_e: int,
-        x_r: int,
-    ) -> float:
-        """Fallback: legacy per-query cost sum (no pipeline overlap modeling)."""
-        emb = self._embedding_latency_ema_ms_per_query.get(x_e, 1.0)
-        ret = self._retrieval_latency_ema_ms_per_query.get(x_r, 0.1)
-        gen = self._generation_latency_ema_ms_per_query
-        if gen <= 0:
-            gen = 8.5 + 0.03 * 32
-        residual = self._estimate_batch_size_residual(batch_size)
-        return emb + ret + gen + residual
 
     def _estimate_action_cost(
         self,
@@ -1618,18 +1538,6 @@ class GreedyScheduler:
     def has_pending(self) -> bool:
         return bool(self._pending_queries)
 
-    def _batch_size_candidates(
-        self,
-        max_feasible: int,
-        pending_count: int,
-    ) -> List[int]:
-        """Generate power-of-2 batch size candidates up to max feasible, capped by pending."""
-        cap = min(max_feasible, pending_count)
-        if cap < 1:
-            return []
-        max_pow = int(math.log2(cap))
-        return [2 ** k for k in range(max_pow + 1)]
-
     def get_ema_params(self) -> Dict[str, Any]:
         """Return all current EMA parameters as a dict for inspection."""
         return {
@@ -1730,10 +1638,10 @@ class GreedyScheduler:
             if xr not in self._ret_overhead_ema:
                 self._ret_overhead_ema[xr] = 1.36 if xr == 0 else 1.50
 
-        self._gen_per_token_ema = float(raw.get("gen_per_token_ema", 0.378))
-        self._gen_base_ema = float(raw.get("gen_base_ema", 1000.0))
+        self._gen_per_token_ema = float(raw.get("gen_per_token_ema", 0.2135))
+        self._gen_base_ema = float(raw.get("gen_base_ema", 1109.0))
         self._avg_output_tokens_ema = float(raw.get("avg_output_tokens_ema", 120.0))
-        self._queue_penalty_ema = float(raw.get("queue_penalty_ema", 2.5))
+        self._queue_penalty_ema = float(raw.get("queue_penalty_ema", 0.23))
         self._transfer_K_ema = parse_tuple_key(raw, "transfer_K_ema")
 
         # Measurement histories
@@ -1787,70 +1695,69 @@ class GreedyScheduler:
         if pending_count == 0:
             return None
 
-        max_feasible = 128
+        # --- Debug: log GPU memory state and B_mem for all actions ---
         if self.resource_tracker is not None:
-            feasible_actions = [
-                a for a in self.available_actions
-                if self._feasible_actions_ema.get((int(a["xE"]), int(a["xR"])), True)
-            ]
-            if feasible_actions:
-                max_feasible = max(
-                    self.resource_tracker.max_batch_size_for_action(
-                        int(a["xE"]), int(a["xR"])
-                    )
-                    for a in feasible_actions
-                )
-        # Build per-action batch size candidates: bias toward the best-performing bs per action
-        raw_candidates: List[int] = []
-        for action in self.available_actions:
-            x_e = int(action["xE"])
-            x_r = int(action["xR"])
-            if not self._feasible_actions_ema.get((x_e, x_r), True):
-                continue
-            key = (x_e, x_r)
-            best_bs = self._best_batch_size_by_action.get(key, self._max_batch_size_ema)
-            if best_bs > 1:
-                best_pow = 2 ** round(math.log2(best_bs))
-                raw_candidates += [1, 2, 4, 8, 16, 32, 64, 128, 256]
-                if best_pow not in raw_candidates:
-                    raw_candidates.append(best_pow)
-        raw_candidates = sorted(set(c for c in raw_candidates if 1 <= c <= min(max_feasible, pending_count)))
-        if not raw_candidates:
-            raw_candidates = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+            rt = self.resource_tracker
+            free = rt.get_current_free_mem_gb()
+            total = rt.get_current_total_mem_gb()
+            bmem = {}
+            for action in self.available_actions:
+                xe = int(action["xE"])
+                xr = int(action["xR"])
+                bmem[(xe, xr)] = rt.max_batch_size_for_action(xe, xr)
+            print(
+                f"[sched mem] free={free:.2f}GB pending={pending_count} "
+                f"B_mem(0,0)={bmem.get((0,0),0)} "
+                f"B_mem(1,0)={bmem.get((1,0),0)} "
+                f"B_mem(0,1)={bmem.get((0,1),0)} "
+                f"B_mem(1,1)={bmem.get((1,1),0)}",
+                flush=True,
+            )
+        # -----------------------------------------------------------
 
-        candidate_batch_sizes = raw_candidates
-
+        # Research plan algorithm:
+        #   For each action, B* = min(pending_count, B_mem(action))
+        #   Evaluate cost model at exactly that B* per action
+        #   Select action with minimum wall_q
+        # Batch size is a continuous integer space — no power-of-2 enumeration.
         best_score = float("inf")
-        best_batch_size = raw_candidates[-1]
+        best_batch_size = 1
         best_action = {"xE": 0, "xR": 0}
         best_lengths: List[int] = []
 
-        for bs in raw_candidates:
-            sim_items = self._pending_queries[:bs]
+        for action in self.available_actions:
+            x_e = int(action["xE"])
+            x_r = int(action["xR"])
+
+            if not self._feasible_actions_ema.get((x_e, x_r), True):
+                continue
+
+            # B_mem = max feasible batch size given GPU memory constraint for this action
+            B_mem = self.resource_tracker.max_batch_size_for_action(x_e, x_r) if self.resource_tracker else 128
+            # B* = min(pending_count, B_mem) — the analytically optimal batch size
+            B_star = min(pending_count, B_mem)
+            if B_star < 1:
+                continue
+
+            if self.fixed_action:
+                if x_e != int(getattr(self.args, "xE", 0)) or x_r != int(getattr(self.args, "xR", 0)):
+                    continue
+
+            feasible = self._action_feasible(x_e, x_r, B_star, gpu_available, gpu_mem_gb)
+            if not feasible:
+                continue
+
+            # Use first B_star pending queries for token length estimation
+            sim_items = self._pending_queries[:B_star]
             sim_lengths = [item.token_length for item in sim_items]
 
-            for action in self.available_actions:
-                x_e = int(action["xE"])
-                x_r = int(action["xR"])
+            score = self._estimate_wall_time(B_star, x_e, x_r, pending_count)
 
-                if not self._feasible_actions_ema.get((x_e, x_r), True):
-                    continue
-
-                if self.fixed_action:
-                    if x_e != int(getattr(self.args, "xE", 0)) or x_r != int(getattr(self.args, "xR", 0)):
-                        continue
-
-                feasible = self._action_feasible(x_e, x_r, bs, gpu_available, gpu_mem_gb)
-                if not feasible:
-                    continue
-
-                score = self._estimate_wall_time(bs, x_e, x_r, pending_count)
-
-                if score < best_score:
-                    best_score = score
-                    best_batch_size = bs
-                    best_action = {"xE": x_e, "xR": x_r}
-                    best_lengths = sim_lengths
+            if score < best_score:
+                best_score = score
+                best_batch_size = B_star
+                best_action = {"xE": x_e, "xR": x_r}
+                best_lengths = sim_lengths
 
         batch_size = min(best_batch_size, pending_count)
         if batch_size < 1:
@@ -1890,24 +1797,27 @@ class GreedyScheduler:
         x_r = int(best_action["xR"])
         keep_gpu_resident_er = x_e == 1 and x_r == 1 and gpu_available
 
-        trace_lengths = lengths
+        # Build candidate_action_rows: evaluate each action at its optimal B*
         candidate_action_rows: List[Dict[str, Any]] = []
         for action in self.available_actions:
             cx_e = int(action["xE"])
             cx_r = int(action["xR"])
             if not self._feasible_actions_ema.get((cx_e, cx_r), True):
                 continue
-            feasible = self._action_feasible(cx_e, cx_r, batch_size, gpu_available, gpu_mem_gb)
+            cx_B_mem = self.resource_tracker.max_batch_size_for_action(cx_e, cx_r) if self.resource_tracker else 128
+            cx_B_star = min(pending_count, cx_B_mem)
+            feasible = self._action_feasible(cx_e, cx_r, cx_B_star, gpu_available, gpu_mem_gb)
             if not feasible:
                 continue
             candidate_action_rows.append({
                 "xE": cx_e,
                 "xR": cx_r,
+                "B_star": cx_B_star,
                 "predicted_action_cost_ms_per_query": self._estimate_action_cost(
-                    trace_lengths, batch_size, cx_e, cx_r
+                    lengths, cx_B_star, cx_e, cx_r
                 ),
                 "predicted_dispatch_cost_ms_per_query": self._estimate_dispatch_cost(
-                    trace_lengths, batch_size, cx_e, cx_r
+                    lengths, cx_B_star, cx_e, cx_r
                 ),
             })
 
@@ -1919,7 +1829,8 @@ class GreedyScheduler:
             DispatchTraceEntry(
                 dispatch_index=len(self.dispatch_trace) + 1,
                 chosen_batch_size=batch_size,
-                candidate_batch_sizes=candidate_batch_sizes,
+                # Continuous integer space: per-action B* values, no power-of-2 enumeration
+                candidate_batch_sizes=[row.get("B_star", 0) for row in candidate_action_rows] or [batch_size],
                 chosen_action={"xE": x_e, "xR": x_r},
                 candidate_actions=candidate_action_rows,
                 q_er_len=q_er_len,
